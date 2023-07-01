@@ -242,11 +242,15 @@ async fn handle_socket(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, laddr:
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = CliArg::parse();
-
     let log_level = args.log_level;
     setup_logger(false, Some(&log_level));
+
+    if args.bind.len() == 0 {
+        error!("no binding arguments provided. please provide via `-b` or `--bind`");
+        return Ok(());
+    }
     for i in &args.bind {
-        info!("{i}");
+        info!("Binding config: {i}");
     }
 
     let acl_file = args.acl;
