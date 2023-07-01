@@ -22,15 +22,15 @@ use tlsheader::{parse};
 
 #[derive(Parser, Debug, Clone)]
 pub struct CliArg {
-    #[arg(short, long)]
+    #[arg(short, long, help="forward config `bind_ip:bind_port:forward_port` format (repeat for multiple)")]
     pub bind: Vec<String>,
-    #[arg(short, long, default_value_t=30000)]
+    #[arg(short, long, default_value_t=30000, help="stats report interval in ms")]
     pub ri: i32,
-    #[arg(long, default_value_t=String::from(""))]
+    #[arg(long, default_value_t=String::from("INFO"), help="log level argument (ERROR INFO WARN DEBUG)")]
     pub log_level: String,
-    #[arg(long)]
+    #[arg(long, help="self IP address to reject (repeat for multiple)")]
     pub self_ip: Vec<String>,
-    #[arg(long, default_value_t=String::from(""))]
+    #[arg(long, default_value_t=String::from(""), help="acl files. see `rules.json`")]
     pub acl:String,
 }
 
@@ -120,12 +120,20 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
     // L -> R path
     let jh_lr = tokio::spawn( async move {
         let mut buf = vec![0; 4096];
+        let conn_id = conn_stats1.id_str();
         loop {
-            let n = lr
+            let nr = lr
                 .read(&mut buf)
-                .await
-                .expect("failed to read data from socket");
+                .await;
+            match nr {
+                Err(cause) => {
+                    error!("{conn_id} failed to read data from socket: {cause}");
+                    return;
+                },
+                _ =>{}
+            }
     
+            let n = nr.unwrap();
             if n == 0 {
                 return;
             }
@@ -135,7 +143,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
                 .await;
             match write_result {
                 Err(cause) => {
-                    error!("failed to write data to socket: {cause}");
+                    error!("{conn_id} failed to write data to socket: {cause}");
                     break;
                 },
                 Ok(_) => {
@@ -147,13 +155,21 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
 
     // R -> L path
     let jh_rl = tokio::spawn(async move {
+        let conn_id = conn_stats2.id_str();
         let mut buf = vec![0; 4096];
         loop {
-            let n = rr
+            let nr = rr
                 .read(&mut buf)
-                .await
-                .expect("failed to read data from socket");
+                .await;
     
+            match nr {
+                Err(cause) => {
+                    error!("{conn_id} failed to read data from socket: {cause}");
+                    return;
+                },
+                _ =>{}
+            }
+            let n = nr.unwrap();
             if n == 0 {
                 return;
             }
@@ -163,7 +179,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
                 .await;
             match write_result {
                 Err(cause) => {
-                    error!("failed to write data to socket: {cause}");
+                    error!("{conn_id} failed to write data to socket: {cause}");
                     break;
                 },
                 Ok(_) => {
@@ -282,7 +298,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let downloaded = ByteSize(g_stats.total_downloaded_bytes() as u64);
             let uploaded = ByteSize(g_stats.total_uploaded_bytes() as u64);
             let total_conn_count = g_stats.conn_count();
-            info!("**  Active: {active}/Total: {total_conn_count}/UP: {uploaded}/Down: {downloaded} **");
+            info!("**  Stats: active: {active} total: {total_conn_count} up: {uploaded} down: {downloaded} **");
         }
     });
     for next_future in futures {

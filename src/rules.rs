@@ -30,7 +30,6 @@ impl RuleSetRaw {
             blacklist,
         };
 
-        println!("{result:#?}");
         return result;
     }
 
