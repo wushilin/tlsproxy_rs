@@ -244,7 +244,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = CliArg::parse();
 
     let log_level = args.log_level;
-    setup_logger(true, Some(&log_level));
+    setup_logger(false, Some(&log_level));
     for i in &args.bind {
         info!("{i}");
     }
