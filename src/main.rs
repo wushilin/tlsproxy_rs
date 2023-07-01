@@ -214,9 +214,14 @@ async fn run_pair(acl_in:Arc<Option<rules::RuleSet>>, bind:String, rport:i32, g_
 }
 
 async fn handle_socket(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, laddr:String, rport:i32, gstat:Arc<GlobalStats>, blacklist:Arc<Vec<IpAddr>>) {
-    let remote_addr = socket.peer_addr().unwrap();
     let cstat = Arc::new(ConnStats::new(Arc::clone(&gstat)));
     let conn_id = cstat.id_str();
+    let remote_addr = socket.peer_addr();
+    if remote_addr.is_err() {
+        error!("{conn_id} has no remote peer info. closed");
+        return;
+    } 
+    let remote_addr = remote_addr.unwrap();
     info!("{conn_id} started: from {remote_addr} via {laddr}");
     let cstat_clone = Arc::clone(&cstat);
     let result = handle_socket_inner(acl, socket, rport, cstat_clone, blacklist).await;
