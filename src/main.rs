@@ -90,7 +90,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
             if ! check_result {
                 return Err(errors::PipeError::wrap_box(format!("rejected by ACL")))
             } else {
-                info!("acl pass: [{tlshost}]");
+                info!("{conn_id} acl pass: [{tlshost}]");
             }
         },
         _ => {
@@ -119,6 +119,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
     let conn_stats2 = Arc::clone(&conn_stats);
     // L -> R path
     let jh_lr = tokio::spawn( async move {
+        let direction = ">>>";
         let mut buf = vec![0; 4096];
         let conn_id = conn_stats1.id_str();
         loop {
@@ -127,7 +128,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
                 .await;
             match nr {
                 Err(cause) => {
-                    error!("{conn_id} failed to read data from socket: {cause}");
+                    error!("{conn_id} {direction} failed to read data from socket: {cause}");
                     return;
                 },
                 _ =>{}
@@ -143,7 +144,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
                 .await;
             match write_result {
                 Err(cause) => {
-                    error!("{conn_id} failed to write data to socket: {cause}");
+                    error!("{conn_id} {direction} failed to write data to socket: {cause}");
                     break;
                 },
                 Ok(_) => {
@@ -155,6 +156,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
 
     // R -> L path
     let jh_rl = tokio::spawn(async move {
+        let direction = "<<<";
         let conn_id = conn_stats2.id_str();
         let mut buf = vec![0; 4096];
         loop {
@@ -164,7 +166,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
     
             match nr {
                 Err(cause) => {
-                    error!("{conn_id} failed to read data from socket: {cause}");
+                    error!("{conn_id} {direction} failed to read data from socket: {cause}");
                     return;
                 },
                 _ =>{}
@@ -179,7 +181,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
                 .await;
             match write_result {
                 Err(cause) => {
-                    error!("{conn_id} failed to write data to socket: {cause}");
+                    error!("{conn_id} {direction} failed to write data to socket: {cause}");
                     break;
                 },
                 Ok(_) => {
@@ -225,7 +227,7 @@ async fn handle_socket(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, laddr:
     let elapsed = cstat.elapsed();
     match result {
         Err(cause) => {
-            info!("{conn_id} failed. cause: {cause}");
+            error!("{conn_id} failed. cause: {cause}");
         },
         Ok(_) => {
 
@@ -271,6 +273,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let tokens = next_bind.split(":").collect::<Vec<&str>>();
         if tokens.len() != 3 {
             error!("invalid specification {next_bind}");
+            continue;
         }
         let self_addresses_clone = Arc::clone(&self_addresses_arc);
         let bind_addr = tokens[0];
