@@ -74,6 +74,8 @@ fn is_address_in(ip_addr:IpAddr, target:&Arc<Vec<IpAddr>>)->bool{
     return false;
 }
 
+// Try to read up to min bytes for TLS header
+// Returns error if it failed to do so
 async fn read_header_with_timeout(stream:&TcpStream, buffer:&mut [u8], min:usize, timeout:Duration) -> Result<usize, Box<dyn Error>> {
     let start = Instant::now();
     let mut read_count:usize = 0;
@@ -86,7 +88,10 @@ async fn read_header_with_timeout(stream:&TcpStream, buffer:&mut [u8], min:usize
         let read_result = stream.try_read(&mut buffer[read_count..]);
         match read_result {
             Ok(0) => {
-                return Ok(read_count);
+                if read_count >= min {
+                    return Ok(read_count);
+                }
+                return Err(errors::PipeError::wrap_box(format!("eof before complete header. received {read_count} bytes < {min} bytes")));
             },
             Ok(n) => {
                 read_count = read_count + n;
