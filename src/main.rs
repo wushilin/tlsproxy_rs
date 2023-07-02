@@ -4,6 +4,7 @@ pub mod errors;
 pub mod rules;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use std::time::{Instant};
 use log::{error, info, LevelFilter, Record};
 
 use std::io::Write;
@@ -19,6 +20,7 @@ use statistics::{GlobalStats, ConnStats};
 use std::time::{Duration};
 use bytesize::ByteSize;
 use tlsheader::{parse};
+
 
 #[derive(Parser, Debug, Clone)]
 pub struct CliArg {
@@ -72,11 +74,46 @@ fn is_address_in(ip_addr:IpAddr, target:&Arc<Vec<IpAddr>>)->bool{
     return false;
 }
 
-async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStream, rport: i32, conn_stats:Arc<ConnStats>, blacklist:Arc<Vec<IpAddr>>
+async fn read_header_with_timeout(stream:&TcpStream, buffer:&mut [u8], timeout:Duration) -> Result<usize, Box<dyn Error>> {
+    let start = Instant::now();
+    let min = 30;
+    let mut read_count:usize = 0;
+    loop {
+        if start.elapsed() > timeout {
+            return Err(errors::PipeError::wrap_box("tls header read timeout".to_string()));
+        }
+        // Check if the stream is ready to be read
+
+        let read_result = stream.try_read(&mut buffer[read_count..]);
+        match read_result {
+            Ok(0) => {
+                // EOF;
+                return Ok(read_count);
+            },
+            Ok(n) => {
+                read_count = read_count + n;
+                if read_count >= min {
+                    return Ok(read_count);
+                }
+            },
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                continue;
+            },
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, rport: i32, conn_stats:Arc<ConnStats>, blacklist:Arc<Vec<IpAddr>>
 ) -> Result<(), Box<dyn Error>> {
     let conn_id = conn_stats.id_str();
     let mut client_hello_buf = vec![0;1024];
-    let tls_client_hello_size = socket.read(&mut client_hello_buf).await?;
+    let read_result = read_header_with_timeout(&socket, &mut client_hello_buf, Duration::from_secs(3));
+
+    let tls_client_hello_size = read_result.await?;
     if tls_client_hello_size == 0 {
         return Err(errors::PipeError::wrap_box(format!("tls client hello read error")));
     }
