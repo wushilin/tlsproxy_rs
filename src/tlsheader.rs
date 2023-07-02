@@ -60,7 +60,7 @@ fn to_int(data: &[u8]) -> usize {
 pub fn parse(client_hello: &[u8]) -> Result<ClientHello, Box<dyn std::error::Error>> {
     let len = client_hello.len();
     if !pre_check(client_hello) {
-        return Err(Box::new(SNIError { msg: format!("tls header pre check failed ({len} bytes") }));
+        return Err(Box::new(SNIError { msg: format!("tls header pre check failed ({len} bytes)") }));
     }
     if client_hello[0] != 0x16 {
         return Err(Box::new(SNIError { msg: String::from("invalid initial byte. Expect 0x16") }));
