@@ -126,7 +126,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, 
         Some(acl_inner) => {
             let check_result = acl_inner.check_access(&tlshost);
             if ! check_result {
-                return Err(errors::PipeError::wrap_box(format!("rejected by ACL")))
+                return Err(errors::PipeError::wrap_box(format!("acl reject: [{tlshost}]")))
             } else {
                 info!("{conn_id} acl pass: [{tlshost}]");
             }
