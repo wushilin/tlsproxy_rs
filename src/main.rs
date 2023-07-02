@@ -75,10 +75,7 @@ fn is_address_in(ip_addr:IpAddr, target:&Arc<Vec<IpAddr>>)->bool{
 async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStream, rport: i32, conn_stats:Arc<ConnStats>, blacklist:Arc<Vec<IpAddr>>
 ) -> Result<(), Box<dyn Error>> {
     let conn_id = conn_stats.id_str();
-    let mut client_hello_buf = Vec::with_capacity(1024);
-    unsafe {
-        client_hello_buf.set_len(1024);
-    }
+    let mut client_hello_buf = vec![0;1024];
     let tls_client_hello_size = socket.read(&mut client_hello_buf).await?;
     if tls_client_hello_size == 0 {
         return Err(errors::PipeError::wrap_box(format!("tls client hello read error")));
@@ -122,10 +119,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
     // L -> R path
     let jh_lr = tokio::spawn( async move {
         let direction = ">>>";
-        let mut buf = Vec::with_capacity(4096);
-        unsafe {
-            client_hello_buf.set_len(4096);
-        }
+        let mut buf = vec![0; 4096];
         let conn_id = conn_stats1.id_str();
         loop {
             let nr = lr
@@ -163,10 +157,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, mut socket:TcpStre
     let jh_rl = tokio::spawn(async move {
         let direction = "<<<";
         let conn_id = conn_stats2.id_str();
-        let mut buf = Vec::with_capacity(4096);
-        unsafe {
-            buf.set_len(4096);
-        }
+        let mut buf = vec![0;4096];
         loop {
             let nr = rr
                 .read(&mut buf)
