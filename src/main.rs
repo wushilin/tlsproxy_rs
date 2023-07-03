@@ -2,11 +2,14 @@ pub mod statistics;
 pub mod tlsheader;
 pub mod errors;
 pub mod rules;
+pub mod idletracker;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use std::time::{Instant};
-use log::{error, info, LevelFilter, Record};
+use log::{error, info, debug, LevelFilter, Record};
 
+use futures::lock::Mutex;
 use std::io::Write;
 use std::thread;
 use std::net::{Ipv4Addr, Ipv6Addr, IpAddr, ToSocketAddrs};
@@ -155,6 +158,14 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, 
     conn_stats.add_uploaded_bytes(tls_client_hello_size);
     let conn_stats1 = Arc::clone(&conn_stats);
     let conn_stats2 = Arc::clone(&conn_stats);
+    let idle_tracker = Arc::new(
+        Mutex::new (
+            idletracker::IdleTracker::new(Duration::from_secs(10))
+        )
+    );
+
+    let idle_tracker1 = Arc::clone(&idle_tracker);
+    let idle_tracker2 = Arc::clone(&idle_tracker);
     // L -> R path
     let jh_lr = tokio::spawn( async move {
         let direction = ">>>";
@@ -187,6 +198,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, 
                 },
                 Ok(_) => {
                     conn_stats1.add_uploaded_bytes(n);
+                    idle_tracker1.lock().await.mark();
                 }
             }
         }
@@ -224,17 +236,44 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, 
                 },
                 Ok(_) => {
                     conn_stats2.add_downloaded_bytes(n);
+                    idle_tracker2.lock().await.mark();
                 }
             }
         }
 
     });
-    jh_lr.await?;
-    jh_rl.await?;
+
+    let idlechecker = tokio::spawn(
+        async move {
+            loop {
+                if jh_lr.is_finished() && jh_rl.is_finished() {
+                    debug!("{conn_id} both direction terminated gracefully");
+                    break;
+                }
+                if idle_tracker.lock().await.is_expired() {
+                    let idle_max = idle_tracker.lock().await.max_idle();
+                    let idled_for = idle_tracker.lock().await.idled_for();
+                    info!("{conn_id} connection idled {idled_for:#?} > {idle_max:#?}. cancelling");
+                    if !jh_lr.is_finished() {
+                        jh_lr.abort();
+                    }
+                    if !jh_rl.is_finished() {
+                        jh_rl.abort();
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    );
+    //jh_lr.await?;
+    //jh_rl.await?;
+    idlechecker.await?;
     return Ok(());
 }
+
 async fn run_pair(acl_in:Arc<Option<rules::RuleSet>>, bind:String, rport:i32, g_stats:Arc<GlobalStats>, self_addresses:Arc<Vec<IpAddr>>) -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind(&bind).await?;
+    let listener: TcpListener = TcpListener::bind(&bind).await?;
     info!("Listening on: {}", &bind);
 
     loop {
