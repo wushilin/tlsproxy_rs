@@ -19,3 +19,7 @@ futures = "0.3.28"
 [[bin]]
 name="tlsproxy"
 path="src/main.rs"
+
+[[bin]]
+name="test"
+path="src/test.rs"

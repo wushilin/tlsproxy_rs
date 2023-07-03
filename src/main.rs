@@ -270,7 +270,7 @@ async fn handle_socket_inner(socket:TcpStream, rport: i32, conn_stats:Arc<ConnSt
                     }
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     );
