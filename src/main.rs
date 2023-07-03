@@ -155,9 +155,9 @@ async fn handle_socket_inner(socket:TcpStream, rport: i32, conn_stats:Arc<ConnSt
             return Err(errors::PipeError::wrap_box(format!("rejected self connection")));
         }
     }
-
     let r_stream = TcpStream::connect(raddr).await?;
-    info!("{conn_id} connected.");
+    let local_addr = r_stream.local_addr()?;
+    info!("{conn_id} connected via {local_addr}. ");
     let (mut lr, mut lw) = tokio::io::split(socket);
     let (mut rr, mut rw) = tokio::io::split(r_stream);
 
