@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 
+#[derive(Debug)]
 pub struct ConnStats {
     id: usize,
     start: Instant,
@@ -79,6 +80,7 @@ impl Clone for ConnStats {
     }
 }
 
+#[derive(Debug)]
 pub struct GlobalStats {
     id_gen: Arc<AtomicUsize>,
     conn_count: Arc<AtomicUsize>,

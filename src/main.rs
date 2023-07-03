@@ -19,11 +19,10 @@ use env_logger::Builder;
 use std::error::Error;
 use clap::Parser;
 use std::sync::Arc;
-use statistics::{GlobalStats, ConnStats};
+use statistics::{ConnStats};
 use std::time::{Duration};
 use bytesize::ByteSize;
 use tlsheader::{parse};
-
 
 #[derive(Parser, Debug, Clone)]
 pub struct CliArg {
@@ -37,6 +36,16 @@ pub struct CliArg {
     pub self_ip: Vec<String>,
     #[arg(long, default_value_t=String::from(""), help="acl files. see `rules.json`")]
     pub acl:String,
+    #[arg(long, default_value_t=300, help="close connection after max idle in seconds")]
+    pub max_idle: i32,
+}
+
+#[derive(Debug)]
+struct ExecutionContext {
+    pub self_ip: Arc<Vec<IpAddr>>,
+    pub acl: Arc<Option<rules::RuleSet>>,
+    pub max_idle: i32,
+    pub stats: Arc<statistics::GlobalStats>,
 }
 
 pub fn setup_logger(log_thread: bool, rust_log: Option<&str>) {
@@ -112,8 +121,7 @@ async fn read_header_with_timeout(stream:&TcpStream, buffer:&mut [u8], min:usize
 
     }
 }
-async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, rport: i32, conn_stats:Arc<ConnStats>, blacklist:Arc<Vec<IpAddr>>
-) -> Result<(), Box<dyn Error>> {
+async fn handle_socket_inner(socket:TcpStream, rport: i32, conn_stats:Arc<ConnStats>, ctx:Arc<ExecutionContext>) -> Result<(), Box<dyn Error>> {
     let conn_id = conn_stats.id_str();
     let mut client_hello_buf = vec![0;1024];
     let read_result = read_header_with_timeout(&socket, &mut client_hello_buf, 32,  Duration::from_secs(5));
@@ -125,7 +133,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, 
 
     let tls_header_parsed = parse(&client_hello_buf[0..tls_client_hello_size])?;
     let tlshost = tls_header_parsed.sni_host;
-    match acl.as_ref() {
+    match ctx.acl.as_ref() {
         Some(acl_inner) => {
             let check_result = acl_inner.check_access(&tlshost);
             if ! check_result {
@@ -143,7 +151,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, 
     let raddr_list = raddr.to_socket_addrs()?;
     for next_addr in raddr_list {
         let next_addr_ip = next_addr.ip();
-        if is_address_in(next_addr_ip, &blacklist) {
+        if is_address_in(next_addr_ip, &ctx.self_ip) {
             return Err(errors::PipeError::wrap_box(format!("rejected self connection")));
         }
     }
@@ -160,7 +168,7 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, 
     let conn_stats2 = Arc::clone(&conn_stats);
     let idle_tracker = Arc::new(
         Mutex::new (
-            idletracker::IdleTracker::new(Duration::from_secs(10))
+            idletracker::IdleTracker::new(Duration::from_secs(ctx.max_idle as u64))
         )
     );
 
@@ -272,26 +280,24 @@ async fn handle_socket_inner(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, 
     return Ok(());
 }
 
-async fn run_pair(acl_in:Arc<Option<rules::RuleSet>>, bind:String, rport:i32, g_stats:Arc<GlobalStats>, self_addresses:Arc<Vec<IpAddr>>) -> Result<(), Box<dyn Error>> {
+async fn run_pair(bind:String, rport:i32, ctx:Arc<ExecutionContext>) -> Result<(), Box<dyn Error>> {
     let listener: TcpListener = TcpListener::bind(&bind).await?;
     info!("Listening on: {}", &bind);
 
     loop {
         // Asynchronously wait for an inbound socket.
         let (socket, _) = listener.accept().await?;
-        let local_gstats = Arc::clone(&g_stats);
         let laddr = bind.clone();
-        let local_blacklist = Arc::clone(&self_addresses);
-        let acl = Arc::clone(&acl_in);
+        let local_ctx = Arc::clone(&ctx);
         tokio::spawn(async move {
             //handle_incoming(socket);
-            let _ = handle_socket(acl, socket, laddr, rport, local_gstats, local_blacklist).await;
+            let _ = handle_socket(socket, laddr, rport, local_ctx).await;
         });
     }
 }
 
-async fn handle_socket(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, laddr:String, rport:i32, gstat:Arc<GlobalStats>, blacklist:Arc<Vec<IpAddr>>) {
-    let cstat = Arc::new(ConnStats::new(Arc::clone(&gstat)));
+async fn handle_socket(socket:TcpStream, laddr:String, rport:i32, ctx:Arc<ExecutionContext>) {
+    let cstat = Arc::new(ConnStats::new(Arc::clone(&ctx.stats)));
     let conn_id = cstat.id_str();
     let remote_addr = socket.peer_addr();
     if remote_addr.is_err() {
@@ -301,7 +307,7 @@ async fn handle_socket(acl:Arc<Option<rules::RuleSet>>, socket:TcpStream, laddr:
     let remote_addr = remote_addr.unwrap();
     info!("{conn_id} started: from {remote_addr} via {laddr}");
     let cstat_clone = Arc::clone(&cstat);
-    let result = handle_socket_inner(acl, socket, rport, cstat_clone, blacklist).await;
+    let result = handle_socket_inner(socket, rport, cstat_clone, ctx).await;
     let up_bytes = cstat.uploaded_bytes();
     let down_bytes = cstat.downloaded_bytes();
     let up_bytes_str = ByteSize(up_bytes as u64);
@@ -331,47 +337,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
         info!("Binding config: {i}");
     }
 
+
+    let global_stats = statistics::GlobalStats::new();
     let acl_file = args.acl;
-    let mut acl_o = None;
+    let mut acl:Option<rules::RuleSet> = None;
     if acl_file.len() > 0 {
-        acl_o = Some(rules::parse(&acl_file).unwrap())
+        acl = Some(rules::parse(&acl_file).unwrap());
     }
-    let acl = Arc::new(acl_o);
-    let mut self_addresses= Vec::<IpAddr>::new();
+    let mut self_ips = Vec::new();
     for i in &args.self_ip {
         let ipv4 = i.parse::<Ipv4Addr>();
         let ipv6 = i.parse::<Ipv6Addr>();
         if ipv4.is_ok() {
-            self_addresses.push(IpAddr::V4(ipv4.unwrap()));
+            let ipv4 = IpAddr::V4(ipv4.unwrap());
+            info!("Added self IPv4 address: {ipv4}");
+            self_ips.push(ipv4);
         }
         if ipv6.is_ok() {
-            self_addresses.push(IpAddr::V6(ipv6.unwrap()));
+            let ipv6 = IpAddr::V6(ipv6.unwrap());
+            info!("Added self IPv6 address: {ipv6}");
+            self_ips.push(ipv6);
         }
     }
-    for addr in &self_addresses {
-        info!("Added self address: {addr}");
-    }
-    let self_addresses_arc = Arc::new(self_addresses);
+    let ctx = ExecutionContext {
+        self_ip: Arc::new(self_ips),
+        acl: Arc::new(acl),
+        max_idle: args.max_idle,
+        stats: Arc::new(global_stats),
+    };
+    info!("Execution context: {ctx:#?}");
     let mut futures = Vec::new();
-    let global_stats = statistics::GlobalStats::new();
-    let g_stats = Arc::new(global_stats);
+    let ctx = Arc::new(ctx);
     for next_bind in args.bind {
         let tokens = next_bind.split(":").collect::<Vec<&str>>();
         if tokens.len() != 3 {
             error!("invalid specification {next_bind}");
             continue;
         }
-        let self_addresses_clone = Arc::clone(&self_addresses_arc);
         let bind_addr = tokens[0];
         let bind_port = tokens[1];
         let target_port = tokens[2];
         let bind_addr = format!("{bind_addr}:{bind_port}");
         let target_port:i32 = target_port.parse().unwrap();
-        let new_g_stats = Arc::clone(&g_stats);
-        let acl_c = Arc::clone(&acl);
+        let ctx = Arc::clone(&ctx);
         let jh = tokio::spawn(async move {
             let bind_c = next_bind.clone();
-            let result = run_pair(acl_c, bind_addr, target_port, new_g_stats, self_addresses_clone).await;
+            
+            let result = run_pair(bind_addr, target_port, ctx).await;
             if let Err(cause) = result {
                 error!("error running tlsproxy for {bind_c} caused by {cause}");
             }
@@ -379,14 +391,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         futures.push(jh);
     }
 
-    let g_stats = Arc::clone(&g_stats);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(args.ri as u64)).await;
-            let active = g_stats.active_conn_count();
-            let downloaded = ByteSize(g_stats.total_downloaded_bytes() as u64);
-            let uploaded = ByteSize(g_stats.total_uploaded_bytes() as u64);
-            let total_conn_count = g_stats.conn_count();
+            let active = ctx.stats.active_conn_count();
+            let downloaded = ByteSize(ctx.stats.total_downloaded_bytes() as u64);
+            let uploaded = ByteSize(ctx.stats.total_uploaded_bytes() as u64);
+            let total_conn_count = ctx.stats.conn_count();
             info!("**  Stats: active: {active} total: {total_conn_count} up: {uploaded} down: {downloaded} **");
         }
     });

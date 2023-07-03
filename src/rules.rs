@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use serde_json::{Value};
+#[derive(Debug)]
 pub struct RuleSet {
     default_allow: bool,
     allowed_static_hosts: HashMap<String, bool>,
