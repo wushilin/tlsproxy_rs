@@ -26,6 +26,27 @@ It starts 2 listeners:
 * one listens on 443, and forward the requests to SNI hosts port 443
 * one listens on 3465, and forward the request to SNI hosts port 465
 
+# Other options
+You may get help by using `-h` or `--help` on the compiled binary.
+
+```bash
+$ target/x86_64-unknown-linux-musl/release/tlsproxy --help
+
+Usage: tlsproxy [OPTIONS]
+
+Options:
+  -b, --bind <BIND>                    forward config `bind_ip:bind_port:forward_port` format (repeat for multiple)
+  -r, --ri <RI>                        stats report interval in ms [default: 30000]
+      --log-conf-file <LOG_CONF_FILE>  log4rs config yaml file path [default: log4rs.yaml]
+      --self-ip <SELF_IP>              self IP address to reject (repeat for multiple)
+      --acl <ACL>                      acl files. see `rules.json` [default: ]
+      --max-idle <MAX_IDLE>            close connection after max idle in seconds [default: 300]
+  -h, --help 
+
+```
+
+Note: idle is defined as the duration that both direction had no traffic (no bytes written successfully).
+
 # Avoid connecting to self
 The program will cause infinite loop if it connects to itself. To avoid that, you can specify a self ip by
 --self-ip "ip1" --self-ip "ip2". 
@@ -67,6 +88,9 @@ All checks are case insensitive.
 If you want to be exactly match by pattern, either use `host:xxxxx`, or `pattern:^xxxxx$`.
 
 
+# Logging
+The software uses log4rs. A handy log4rs.yaml is given by default. Specify the log config file by using
+`--log-conf-file`. The default config file is `./log4rs.yaml`.
 
 # Enjoy
 

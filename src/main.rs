@@ -42,9 +42,10 @@ struct ExecutionContext {
     pub stats: Arc<statistics::GlobalStats>,
 }
 
-pub fn setup_logger(log_conf_file:String) {
-    println!("Logs will be sent according to config file {log_conf_file}");
-    log4rs::init_file(log_conf_file, Default::default()).unwrap();
+pub fn setup_logger(log_conf_file:&str) ->Result<(), Box<dyn Error>> {
+    log4rs::init_file(log_conf_file, Default::default())?;
+    println!("logs will be sent according to config file {log_conf_file}");
+    Ok(())
 }
 
 fn is_address_in(ip_addr:IpAddr, target:&Arc<Vec<IpAddr>>)->bool{
@@ -297,7 +298,13 @@ async fn handle_socket(socket:TcpStream, laddr:String, rport:i32, ctx:Arc<Execut
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = CliArg::parse();
     let log_conf_file = args.log_conf_file;
-    setup_logger(log_conf_file);
+    match setup_logger(&log_conf_file) {
+        Err(cause) => {
+            println!("failed to setup logger using config file `{log_conf_file}` : {cause}");
+            return Ok(());
+        },
+        _ => {}
+    }
 
     if args.bind.len() == 0 {
         error!(target:"tlsproxy", "no binding arguments provided. please provide via `-b` or `--bind`");
