@@ -6,18 +6,18 @@ pub mod idletracker;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use std::time::{Instant};
+use std::time::{Instant, Duration};
 
 use futures::lock::Mutex;
 use std::net::{Ipv4Addr, Ipv6Addr, IpAddr, ToSocketAddrs};
 use std::error::Error;
 use clap::Parser;
 use std::sync::Arc;
-use statistics::{ConnStats};
-use std::time::{Duration};
+use statistics::ConnStats;
 use bytesize::ByteSize;
-use tlsheader::{parse};
+use tlsheader::parse;
 use log::{error, info, debug};
+
 #[derive(Parser, Debug, Clone)]
 pub struct CliArg {
     #[arg(short, long, help="forward config `bind_ip:bind_port:forward_port` format (repeat for multiple)")]

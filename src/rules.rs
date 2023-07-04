@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::Read;
-use serde_json::{Value};
+use serde_json::Value;
 #[derive(Debug)]
 pub struct RuleSet {
     default_allow: bool,
