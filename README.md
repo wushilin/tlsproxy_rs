@@ -72,7 +72,8 @@ Example
     "blacklist":[
         "host:a",
         "host:b",
-        "pattern:www.goddogle.com"
+        "pattern:www.goddogle.com",
+        "$any"
     ]
 }
 ```
@@ -86,7 +87,9 @@ All checks are case insensitive.
 `host:xxx` is valid just for host xxx using exact match.
 `pattern:xxx` is valid if regular expression xxx matches the host name to connect. It also matches xxxxx, xxxxxx....
 If you want to be exactly match by pattern, either use `host:xxxxx`, or `pattern:^xxxxx$`.
+`$any` is valid for all hosts. It is more efficient thatn `pattern:^.*$` because it requires no matching.
 
+It would set the whole rule to instant `true` without matching attempt. It superseds all sibling rules.
 
 # Logging
 The software uses log4rs. A handy log4rs.yaml is given by default. Specify the log config file by using
