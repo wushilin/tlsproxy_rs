@@ -7,6 +7,8 @@ use serde_json::Value;
 #[derive(Debug)]
 pub struct RuleSet {
     default_allow: bool,
+    allowed_all: bool,
+    rejected_all: bool,
     allowed_static_hosts: HashMap<String, bool>,
     rejected_static_hosts: HashMap<String, bool>,
     allowed_patterns: Vec<Regex>,
@@ -71,6 +73,8 @@ impl RuleSetRaw {
             allowed_patterns: Vec::new(),
             rejected_static_hosts: HashMap::new(),
             rejected_patterns: Vec::new(),
+            allowed_all: false,
+            rejected_all: false,
         };
 
         match self.no_match_decision.to_lowercase().as_str() {
@@ -82,11 +86,15 @@ impl RuleSetRaw {
 
         for rule in &self.whitelist {
             let rule = rule.to_lowercase();
+            if rule == "$any" {
+                result.allowed_all = true;
+                continue;
+            }
             if rule.starts_with("host:") {
                 result.allowed_static_hosts.insert(rule[5..].to_owned(), true);
             } else if rule.starts_with("pattern:") {
                 let mut pattern = rule[8..].to_owned();
-                if !pattern.ends_with("(?i)") {
+                if !pattern.starts_with("(?i)") {
                     pattern = "(?i)".to_owned() + &pattern;
                 }
                 result.allowed_patterns.push(Regex::new(&pattern)?);
@@ -97,11 +105,15 @@ impl RuleSetRaw {
 
         for rule in &self.blacklist {
             let rule = rule.to_lowercase();
+            if rule == "$any" {
+                result.rejected_all = true;
+                continue;
+            }
             if rule.starts_with("host:") {
                 result.rejected_static_hosts.insert(rule[5..].to_owned(), true);
             } else if rule.starts_with("pattern:") {
                 let mut pattern = rule[8..].to_owned();
-                if !pattern.ends_with("(?i)") {
+                if !pattern.starts_with("(?i)") {
                     pattern = "(?i)".to_owned() + &pattern;
                 }
                 result.rejected_patterns.push(Regex::new(&pattern)?);
@@ -128,8 +140,14 @@ pub fn parse(file: &str) -> Result<RuleSet, Box<dyn Error>> {
 impl RuleSet {
     pub fn check_access(&self, target_host: &str) -> bool {
         if self.default_allow {
+            if self.rejected_all {
+                return false;
+            }
             !check_match(target_host, &self.rejected_static_hosts, &self.rejected_patterns)
         } else {
+            if self.allowed_all {
+                return true;
+            }
             check_match(target_host, &self.allowed_static_hosts, &self.allowed_patterns)
         }
     }
