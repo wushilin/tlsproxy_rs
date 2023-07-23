@@ -41,7 +41,8 @@ Options:
       --self-ip <SELF_IP>              self IP address to reject (repeat for multiple)
       --acl <ACL>                      acl files. see `rules.json` [default: ]
       --max-idle <MAX_IDLE>            close connection after max idle in seconds [default: 300]
-  -h, --help 
+      --resolve-conf <RESOLVE_CONF>    special port resolve conf [default: ]
+  -h, --help                           Print help
 
 ```
 
