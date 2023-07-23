@@ -133,11 +133,11 @@ When connect connects to your services and try to send TLS header to connect to 
 
 Note about the order: 
 
-* Initial port mapping is done first
-* Special host resolution (resolve-conf) is performed second (after mapped port)
-* ACL is evaluated third (after special host resolution done)
+* Initial port mapping is done first. Your `0.0.0.0:443:1443` (`1443` is the mapped port)
+* Special host resolution (resolve-conf) is performed second (after mapped port).
+* ACL is evaluated third using resolved `HostAndPort` (after special host resolution done)
 * Actual DNS lookup is performed, self IP address is checked
-* TLS Proxy piping is done
+* TLS Proxy piping is done at last
 
 # Enjoy
 
