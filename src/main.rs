@@ -35,7 +35,7 @@ pub struct CliArg {
     #[arg(long, default_value_t=300, help="close connection after max idle in seconds")]
     pub max_idle: i32,
     #[arg(long, default_value_t=String::from(""), help="special port resolve conf")]
-    pub resove_conf:String,
+    pub resolve_conf:String,
 }
 
 #[derive(Debug)]
