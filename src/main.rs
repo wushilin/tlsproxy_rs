@@ -335,8 +335,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut resolver:ResolveConfig = ResolveConfig::empty().unwrap();
-    if args.resove_conf.len() > 0 {
-        resolver = ResolveConfig::load_from_json_file(&args.resove_conf).expect("Failed to load `resolve_conf` file");
+    if args.resolve_conf.len() > 0 {
+        resolver = ResolveConfig::load_from_json_file(&args.resolve_conf).expect("Failed to load `resolve_conf` file");
     }
 
     let resolver = Arc::new(resolver);
