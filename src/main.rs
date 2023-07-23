@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use std::time::{Instant, Duration};
 
-use resolve::{ResolveConfig, HostAndPort};
+use resolve::{ResolveConfig};
 use futures::lock::Mutex;
 use std::net::{Ipv4Addr, Ipv6Addr, IpAddr, ToSocketAddrs};
 use std::error::Error;

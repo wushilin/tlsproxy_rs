@@ -1,7 +1,5 @@
 pub mod statistics;
 
-use statistics::{GlobalStats, ConnStats};
-use std::sync::Arc;
 pub mod resolve;
 #[tokio::main]
 async fn main() {
