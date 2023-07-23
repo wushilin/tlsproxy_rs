@@ -50,7 +50,7 @@ Note: idle is defined as the duration that both direction had no traffic (no byt
 
 # Avoid connecting to self
 The program will cause infinite loop if it connects to itself. To avoid that, you can specify a self ip by
---self-ip "ip1" --self-ip "ip2". 
+`--self-ip "ip1" --self-ip "ip2"`. 
 
 When SNI info points to host that would resolve to one of the self IP addresses, the connection will be rejected.
 
