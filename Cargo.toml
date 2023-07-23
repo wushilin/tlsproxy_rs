@@ -14,6 +14,7 @@ serde_json = "1.0.99"
 futures = "0.3.28"
 log4rs = { version="1.2.0", features = ["gzip", "background_rotation"] }
 log = "0.4.19"
+serde = "1"
 
 [[bin]]
 name="tlsproxy"

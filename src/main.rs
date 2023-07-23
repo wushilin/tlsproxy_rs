@@ -3,11 +3,13 @@ pub mod tlsheader;
 pub mod errors;
 pub mod rules;
 pub mod idletracker;
+pub mod resolve;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use std::time::{Instant, Duration};
 
+use resolve::{ResolveConfig, HostAndPort};
 use futures::lock::Mutex;
 use std::net::{Ipv4Addr, Ipv6Addr, IpAddr, ToSocketAddrs};
 use std::error::Error;
@@ -32,6 +34,8 @@ pub struct CliArg {
     pub acl:String,
     #[arg(long, default_value_t=300, help="close connection after max idle in seconds")]
     pub max_idle: i32,
+    #[arg(long, default_value_t=String::from(""), help="special port resolve conf")]
+    pub resove_conf:String,
 }
 
 #[derive(Debug)]
@@ -40,6 +44,7 @@ struct ExecutionContext {
     pub acl: Arc<Option<rules::RuleSet>>,
     pub max_idle: i32,
     pub stats: Arc<statistics::GlobalStats>,
+    pub resolver: Arc<ResolveConfig>,
 }
 
 pub fn setup_logger(log_conf_file:&str) ->Result<(), Box<dyn Error>> {
@@ -103,7 +108,22 @@ async fn handle_socket_inner(socket:TcpStream, rport: i32, conn_stats:Arc<ConnSt
     }
 
     let tls_header_parsed = parse(&client_hello_buf[0..tls_client_hello_size])?;
-    let tlshost = tls_header_parsed.sni_host;
+    let mut tlshost = tls_header_parsed.sni_host;
+    let mut rport = rport;
+    let resolve_result = ctx.resolver.resolve(&tlshost, rport);
+    
+    match resolve_result {
+        Some(result) => {
+            let new_host = result.host;
+            let new_port = result.port;
+            info!(target:"tlsproxy", "{conn_id} resolved {tlshost}:{rport} => {new_host}:{new_port}");
+            tlshost = new_host;
+            rport = new_port;
+        },
+        _ => {
+            // resolve didn't have special configs, let it keep original config
+        }
+    }
     match ctx.acl.as_ref() {
         Some(acl_inner) => {
             let check_result = acl_inner.check_access(&tlshost);
@@ -314,7 +334,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         info!(target:"tlsproxy", "Binding config: {i}");
     }
 
+    let mut resolver:ResolveConfig = ResolveConfig::empty().unwrap();
+    if args.resove_conf.len() > 0 {
+        resolver = ResolveConfig::load_from_json_file(&args.resove_conf).expect("Failed to load `resolve_conf` file");
+    }
 
+    let resolver = Arc::new(resolver);
     let global_stats = statistics::GlobalStats::new();
     let acl_file = args.acl;
     let mut acl:Option<rules::RuleSet> = None;
@@ -341,6 +366,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         acl: Arc::new(acl),
         max_idle: args.max_idle,
         stats: Arc::new(global_stats),
+        resolver: Arc::clone(&resolver),
     };
     info!(target:"tlsproxy", "Execution context: {ctx:#?}");
     let mut futures = Vec::new();

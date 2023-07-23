@@ -1,0 +1,24 @@
+{
+    "rules": [
+        {
+            "from": {
+                "host": "www.google.com",
+                "port": 443
+            },
+            "to": {
+                "host": "www.baidu.com",
+                "port": 443
+            }
+        },
+        {
+            "from": {
+                "host": "www.google1.com",
+                "port": 443
+            },
+            "to": {
+                "host": "www.baidu1.com",
+                "port": 443
+            }
+        }
+    ]
+}
