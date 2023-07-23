@@ -95,5 +95,49 @@ It would set the whole rule to instant `true` without matching attempt. It super
 The software uses log4rs. A handy log4rs.yaml is given by default. Specify the log config file by using
 `--log-conf-file`. The default config file is `./log4rs.yaml`.
 
+# Resolve override
+The TLS Proxy supports special resolve override. The purpose of resolve override is to redirect TLSHost & Port to another host.
+
+To set Resolve Override, specify `--resolve-conf some-rule.json` in command line.
+
+An example of resolve configuration JSON file is as follows:
+
+```json
+{
+    "rules": [
+        {
+            "from": {
+                "host": "www.google.com",
+                "port": 443
+            },
+            "to": {
+                "host": "172.20.11.11",
+                "port": 443
+            }
+        },
+        {
+            "from": {
+                "host": "smtp.google.com",
+                "port": 465
+            },
+            "to": {
+                "host": "some-host.com",
+                "port": 3465
+            }
+        }
+    ]
+}
+```
+
+When connect connects to your services and try to send TLS header to connect to the above hosts in `from` field, the actual attempted host is determined by the `to` field.
+
+Note about the order: 
+
+* Initial port mapping is done first
+* Special host resolution (resolve-conf) is performed second (after mapped port)
+* ACL is evaluated third (after special host resolution done)
+* Actual DNS lookup is performed, self IP address is checked
+* TLS Proxy piping is done
+
 # Enjoy
 

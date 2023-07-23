@@ -6,18 +6,18 @@
                 "port": 443
             },
             "to": {
-                "host": "www.baidu.com",
+                "host": "172.20.11.11",
                 "port": 443
             }
         },
         {
             "from": {
-                "host": "www.google1.com",
-                "port": 443
+                "host": "smtp.google.com",
+                "port": 465
             },
             "to": {
-                "host": "www.baidu1.com",
-                "port": 443
+                "host": "some-host.com",
+                "port": 3465
             }
         }
     ]
