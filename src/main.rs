@@ -114,8 +114,7 @@ async fn handle_socket_inner(socket:TcpStream, rport: i32, conn_stats:Arc<ConnSt
     
     match resolve_result {
         Some(result) => {
-            let new_host = result.host;
-            let new_port = result.port;
+            let (new_host,new_port) = result;
             info!(target:"tlsproxy", "{conn_id} resolved {tlshost}:{rport} => {new_host}:{new_port}");
             tlshost = new_host;
             rport = new_port;

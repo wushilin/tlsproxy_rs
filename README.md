@@ -105,30 +105,19 @@ An example of resolve configuration JSON file is as follows:
 
 ```json
 {
-    "rules": [
-        {
-            "from": {
-                "host": "www.google.com",
-                "port": 443
-            },
-            "to": {
-                "host": "172.20.11.11",
-                "port": 443
-            }
-        },
-        {
-            "from": {
-                "host": "smtp.google.com",
-                "port": 465
-            },
-            "to": {
-                "host": "some-host.com",
-                "port": 3465
-            }
-        }
-    ]
+    "www.google.com;www.g1.com;www.g2.com;www.g3.com:3": "127.0.0.1",
+    "www.baidu.comP465": "127.0.0.1:465",
+    "www.google.com:443": "192.168.44.17"
 }
 ```
+
+You can define multiple hosts to map to the same target host.
+
+When source host has no port, it implies all ports.
+
+When destination has no port, it implies same as lookup source port.
+
+Look up happens for specific host + specific port first, if not found, fall back to host only lookup.
 
 When connect connects to your services and try to send TLS header to connect to the above hosts in `from` field, the actual attempted host is determined by the `to` field.
 
@@ -139,6 +128,10 @@ Note about the order:
 * ACL is evaluated third using resolved `HostAndPort` (after special host resolution done)
 * Actual DNS lookup is performed, self IP address is checked
 * TLS Proxy piping is done at last
+
+NOTE: Both `from.port` and `to.port` can be skipped. If `from.port` is skipped, it is for all ports, except those explicitly configured.
+
+If `to.port` is skipped, it is the mapped port. 
 
 # Enjoy
 
