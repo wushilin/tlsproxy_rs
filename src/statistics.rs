@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub struct ConnStats {
@@ -12,10 +12,10 @@ pub struct ConnStats {
 }
 
 impl ConnStats {
-    pub fn new(gstat:Arc<GlobalStats>) -> ConnStats {
+    pub fn new(gstat: Arc<GlobalStats>) -> ConnStats {
         gstat.increase_conn_count();
         gstat.increase_active_conn_count();
-        let result = ConnStats{
+        let result = ConnStats {
             id: gstat.gen_conn_id(),
             start: Instant::now(),
             uploaded_bytes: new_au(0),
@@ -60,7 +60,6 @@ impl ConnStats {
     pub fn uploaded_bytes(&self) -> usize {
         return self.uploaded_bytes.load(Ordering::SeqCst);
     }
-
 }
 
 impl Drop for ConnStats {
@@ -70,10 +69,10 @@ impl Drop for ConnStats {
 }
 impl Clone for ConnStats {
     fn clone(&self) -> ConnStats {
-        return ConnStats { 
+        return ConnStats {
             id: self.id,
-            start: self.start, 
-            uploaded_bytes: Arc::clone(&self.uploaded_bytes), 
+            start: self.start,
+            uploaded_bytes: Arc::clone(&self.uploaded_bytes),
             downloaded_bytes: Arc::clone(&self.downloaded_bytes),
             global_stats: Arc::clone(&self.global_stats),
         };
@@ -105,7 +104,6 @@ fn new_au(start: usize) -> Arc<AtomicUsize> {
     return Arc::new(au);
 }
 impl GlobalStats {
-
     pub fn new() -> GlobalStats {
         return GlobalStats {
             id_gen: new_au(0),
@@ -124,7 +122,7 @@ impl GlobalStats {
         return self.conn_count.fetch_add(1, Ordering::SeqCst) + 1;
     }
 
-    pub fn conn_count(&self)->usize {
+    pub fn conn_count(&self) -> usize {
         return self.conn_count.load(Ordering::SeqCst);
     }
 

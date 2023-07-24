@@ -16,8 +16,11 @@ impl std::fmt::Display for SNIError {
 }
 
 pub fn pre_check(data: &[u8]) -> bool {
-    data.len() > 5 && data[0] == 0x16 && data[1] == 0x03 && (data[2] > 0x00 && data[2] < 0x05) &&
-        (data[3] as usize * 256 + data[4] as usize) == data.len() - 5
+    data.len() > 5
+        && data[0] == 0x16
+        && data[1] == 0x03
+        && (data[2] > 0x00 && data[2] < 0x05)
+        && (data[3] as usize * 256 + data[4] as usize) == data.len() - 5
 }
 
 fn skip(data: &[u8], count: usize) -> &[u8] {
@@ -60,33 +63,49 @@ fn to_int(data: &[u8]) -> usize {
 pub fn parse(client_hello: &[u8]) -> Result<ClientHello, Box<dyn std::error::Error>> {
     let len = client_hello.len();
     if !pre_check(client_hello) {
-        return Err(Box::new(SNIError { msg: format!("tls header pre check failed ({len} bytes)") }));
+        return Err(Box::new(SNIError {
+            msg: format!("tls header pre check failed ({len} bytes)"),
+        }));
     }
     if client_hello[0] != 0x16 {
-        return Err(Box::new(SNIError { msg: String::from("invalid initial byte. Expect 0x16") }));
+        return Err(Box::new(SNIError {
+            msg: String::from("invalid initial byte. Expect 0x16"),
+        }));
     }
     if client_hello[1] != 0x03 {
-        return Err(Box::new(SNIError { msg: String::from("expect version byte 0x03") }));
+        return Err(Box::new(SNIError {
+            msg: String::from("expect version byte 0x03"),
+        }));
     }
     if client_hello[2] < 0x01 || client_hello[3] > 0x04 {
-        return Err(Box::new(SNIError { msg: String::from("only support TLS 1.0 ~ 1.3 (outer)") }));
+        return Err(Box::new(SNIError {
+            msg: String::from("only support TLS 1.0 ~ 1.3 (outer)"),
+        }));
     }
 
     let data_len = to_int(&client_hello[3..5]);
     if client_hello.len() < data_len + 5 {
-        return Err(Box::new(SNIError { msg: String::from("data length mismatch(outer)") }));
+        return Err(Box::new(SNIError {
+            msg: String::from("data length mismatch(outer)"),
+        }));
     }
     let inner_data_len = to_int(&client_hello[7..9]);
     if client_hello.len() != inner_data_len + 9 {
-        return Err(Box::new(SNIError { msg: String::from("data length mismatch(inner)") }));
+        return Err(Box::new(SNIError {
+            msg: String::from("data length mismatch(inner)"),
+        }));
     }
 
     let inner_version_bytes = &client_hello[9..11];
     if inner_version_bytes[0] != 0x03 {
-        return Err(Box::new(SNIError { msg: String::from("expect version byte 0x03 (inner)") }));
+        return Err(Box::new(SNIError {
+            msg: String::from("expect version byte 0x03 (inner)"),
+        }));
     }
     if inner_version_bytes[1] < 0x01 || inner_version_bytes[1] > 0x04 {
-        return Err(Box::new(SNIError { msg: String::from("only support TLS 1.0 ~ 1.3 (inner)") }));
+        return Err(Box::new(SNIError {
+            msg: String::from("only support TLS 1.0 ~ 1.3 (inner)"),
+        }));
     }
 
     let mut client_hello = skip(client_hello, 43);
@@ -122,5 +141,7 @@ pub fn parse(client_hello: &[u8]) -> Result<ClientHello, Box<dyn std::error::Err
         }
     }
 
-    Err(Box::new(SNIError { msg: String::from("extension 0x00 0x00 not found") }))
+    Err(Box::new(SNIError {
+        msg: String::from("extension 0x00 0x00 not found"),
+    }))
 }

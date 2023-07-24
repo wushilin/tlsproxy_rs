@@ -42,12 +42,6 @@ impl HostAndPort {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ResolveEntry {
-    pub from:HostAndPort,
-    pub to:HostAndPort
-}
-
 #[derive(Debug, Clone)]
 pub struct ResolveConfig {
     rules: HashMap<HostAndPort, HostAndPort>

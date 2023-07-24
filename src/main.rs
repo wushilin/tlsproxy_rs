@@ -1,59 +1,72 @@
-pub mod statistics;
-pub mod tlsheader;
+pub mod acl;
 pub mod errors;
-pub mod rules;
 pub mod idletracker;
 pub mod resolve;
+pub mod statistics;
+pub mod tlsheader;
 
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use std::time::{Instant, Duration};
 
-use resolve::ResolveConfig;
-use futures::lock::Mutex;
-use std::net::{Ipv4Addr, Ipv6Addr, IpAddr, ToSocketAddrs};
-use std::error::Error;
-use clap::Parser;
-use std::sync::Arc;
-use statistics::ConnStats;
 use bytesize::ByteSize;
+use clap::Parser;
+use futures::lock::Mutex;
+use log::{debug, error, info};
+use resolve::ResolveConfig;
+use statistics::ConnStats;
+use std::error::Error;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::sync::Arc;
 use tlsheader::parse;
-use log::{error, info, debug};
 
 #[derive(Parser, Debug, Clone)]
 pub struct CliArg {
-    #[arg(short, long, help="forward config `bind_ip:bind_port:forward_port` format (repeat for multiple)")]
+    #[arg(
+        short,
+        long,
+        help = "forward config `bind_ip:bind_port:forward_port` format (repeat for multiple)"
+    )]
     pub bind: Vec<String>,
-    #[arg(short, long, default_value_t=30000, help="stats report interval in ms")]
+    #[arg(
+        short,
+        long,
+        default_value_t = 30000,
+        help = "stats report interval in ms"
+    )]
     pub ri: i32,
     #[arg(long, default_value_t=String::from("log4rs.yaml"), help="log4rs config yaml file path")]
     pub log_conf_file: String,
-    #[arg(long, help="self IP address to reject (repeat for multiple)")]
+    #[arg(long, help = "self IP address to reject (repeat for multiple)")]
     pub self_ip: Vec<String>,
     #[arg(long, default_value_t=String::from(""), help="acl files. see `rules.json`")]
-    pub acl:String,
-    #[arg(long, default_value_t=300, help="close connection after max idle in seconds")]
+    pub acl: String,
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "close connection after max idle in seconds"
+    )]
     pub max_idle: i32,
     #[arg(long, default_value_t=String::from(""), help="special port resolve conf")]
-    pub resolve_conf:String,
+    pub resolve_conf: String,
 }
 
 #[derive(Debug)]
 struct ExecutionContext {
     pub self_ip: Arc<Vec<IpAddr>>,
-    pub acl: Arc<Option<rules::RuleSet>>,
+    pub acl: Arc<acl::RuleSet>,
     pub max_idle: i32,
     pub stats: Arc<statistics::GlobalStats>,
     pub resolver: Arc<ResolveConfig>,
 }
 
-pub fn setup_logger(log_conf_file:&str) ->Result<(), Box<dyn Error>> {
+pub fn setup_logger(log_conf_file: &str) -> Result<(), Box<dyn Error>> {
     log4rs::init_file(log_conf_file, Default::default())?;
     println!("logs will be sent according to config file {log_conf_file}");
     Ok(())
 }
 
-fn is_address_in(ip_addr:IpAddr, target:&Arc<Vec<IpAddr>>)->bool{
+fn is_address_in(ip_addr: IpAddr, target: &Arc<Vec<IpAddr>>) -> bool {
     for i in target.as_ref() {
         if ip_addr == *i {
             return true;
@@ -64,12 +77,19 @@ fn is_address_in(ip_addr:IpAddr, target:&Arc<Vec<IpAddr>>)->bool{
 
 // Try to read up to min bytes for TLS header
 // Returns error if it failed to do so
-async fn read_header_with_timeout(stream:&TcpStream, buffer:&mut [u8], min:usize, timeout:Duration) -> Result<usize, Box<dyn Error>> {
+async fn read_header_with_timeout(
+    stream: &TcpStream,
+    buffer: &mut [u8],
+    min: usize,
+    timeout: Duration,
+) -> Result<usize, Box<dyn Error>> {
     let start = Instant::now();
-    let mut read_count:usize = 0;
+    let mut read_count: usize = 0;
     loop {
         if start.elapsed() > timeout {
-            return Err(errors::GeneralError::wrap_box(format!("tls header timeout. received {read_count} bytes < {min} bytes after {timeout:#?}")));
+            return Err(errors::GeneralError::wrap_box(format!(
+                "tls header timeout. received {read_count} bytes < {min} bytes after {timeout:#?}"
+            )));
         }
         // Check if the stream is ready to be read
 
@@ -79,62 +99,66 @@ async fn read_header_with_timeout(stream:&TcpStream, buffer:&mut [u8], min:usize
                 if read_count >= min {
                     return Ok(read_count);
                 }
-                return Err(errors::GeneralError::wrap_box(format!("eof before complete header. received {read_count} bytes < {min} bytes")));
-            },
+                return Err(errors::GeneralError::wrap_box(format!(
+                    "eof before complete header. received {read_count} bytes < {min} bytes"
+                )));
+            }
             Ok(n) => {
                 read_count = read_count + n;
                 if read_count >= min {
                     return Ok(read_count);
-                } 
-            },
+                }
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-            },
+            }
             Err(e) => {
                 return Err(e.into());
             }
         }
-
     }
 }
-async fn handle_socket_inner(socket:TcpStream, rport: i32, conn_stats:Arc<ConnStats>, ctx:Arc<ExecutionContext>) -> Result<(), Box<dyn Error>> {
+async fn handle_socket_inner(
+    socket: TcpStream,
+    rport: i32,
+    conn_stats: Arc<ConnStats>,
+    ctx: Arc<ExecutionContext>,
+) -> Result<(), Box<dyn Error>> {
     let conn_id = conn_stats.id_str();
-    let mut client_hello_buf = vec![0;1024];
-    let read_result = read_header_with_timeout(&socket, &mut client_hello_buf, 32,  Duration::from_secs(5));
+    let mut client_hello_buf = vec![0; 1024];
+    let read_result =
+        read_header_with_timeout(&socket, &mut client_hello_buf, 32, Duration::from_secs(5));
 
     let tls_client_hello_size = read_result.await?;
     if tls_client_hello_size == 0 {
-        return Err(errors::GeneralError::wrap_box(format!("tls client hello read error")));
+        return Err(errors::GeneralError::wrap_box(format!(
+            "tls client hello read error"
+        )));
     }
 
     let tls_header_parsed = parse(&client_hello_buf[0..tls_client_hello_size])?;
     let mut tlshost = tls_header_parsed.sni_host;
     let mut rport = rport;
     let resolve_result = ctx.resolver.resolve(&tlshost, rport);
-    
+
     match resolve_result {
         Some(result) => {
-            let (new_host,new_port) = result;
+            let (new_host, new_port) = result;
             info!(target:"tlsproxy", "{conn_id} resolved {tlshost}:{rport} => {new_host}:{new_port}");
             tlshost = new_host;
             rport = new_port;
-        },
+        }
         _ => {
             // resolve didn't have special configs, let it keep original config
         }
     }
-    match ctx.acl.as_ref() {
-        Some(acl_inner) => {
-            let check_result = acl_inner.check_access(&tlshost);
-            if ! check_result {
-                return Err(errors::GeneralError::wrap_box(format!("acl reject: [{tlshost}]")))
-            } else {
-                info!(target:"tlsproxy", "{conn_id} acl pass: [{tlshost}]");
-            }
-        },
-        _ => {
-
-        }
+    let check_result = ctx.acl.check_access(&tlshost);
+    if !check_result {
+        return Err(errors::GeneralError::wrap_box(format!(
+            "acl reject: [{tlshost}]"
+        )));
+    } else {
+        info!(target:"tlsproxy", "{conn_id} acl pass: [{tlshost}]");
     }
     let raddr = format!("{tlshost}:{rport}");
     info!(target:"tlsproxy", "{conn_id} connecting to {raddr}...");
@@ -142,7 +166,9 @@ async fn handle_socket_inner(socket:TcpStream, rport: i32, conn_stats:Arc<ConnSt
     for next_addr in raddr_list {
         let next_addr_ip = next_addr.ip();
         if is_address_in(next_addr_ip, &ctx.self_ip) {
-            return Err(errors::GeneralError::wrap_box(format!("rejected self connection")));
+            return Err(errors::GeneralError::wrap_box(format!(
+                "rejected self connection"
+            )));
         }
     }
     let r_stream = TcpStream::connect(raddr).await?;
@@ -152,48 +178,43 @@ async fn handle_socket_inner(socket:TcpStream, rport: i32, conn_stats:Arc<ConnSt
     let (mut rr, mut rw) = tokio::io::split(r_stream);
 
     // write the header
-    rw.write_all(&client_hello_buf[0..tls_client_hello_size]).await?;
+    rw.write_all(&client_hello_buf[0..tls_client_hello_size])
+        .await?;
     conn_stats.add_uploaded_bytes(tls_client_hello_size);
     let conn_stats1 = Arc::clone(&conn_stats);
     let conn_stats2 = Arc::clone(&conn_stats);
-    let idle_tracker = Arc::new(
-        Mutex::new (
-            idletracker::IdleTracker::new(Duration::from_secs(ctx.max_idle as u64))
-        )
-    );
+    let idle_tracker = Arc::new(Mutex::new(idletracker::IdleTracker::new(
+        Duration::from_secs(ctx.max_idle as u64),
+    )));
 
     let idle_tracker1 = Arc::clone(&idle_tracker);
     let idle_tracker2 = Arc::clone(&idle_tracker);
     // L -> R path
-    let jh_lr = tokio::spawn( async move {
+    let jh_lr = tokio::spawn(async move {
         let direction = ">>>";
         let mut buf = vec![0; 4096];
         let conn_id = conn_stats1.id_str();
         loop {
-            let nr = lr
-                .read(&mut buf)
-                .await;
+            let nr = lr.read(&mut buf).await;
             match nr {
                 Err(cause) => {
                     error!(target:"tlsproxy", "{conn_id} {direction} failed to read data from socket: {cause}");
                     return;
-                },
-                _ =>{}
+                }
+                _ => {}
             }
-    
+
             let n = nr.unwrap();
             if n == 0 {
                 return;
             }
-    
-            let write_result = rw
-                .write_all(&buf[0..n])
-                .await;
+
+            let write_result = rw.write_all(&buf[0..n]).await;
             match write_result {
                 Err(cause) => {
                     error!(target:"tlsproxy", "{conn_id} {direction} failed to write data to socket: {cause}");
                     break;
-                },
+                }
                 Ok(_) => {
                     conn_stats1.add_uploaded_bytes(n);
                     idle_tracker1.lock().await.mark();
@@ -206,71 +227,68 @@ async fn handle_socket_inner(socket:TcpStream, rport: i32, conn_stats:Arc<ConnSt
     let jh_rl = tokio::spawn(async move {
         let direction = "<<<";
         let conn_id = conn_stats2.id_str();
-        let mut buf = vec![0;4096];
+        let mut buf = vec![0; 4096];
         loop {
-            let nr = rr
-                .read(&mut buf)
-                .await;
-    
+            let nr = rr.read(&mut buf).await;
+
             match nr {
                 Err(cause) => {
                     error!(target:"tlsproxy", "{conn_id} {direction} failed to read data from socket: {cause}");
                     return;
-                },
-                _ =>{}
+                }
+                _ => {}
             }
             let n = nr.unwrap();
             if n == 0 {
                 return;
             }
-    
-            let write_result = lw
-                .write_all(&buf[0..n])
-                .await;
+
+            let write_result = lw.write_all(&buf[0..n]).await;
             match write_result {
                 Err(cause) => {
                     error!(target:"tlsproxy", "{conn_id} {direction} failed to write data to socket: {cause}");
                     break;
-                },
+                }
                 Ok(_) => {
                     conn_stats2.add_downloaded_bytes(n);
                     idle_tracker2.lock().await.mark();
                 }
             }
         }
-
     });
 
-    let idlechecker = tokio::spawn(
-        async move {
-            loop {
-                if jh_lr.is_finished() && jh_rl.is_finished() {
-                    debug!(target: "tlsproxy", "{conn_id} both direction terminated gracefully");
-                    break;
-                }
-                if idle_tracker.lock().await.is_expired() {
-                    let idle_max = idle_tracker.lock().await.max_idle();
-                    let idled_for = idle_tracker.lock().await.idled_for();
-                    info!(target:"tlsproxy", "{conn_id} connection idled {idled_for:#?} > {idle_max:#?}. cancelling");
-                    if !jh_lr.is_finished() {
-                        jh_lr.abort();
-                    }
-                    if !jh_rl.is_finished() {
-                        jh_rl.abort();
-                    }
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+    let idlechecker = tokio::spawn(async move {
+        loop {
+            if jh_lr.is_finished() && jh_rl.is_finished() {
+                debug!(target: "tlsproxy", "{conn_id} both direction terminated gracefully");
+                break;
             }
+            if idle_tracker.lock().await.is_expired() {
+                let idle_max = idle_tracker.lock().await.max_idle();
+                let idled_for = idle_tracker.lock().await.idled_for();
+                info!(target:"tlsproxy", "{conn_id} connection idled {idled_for:#?} > {idle_max:#?}. cancelling");
+                if !jh_lr.is_finished() {
+                    jh_lr.abort();
+                }
+                if !jh_rl.is_finished() {
+                    jh_rl.abort();
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-    );
+    });
     //jh_lr.await?;
     //jh_rl.await?;
     idlechecker.await?;
     return Ok(());
 }
 
-async fn run_pair(bind:String, rport:i32, ctx:Arc<ExecutionContext>) -> Result<(), Box<dyn Error>> {
+async fn run_pair(
+    bind: String,
+    rport: i32,
+    ctx: Arc<ExecutionContext>,
+) -> Result<(), Box<dyn Error>> {
     let listener: TcpListener = TcpListener::bind(&bind).await?;
     info!(target:"tlsproxy", "Listening on: {}", &bind);
 
@@ -286,14 +304,14 @@ async fn run_pair(bind:String, rport:i32, ctx:Arc<ExecutionContext>) -> Result<(
     }
 }
 
-async fn handle_socket(socket:TcpStream, laddr:String, rport:i32, ctx:Arc<ExecutionContext>) {
+async fn handle_socket(socket: TcpStream, laddr: String, rport: i32, ctx: Arc<ExecutionContext>) {
     let cstat = Arc::new(ConnStats::new(Arc::clone(&ctx.stats)));
     let conn_id = cstat.id_str();
     let remote_addr = socket.peer_addr();
     if remote_addr.is_err() {
         error!(target:"tlsproxy", "{conn_id} has no remote peer info. closed");
         return;
-    } 
+    }
     let remote_addr = remote_addr.unwrap();
     info!(target:"tlsproxy", "{conn_id} started: from {remote_addr} via {laddr}");
     let cstat_clone = Arc::clone(&cstat);
@@ -306,10 +324,8 @@ async fn handle_socket(socket:TcpStream, laddr:String, rport:i32, ctx:Arc<Execut
     match result {
         Err(cause) => {
             error!(target:"tlsproxy", "{conn_id} failed. cause: {cause}");
-        },
-        Ok(_) => {
-
         }
+        Ok(_) => {}
     }
     info!(target:"tlsproxy", "{conn_id} stopped: up {up_bytes_str} down {down_bytes_str} uptime {elapsed:#?}");
 }
@@ -321,7 +337,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(cause) => {
             println!("failed to setup logger using config file `{log_conf_file}` : {cause}");
             return Ok(());
-        },
+        }
         _ => {}
     }
 
@@ -333,18 +349,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         info!(target:"tlsproxy", "Binding config: {i}");
     }
 
-    let mut resolver:ResolveConfig = ResolveConfig::empty().unwrap();
+    let mut resolver: ResolveConfig = ResolveConfig::empty().unwrap();
     if args.resolve_conf.len() > 0 {
-        resolver = ResolveConfig::load_from_json_file(&args.resolve_conf).expect("Failed to load `resolve_conf` file");
+        resolver = ResolveConfig::load_from_json_file(&args.resolve_conf)
+            .expect("Failed to load `resolve_conf` file");
     }
 
     let resolver = Arc::new(resolver);
     let global_stats = statistics::GlobalStats::new();
     let acl_file = args.acl;
-    let mut acl:Option<rules::RuleSet> = None;
+    let mut acl = acl::RuleSet::all_allowed_rules();
     if acl_file.len() > 0 {
-        acl = Some(rules::parse(&acl_file).unwrap());
+        acl = acl::parse(&acl_file).unwrap();
     }
+
     let mut self_ips = Vec::new();
     for i in &args.self_ip {
         let ipv4 = i.parse::<Ipv4Addr>();
@@ -380,11 +398,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let bind_port = tokens[1];
         let target_port = tokens[2];
         let bind_addr = format!("{bind_addr}:{bind_port}");
-        let target_port:i32 = target_port.parse().unwrap();
+        let target_port: i32 = target_port.parse().unwrap();
         let ctx = Arc::clone(&ctx);
         let jh = tokio::spawn(async move {
             let bind_c = next_bind.clone();
-            
+
             let result = run_pair(bind_addr, target_port, ctx).await;
             if let Err(cause) = result {
                 error!(target:"tlsproxy", "error running tlsproxy for {bind_c} caused by {cause}");

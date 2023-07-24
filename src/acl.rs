@@ -138,6 +138,29 @@ pub fn parse(file: &str) -> Result<RuleSet, Box<dyn Error>> {
 }
 
 impl RuleSet {
+    pub fn all_allowed_rules() -> RuleSet {
+        return RuleSet { 
+            default_allow: true, 
+            allowed_all: true, 
+            rejected_all: false, 
+            allowed_static_hosts: HashMap::new(), 
+            rejected_static_hosts: HashMap::new(), 
+            allowed_patterns: Vec::new(), 
+            rejected_patterns: Vec::new() 
+        };
+    }
+
+    pub fn all_rejected_rules() -> RuleSet {
+        return RuleSet { 
+            default_allow: false, 
+            allowed_all: false, 
+            rejected_all: true, 
+            allowed_static_hosts: HashMap::new(), 
+            rejected_static_hosts: HashMap::new(), 
+            allowed_patterns: Vec::new(), 
+            rejected_patterns: Vec::new() 
+        };
+    }
     pub fn check_access(&self, target_host: &str) -> bool {
         if self.default_allow {
             if self.rejected_all {
