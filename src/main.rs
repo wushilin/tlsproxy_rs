@@ -150,6 +150,7 @@ async fn handle_socket_inner(
         }
         _ => {
             // resolve didn't have special configs, let it keep original config
+            info!(target: "tlsproxy", "{conn_id} no resolve for {tlshost}:{rport}");
         }
     }
     let check_result = ctx.acl.check_access(&tlshost);
