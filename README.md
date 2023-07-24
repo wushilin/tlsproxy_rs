@@ -117,9 +117,9 @@ When source host has no port, it implies all ports.
 
 When destination has no port, it implies same as lookup source port.
 
-Look up happens for specific host + specific port first, if not found, fall back to host only lookup.
+Look up happens for specific host + specific port first, if not found, fall back to host only lookup. In this case, the port is following original mapped port.
 
-When connect connects to your services and try to send TLS header to connect to the above hosts in `from` field, the actual attempted host is determined by the `to` field.
+If conflicting definition found, the last one takes effect.
 
 Note about the order: 
 
