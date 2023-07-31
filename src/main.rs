@@ -350,7 +350,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         info!(target:"tlsproxy", "Binding config: {i}");
     }
 
-    let mut resolver: ResolveConfig = ResolveConfig::empty().unwrap();
+    let mut resolver: ResolveConfig = Default::default();
     if args.resolve_conf.len() > 0 {
         resolver = ResolveConfig::load_from_json_file(&args.resolve_conf)
             .expect("Failed to load `resolve_conf` file");
@@ -359,7 +359,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let resolver = Arc::new(resolver);
     let global_stats = statistics::GlobalStats::new();
     let acl_file = args.acl;
-    let mut acl = acl::RuleSet::all_allowed_rules();
+    let mut acl = Default::default();
     if acl_file.len() > 0 {
         acl = acl::parse(&acl_file).unwrap();
     }

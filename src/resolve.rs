@@ -46,6 +46,15 @@ impl HostAndPort {
 pub struct ResolveConfig {
     rules: HashMap<HostAndPort, HostAndPort>
 }
+
+impl Default for ResolveConfig {
+    fn default() -> ResolveConfig {
+        ResolveConfig {
+            rules: HashMap::new()
+        }
+    }
+}
+
 impl ResolveConfig {
     fn load_value_from_json(path:&str)-> Result<Value, Box<dyn Error>> {
         let mut f = std::fs::File::open(path)?;
@@ -53,11 +62,6 @@ impl ResolveConfig {
         f.read_to_string(&mut str)?;
         let resolve_config_raw = serde_json::from_str(&str)?;
         return Ok(resolve_config_raw);
-    }
-
-    pub fn empty() -> Result<ResolveConfig, Box<dyn Error>> {
-        let rules = HashMap::<HostAndPort, HostAndPort>::new();
-        return Ok(ResolveConfig { rules })
     }
     
     pub fn resolve(&self, host:&str, port: i32) -> Option<(String, i32)> {

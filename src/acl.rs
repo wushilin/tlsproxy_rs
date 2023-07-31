@@ -137,6 +137,12 @@ pub fn parse(file: &str) -> Result<RuleSet, Box<dyn Error>> {
     result.generate()
 }
 
+impl Default for RuleSet {
+    fn default() -> Self {
+        return RuleSet::all_allowed_rules();
+    }
+}
+
 impl RuleSet {
     pub fn all_allowed_rules() -> RuleSet {
         return RuleSet { 
