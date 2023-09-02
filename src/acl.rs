@@ -4,21 +4,41 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use serde_json::Value;
+
+
 #[derive(Debug)]
 pub struct RuleSet {
+    // Is default allowed when no rule matches
+    // when default allow is true, only rejection rules are checked
+    // when default allow is false, only acceptance rules are checked
     default_allow: bool,
+    // Common flag to speed up host matching. When accept rule contains `$any`, set this to true and avoid regex matching
     allowed_all: bool,
+
+    // Common flag to speed up host matching. When reject rule contains `$any`, set this to true and avoid regex matching
     rejected_all: bool,
+
+    // For entries that defined as host:xxxxx. Speedup look up in O(1) using hashmap
     allowed_static_hosts: HashMap<String, bool>,
+    // For entries that defined as host:xxxxx. Speedup look up in O(1) using hashmap
     rejected_static_hosts: HashMap<String, bool>,
+
+    // Patterns of regex for allowed host in `pattern:...` format
     allowed_patterns: Vec<Regex>,
+
+    // Patterns of regex for rejected host in `pattern...` format
     rejected_patterns: Vec<Regex>,
 }
 
+
+// Represent a raw JSON representation of rules
 #[derive(Debug)]
 pub struct RuleSetRaw {
+    // only accept, reject, allow, deny are valid
     no_match_decision: String,
+    // whitelist entries are host:xxx or pattern:xxxx format
     whitelist: Vec<String>,
+    // blacklist entries are host:xxx or pattern:xxxx format
     blacklist: Vec<String>,
 }
 
