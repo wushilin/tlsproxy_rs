@@ -1,4 +1,10 @@
 #!/bin/sh
 
-cargo build --target=x86_64-unknown-linux-musl
-cargo build --release --target=x86_64-unknown-linux-musl
+echo Building UI
+cd angular-ui
+sh build.sh
+cd -
+echo "UI Done"
+echo "Building binary"
+cargo build --release
+echo "Done"

@@ -1,137 +1,139 @@
-# tlsproxy_rs
-TLS Proxy written in Rust
+# TLS Proxy with a UI
 
-It listens on host port and forward to target SNI Host port. Supports almost all major TLS based protocols.
+# Configuration UI
+Online edit via Admin server
+![image](https://github.com/wushilin/portforwarder_rs/assets/7019828/71317719-e2ef-4d91-984a-e6dab3b18851)
 
+# Online configuration change
+![image](https://github.com/wushilin/portforwarder_rs/assets/7019828/ba2efaaa-3bef-4648-95a4-74b61d469473)
 
-# Build
+You may update server config via web UI and trigger restart.
 
-To build static binary (no glic requirement)
+# Realtime monitoring and statistics
+
+Visualize the listener and portforwarding status
+
+Supports
+
+- Total connection
+- Active connection
+- Uploaded bytes
+- Downloaded bytes
+
+![image](https://github.com/wushilin/portforwarder_rs/assets/7019828/7ce3a32c-8a6b-42a1-8ff2-ed3b4c2f969a)
+
+# Building
+
 ```bash
-$ sh build.sh
-```
-
-To build normally
-```
 $ cargo build --release
 ```
 
 # Running
-```bash
-$ target/x86_64-unknown-linux-musl/release/tlsproxy -b 0.0.0.0:443:443 -b 0.0.0.0:3465:465
+## Directory structure
+
+You should build your tls proxy using `$ cargo build --release`
+
+And copy `target/release/tlsproxy` to a separate folder.
+
+In the same folder, you should also copy the following files:
+
+- static/
+- config.yaml
+- log4rs.yaml
+
+
+## Prepare configuration
+
+Example config.yaml
+```yaml
+# define your listeners
+listeners:
+  google: # listener name
+    bind: 0.0.0.0:1443  # listener bind address and port
+    targets:
+    - www.google.com:443  # forward to www.google.com:443
+options:
+  health_check_timeout_ms: 4000 # Targets will be health checked. Not working hosts will be removed from targets temporarily, unless they come online again
+  log_config_file: log4rs.yaml # log config file
+  max_idle_time_ms: 1000000 # connection can remain open and idle for 1000 seconds (no data transferred means idling)
+dns:
+  "www.googlex.com:443": "www.google.com:443" # if target is www.googlex.com:443, we will redirect to connect to www.google.com:443 instead
+admin_server: # Admin UI
+  bind_address: 0.0.0.0 # bind on all interfaces 
+  bind_port: 48889 # bind on port 48889
+  username: admin # Basic username: admin
+  password: pass1234 # Basic password: pass1234
+  tls_cert: null # Do not enable TLS. If you enable TLS, you need to put your PEM path here
+  tls_key: null # Private key PEM file path
+  tls_ca_cert: null # Certificate Authority cert PEM file path
+  mutual_tls: null # If set to `true`, mutual TLS will be required
+  tls: false # if set to `true` TLS will be used
+  rocket_log_level: normal # Rocket log level. Default is normal
 ```
 
-It starts 2 listeners:
+Sample log4rs.yaml
+```yaml
+refresh_rate: 60 seconds
 
-* one listens on 443, and forward the requests to SNI hosts port 443
-* one listens on 3465, and forward the request to SNI hosts port 465
+appenders:
+  stdout:
+    kind: console
+  default:
+    kind: rolling_file
+    path: "tlsproxy.log"
+    append: true
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S%.3f %Z)} {M} {({l}):5.5} {f}:{L} - {m}{n}"
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 10 mb
+      roller:
+        kind: fixed_window
+        pattern: "tlsproxy.{}.log.gz"
+        count: 20
+        base: 1
+root:
+  level: info
+  appenders:
+    - default
+    - stdout
 
-# Other options
-You may get help by using `-h` or `--help` on the compiled binary.
-
-```bash
-$ target/x86_64-unknown-linux-musl/release/tlsproxy --help
-
-Usage: tlsproxy [OPTIONS]
-
-Options:
-  -b, --bind <BIND>                    forward config `bind_ip:bind_port:forward_port` format (repeat for multiple)
-  -r, --ri <RI>                        stats report interval in ms [default: 30000]
-      --log-conf-file <LOG_CONF_FILE>  log4rs config yaml file path [default: log4rs.yaml]
-      --self-ip <SELF_IP>              self IP address to reject (repeat for multiple)
-      --acl <ACL>                      acl files. see `rules.json` [default: ]
-      --max-idle <MAX_IDLE>            close connection after max idle in seconds [default: 300]
-      --resolve-conf <RESOLVE_CONF>    special port resolve conf [default: ]
-  -h, --help                           Print help
-
+loggers:
+  tlsproxy:
+    level: info
+    appenders:
+      - default
+      - stdout
+    additive: false
 ```
 
-Note: idle is defined as the duration that both direction had no traffic (no bytes written successfully).
-
-# Avoid connecting to self
-The program will cause infinite loop if it connects to itself. To avoid that, you can specify a self ip by
-`--self-ip "ip1" --self-ip "ip2"`. 
-
-When SNI info points to host that would resolve to one of the self IP addresses, the connection will be rejected.
-
-# ACL
-You can use `-acl rule.json` to specify a ACL for host check. 
-This will help you to limit the target host names by static check, or by regular expression.
-
-See `rules.json` in the repo for more info.
-
-Example
-
-```json
-{
-    "no_match_decision":"reject",
-    "whitelist":[
-        "host:a",
-        "host:www.google.com",
-        "pattern:www\\.goo.*\\.com"
-    ],
-    "blacklist":[
-        "host:a",
-        "host:b",
-        "pattern:www.goddogle.com",
-        "$any"
-    ]
-}
+Sample systemd unit file
+```yaml
+[Unit]
+Description=The TLS Proxy
+After=syslog.target network-online.target remote-fs.target nss-lookup.target
+Wants=network-online.target
+        
+[Service]
+Type=simple
+WorkingDirectory=/opt/services/tlsproxy
+PIDFile=/opt/services/tlsproxy/tlsproxy.pid
+ExecStart=/opt/services/tlsproxy/tlsproxy
+# ExecStop=/bin/kill -s QUIT $MAINPID
+PrivateTmp=true
+        
+[Install]
+WantedBy=multi-user.target
 ```
 
-The rule says: When no whitelist/blacklist is matching the host, the decision will be "reject" (valid options are "accept", "reject"),
+## Start
 
-whitelist and blacklist are hosts that are allowed or rejected. 
+Just run the portforwarder. No argument required. All support files must be in the same folder
 
-All checks are case insensitive.
+Visit your server at http://host:48888 to start managing.
 
-`host:xxx` is valid just for host xxx using exact match.
-`pattern:xxx` is valid if regular expression xxx matches the host name to connect. It also matches xxxxx, xxxxxx....
-If you want to be exactly match by pattern, either use `host:xxxxx`, or `pattern:^xxxxx$`.
-`$any` is valid for all hosts. It is more efficient thatn `pattern:^.*$` because it requires no matching.
-
-It would set the whole rule to instant `true` without matching attempt. It superseds all sibling rules.
-
-# Logging
-The software uses log4rs. A handy log4rs.yaml is given by default. Specify the log config file by using
-`--log-conf-file`. The default config file is `./log4rs.yaml`.
-
-# Resolve override
-The TLS Proxy supports special resolve override. The purpose of resolve override is to redirect TLSHost & Port to another host.
-
-To set Resolve Override, specify `--resolve-conf some-rule.json` in command line.
-
-An example of resolve configuration JSON file is as follows:
-
-```json
-{
-    "www.google.com;www.g1.com;www.g2.com;www.g3.com:3": "127.0.0.1",
-    "www.baidu.comP465": "127.0.0.1:465",
-    "www.google.com:443": "192.168.44.17"
-}
-```
-
-You can define multiple hosts to map to the same target host.
-
-When source host has no port, it implies all ports.
-
-When destination has no port, it implies same as lookup source port.
-
-Look up happens for specific host + specific port first, if not found, fall back to host only lookup. In this case, the port is following original mapped port.
-
-If conflicting definition found, the last one takes effect.
-
-Note about the order: 
-
-* Initial port mapping is done first. Your `0.0.0.0:443:1443` (`1443` is the mapped port)
-* Special host resolution (resolve-conf) is performed second (after mapped port).
-* ACL is evaluated third using resolved `HostAndPort` (after special host resolution done)
-* Actual DNS lookup is performed, self IP address is checked
-* TLS Proxy piping is done at last
-
-NOTE: Both `from.port` and `to.port` can be skipped. If `from.port` is skipped, it is for all ports, except those explicitly configured.
-
-If `to.port` is skipped, it is the mapped port. 
+If prompted for Basic auth, please enter the username and password
 
 # Enjoy
-

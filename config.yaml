@@ -1,0 +1,27 @@
+listeners:
+  SSH:
+    bind: 0.0.0.0:1443
+    target_port: 1443
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns:
+      - ^www.g.*$
+    max_idle_time_ms: 3600000
+options:
+  log_config_file: log4rs.yaml
+  self_ips:
+  - 127.0.0.1
+  - me.jungle
+dns: {}
+admin_server:
+  bind_address: 0.0.0.0
+  bind_port: 48888
+  username: admin
+  password: pass1234
+  tls_cert: null
+  tls_key: null
+  tls_ca_cert: null
+  mutual_tls: null
+  tls: false
+  rocket_log_level: critical

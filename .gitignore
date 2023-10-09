@@ -12,4 +12,8 @@ Cargo.lock
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
-log/
+.vscode/
+angular-ui/node_modules
+*.log
+target/
+angular-ui/dist
