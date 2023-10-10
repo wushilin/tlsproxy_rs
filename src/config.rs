@@ -14,6 +14,20 @@ pub struct Config {
 }
 
 impl Listener {
+    pub fn speed_limit(&self) -> f64 {
+        match self.speed_limit.as_ref() {
+            Some(inner) => {
+                if *inner == 0f64 {
+                    std::f64::INFINITY
+                } else {
+                    *inner
+                }
+            },
+            None => {
+                std::f64::INFINITY
+            }
+        }
+    }
     pub fn max_idle_time_ms(&self) -> u64 {
         match self.max_idle_time_ms.as_ref() {
             Some(inner) => {
@@ -132,6 +146,7 @@ pub struct Listener {
     pub policy: Policy,
     pub rules: Rules,
     pub max_idle_time_ms: Option<u64>,
+    pub speed_limit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

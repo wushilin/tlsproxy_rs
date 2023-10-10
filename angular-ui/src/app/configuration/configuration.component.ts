@@ -23,11 +23,12 @@ export class ConfigurationComponent implements OnInit {
   newListenerBind: string = "";
   newMaxIdleTimeMs: number = 3600000;
   newTargetPort: number = 443;
+  newSpeedLimit:number = 0.0
 
 
   separatorKeysCodes = [ENTER, COMMA] as const;
   targetAddOnBlur = true;
-  displayedColumns: string[] = ['name', 'bind', 'targetPort', 'policy', 'maxIdleTime', 'rulesHosts', 'rulesPatterns'];
+  displayedColumns: string[] = ['name', 'bind', 'speedLimit', 'targetPort', 'policy', 'maxIdleTime', 'rulesHosts', 'rulesPatterns'];
   dnsDisplayedColumns: string[] = ['from', 'to', 'action'];
   dns: [string, string][] = [];
   listenersList: [string, Listener][] = []
@@ -37,6 +38,7 @@ export class ConfigurationComponent implements OnInit {
     this.newListenerBind = ""
     this.newTargetPort = 443
     this.newMaxIdleTimeMs = 3600000
+    this.newSpeedLimit = 0.0
     this.fetchData()
   }
 
@@ -294,7 +296,7 @@ export class ConfigurationComponent implements OnInit {
     console.log(`Add listener ${this.newListenerName} => ${this.newListenerBind}`)
     var find = this.listenersList.filter((it) => it[0] == this.newListenerName)
     if (find.length == 0) {
-      this.listenersList.push([this.newListenerName, { bind: this.newListenerBind, policy: "DENY", target_port: this.newTargetPort, max_idle_time_ms: this.newMaxIdleTimeMs, rules: { static_hosts: [], patterns: [] } }])
+      this.listenersList.push([this.newListenerName, { bind: this.newListenerBind, policy: "DENY", target_port: this.newTargetPort, speed_limit: this.newSpeedLimit, max_idle_time_ms: this.newMaxIdleTimeMs, rules: { static_hosts: [], patterns: [] } }])
       var tmp = this.listenersList.filter((it) => true)
       tmp.sort((a, b) => {
         return a[0].localeCompare(b[0])
@@ -305,6 +307,7 @@ export class ConfigurationComponent implements OnInit {
       this.newListenerName = ""
       this.newTargetPort = 443
       this.newMaxIdleTimeMs = 3600000
+      this.newSpeedLimit = 0.0
       console.log("FOrm reset")
     } else {
       console.log("Name already exists")

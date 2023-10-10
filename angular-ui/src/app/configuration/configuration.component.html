@@ -89,6 +89,15 @@
           </mat-form-field>
         </td>
       </ng-container>
+      <ng-container matColumnDef="speedLimit">
+        <th mat-header-cell *matHeaderCellDef> Speed Limit(bytes/s)</th>
+        <td mat-cell *matCellDef="let element">
+          <mat-form-field>
+            <mat-label>Speed Limit</mat-label>
+            <input type="number" matInput [(ngModel)]="element[1].speed_limit" name="speedLimit">
+          </mat-form-field>
+        </td>
+      </ng-container>
       <!-- Weight Column -->
       <ng-container matColumnDef="rulesHosts">
         <th mat-header-cell *matHeaderCellDef> Static Host Set </th>
@@ -169,6 +178,12 @@
           <mat-form-field class="example-full-width" name="maxIdle">
             <mat-label>Max Idle Milliseconds</mat-label>
             <input matInput name="maxIdle" type="number" placeholder="0" [(ngModel)]="newMaxIdleTimeMs">
+          </mat-form-field>
+        </div>
+        <div>
+          <mat-form-field class="example-full-width" name="speedLimit">
+            <mat-label>Speedlimit (bytes/sec)</mat-label>
+            <input matInput name="speedLimit" type="number" placeholder="0" [(ngModel)]="newSpeedLimit">
           </mat-form-field>
         </div>
         <button mat-raised-button color="primary" (click)="addListener()">Add</button>

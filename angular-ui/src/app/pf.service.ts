@@ -65,6 +65,7 @@ export interface Listener {
   policy: string,
   rules: Rules,
   max_idle_time_ms: number,
+  speed_limit: number,
 }
 
 export interface Rules {

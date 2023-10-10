@@ -2,6 +2,7 @@ use crate::controller::Controller;
 use crate::idletracker::IdleTracker;
 use anyhow::anyhow;
 use anyhow::Result;
+use async_speed_limit::Limiter;
 use lazy_static::lazy_static;
 use log::{info, warn, error};
 use tokio::net::lookup_host;
@@ -295,6 +296,7 @@ impl Runner {
         let local_addr = r_stream.local_addr()?;
         info!("{conn_id} connected to {resolved} via {local_addr:?}");
         let (lr, lw) = tokio::io::split(socket);
+
         let (rr, mut rw) = tokio::io::split(r_stream);
 
         let idle_tracker = Arc::new(Mutex::new(IdleTracker::new(context.idle_timeout_ms)));
@@ -313,6 +315,9 @@ impl Runner {
             }
         }
         let controller_clone = Arc::clone(&controller);
+        let limiter = <Limiter>::new(listener_config.speed_limit());
+        let limiter1 = limiter.clone();
+        let limiter2 = limiter.clone();
         let jh1 = Self::pipe(
             conn_id,
             lr,
@@ -322,6 +327,7 @@ impl Runner {
             true,
             Arc::clone(&uploaded),
             controller_clone,
+            limiter1,
         )
         .await;
         let context_clone = Arc::clone(&context);
@@ -335,6 +341,7 @@ impl Runner {
             false,
             Arc::clone(&downloaded),
             controller_clone,
+            limiter2
         )
         .await;
 
@@ -400,6 +407,7 @@ impl Runner {
         is_upload: bool,
         counter: Arc<AtomicU64>,
         controller: Arc<RwLock<Controller>>,
+        limiter: Limiter,
     ) -> JoinHandle<Option<()>> {
         let mut reader = reader_i;
         let mut writer = writer_i;
@@ -428,6 +436,7 @@ impl Runner {
                         break;
                     }
 
+                    limiter.consume(n).await;
                     let write_result = writer.write_all(&buf[0..n]).await;
                     match write_result {
                         Err(_) => {
