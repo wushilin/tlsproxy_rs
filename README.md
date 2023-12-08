@@ -2,16 +2,23 @@
 
 # Configuration UI
 Online edit via Admin server
-![image](https://github.com/wushilin/portforwarder_rs/assets/7019828/71317719-e2ef-4d91-984a-e6dab3b18851)
+![image](https://github.com/wushilin/tlsproxy_rs/assets/7019828/b2b1ae48-685b-4ee1-a820-3515cefb1b64)
+
 
 # Online configuration change
-![image](https://github.com/wushilin/portforwarder_rs/assets/7019828/ba2efaaa-3bef-4648-95a4-74b61d469473)
+![image](https://github.com/wushilin/tlsproxy_rs/assets/7019828/63af4d86-2f45-4ad7-99c1-ca2935a1dd5a)
 
-You may update server config via web UI and trigger restart.
+# DNS Override
+![image](https://github.com/wushilin/tlsproxy_rs/assets/7019828/9046871b-b38c-46e8-aadc-ea2aa1816da1)
+
+
+You may update the server config via web UI and trigger restart.
 
 # Realtime monitoring and statistics
+Visualize the listener and tls proxy status
 
-Visualize the listener and portforwarding status
+![image](https://github.com/wushilin/tlsproxy_rs/assets/7019828/264a1008-c13c-48bc-aba5-3a26ef88f0d4)
+
 
 Supports
 
@@ -20,7 +27,7 @@ Supports
 - Uploaded bytes
 - Downloaded bytes
 
-![image](https://github.com/wushilin/portforwarder_rs/assets/7019828/7ce3a32c-8a6b-42a1-8ff2-ed3b4c2f969a)
+
 
 # Building
 
@@ -41,34 +48,44 @@ In the same folder, you should also copy the following files:
 - config.yaml
 - log4rs.yaml
 
+If you want to enable TLS, please create your `server.pem`, `server.key` and `ca.pem`.
+
+You may refer to https://github.com/wushilin/minica for cert management.
 
 ## Prepare configuration
 
 Example config.yaml
 ```yaml
-# define your listeners
 listeners:
-  google: # listener name
-    bind: 0.0.0.0:1443  # listener bind address and port
-    targets:
-    - www.google.com:443  # forward to www.google.com:443
+  HTTPS:
+    bind: 0.0.0.0:1443  # TLS proxy binds to 0.0.0.0:1443
+    target_port: 443  # Proxy all requests to port 443
+    policy: DENY  # If rules matched, they will be denied (possible values: ALLOW|DENY). basically the rules is blacklist. If it is ALLOW, it would act as a whitelist
+    rules:
+      static_hosts: []  # Static host matching, ignore case
+      patterns:
+      - ^www.g.*$  # Regex checking, case sensitive. You probably want to add (?i) if you want to ignore case...
+    max_idle_time_ms: 3600000
+    speed_limit: 0.0 # Speed limit for each connection. 0 is no limit. unit is bytes/second, shared by upload/download together
 options:
-  health_check_timeout_ms: 4000 # Targets will be health checked. Not working hosts will be removed from targets temporarily, unless they come online again
-  log_config_file: log4rs.yaml # log config file
-  max_idle_time_ms: 1000000 # connection can remain open and idle for 1000 seconds (no data transferred means idling)
+  log_config_file: log4rs.yaml  # log4rs config
+  self_ips:
+  - 127.0.0.1  # If target server resolves to this host it will be rejected
+  - me.jungle # If target server resolves to one of the addresses by this domain, it will be rejected
 dns:
-  "www.googlex.com:443": "www.google.com:443" # if target is www.googlex.com:443, we will redirect to connect to www.google.com:443 instead
-admin_server: # Admin UI
-  bind_address: 0.0.0.0 # bind on all interfaces 
-  bind_port: 48889 # bind on port 48889
-  username: admin # Basic username: admin
-  password: pass1234 # Basic password: pass1234
-  tls_cert: null # Do not enable TLS. If you enable TLS, you need to put your PEM path here
-  tls_key: null # Private key PEM file path
-  tls_ca_cert: null # Certificate Authority cert PEM file path
-  mutual_tls: null # If set to `true`, mutual TLS will be required
-  tls: false # if set to `true` TLS will be used
-  rocket_log_level: normal # Rocket log level. Default is normal
+  home.wushilin.net: 192.168.44.100 # DNS override. If target host is home.wushilin.net, it would be resolved as 192.168.44.100. The DNS can be domain to domain redirection as well. e.g. you can use www.google.com as resolve result
+admin_server:
+  bind_address: 0.0.0.0  # Admin server bind to this address
+  bind_port: 48889 # Admin server bind to this port
+  username: admin # Admin server requires the basic user
+  password: pass1234 # Admin server require the basic password
+  tls_cert: null # TLS cert for admin server, required if tls => true
+  tls_key: null # TLS key for admin server, required if tls => true
+  tls_ca_cert: null # TLS CA cert for admin server, required if tls => true 
+  mutual_tls: null # Enable mtls or not true|false|null. If set to true, tls must also be true!
+  tls: false # Enable TLS or not
+  rocket_log_level: critical # Rocket log level
+
 ```
 
 Sample log4rs.yaml
@@ -130,9 +147,9 @@ WantedBy=multi-user.target
 
 ## Start
 
-Just run the portforwarder. No argument required. All support files must be in the same folder
+Just run the tlsproxy. No argument required. All support files must be in the same folder
 
-Visit your server at http://host:48888 to start managing.
+Visit your server at http://host:48889 to start managing.
 
 If prompted for Basic auth, please enter the username and password
 
