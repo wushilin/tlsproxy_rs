@@ -38,7 +38,7 @@ appenders:
 root:
   level: info
   appenders:
-    - default
+    - rocket
 
 loggers:
   rocket:
