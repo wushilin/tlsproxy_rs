@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::activetracker;
 use crate::controller::Controller;
 use crate::listener_stats::StatsSerde;
 use crate::runner::Runner;
@@ -72,6 +73,7 @@ pub async fn stop() {
     info!("transitioning from `{status:?}` to `{:?}`", Status::STOPPING);
     *status = Status::STOPPING;
     listeners.clear();
+    activetracker::reset().await;
     listener_status.clear();
     info!("cancelling all tasks");
     cancel().await;
@@ -125,6 +127,7 @@ pub async fn start(config: Config) -> Result<HashMap<String, Result<bool>>> {
     *status = Status::STARTING;
 
     resolver::init(&config).await;
+    activetracker::reset().await;
 
     let config_x = Arc::new(RwLock::new(config.clone()));
     let (tx, mut rx) = mpsc::channel(config.listeners.len());
