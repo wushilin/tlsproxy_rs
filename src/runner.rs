@@ -161,15 +161,15 @@ impl Runner {
             controller_inner.spawn(async move {
                 let stats_local = Arc::clone(&stats);
                 {
-                    let new_active = stats_local.increase_conn_count();
-                    let new_total = stats_local.total_count();
                     let addr = socket.peer_addr();
                     if addr.is_err() {
+                        warn!("{conn_id} has no peer addr. closing");
                         return;
                     }
                     let addr = addr.unwrap();
+                    let new_active = stats_local.increase_conn_count();
+                    let new_total = stats_local.total_count();
                     info!("{conn_id} ({name}) new connection from {addr:?} active {new_active} total {new_total}");
-
                 }
                 let stats_local_clone = Arc::clone(&stats_local);
                 let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
@@ -177,11 +177,9 @@ impl Runner {
                     let err = rr.err().unwrap();
                     warn!("{conn_id} connection error: {err}");
                 }
-                {
-                    let new_active = stats_local.decrease_conn_count();
-                    let new_total = stats_local.total_count();
-                    info!("{conn_id} closing connection: active {new_active} total {new_total}");
-                }
+                let new_active = stats_local.decrease_conn_count();
+                let new_total = stats_local.total_count();
+                info!("{conn_id} closing connection: active {new_active} total {new_total}");
             }).await;
         }
     }
