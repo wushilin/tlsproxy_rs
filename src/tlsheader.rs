@@ -1,3 +1,5 @@
+use log::info;
+
 pub struct ClientHello {
     pub sni_host: String,
 }
@@ -50,6 +52,7 @@ fn read_length_and_skip(data: &[u8], number_of_bytes: usize) -> Result<&[u8], SN
 
 // Read TLS extension
 fn read_extension(client_hello: &[u8]) -> Option<(&[u8], usize, &[u8])> {
+    info!("Parsing {} bytes", client_hello.len());
     if client_hello.len() < 4 {
         return None
     }
@@ -59,7 +62,9 @@ fn read_extension(client_hello: &[u8]) -> Option<(&[u8], usize, &[u8])> {
     let byte3 = client_hello[3];
     let extension_type = (byte0 as usize) * 256 + (byte1 as usize);
     let length = (byte2 as usize) * 256 + (byte3 as usize);
-    if !client_hello.len() >= 4+ length {
+    info!("type {extension_type} length {length}");
+    if client_hello.len() < 4+ length {
+        info!("Not enough...");
         return None
     }
     let data = &client_hello[4..4 + length];
