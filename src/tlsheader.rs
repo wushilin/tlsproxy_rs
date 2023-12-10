@@ -25,13 +25,19 @@ pub fn pre_check(data: &[u8]) -> bool {
 }
 
 // Skip x bytes in input and return the skipped bytes
-fn skip(data: &[u8], count: usize) -> &[u8] {
-    &data[count..]
+fn skip(data: &[u8], count: usize) -> Result<&[u8], SNIError> {
+    if data.len() >= count {
+        return Ok(&data[count..])
+    } else {
+        return Err(SNIError {
+            msg: "insufficient data to skip".into()
+        })
+    }
 }
 
 // Read `number_of_bytes` bytes and convert read number as usize, then skip them 
 // in the byte array. Return the skipped bytes 
-fn read_length_and_skip(data: &[u8], number_of_bytes: usize) -> &[u8] {
+fn read_length_and_skip(data: &[u8], number_of_bytes: usize) -> Result<&[u8], SNIError> {
     let mut count = 1;
     let mut size = data[0] as usize;
     while count < number_of_bytes {
@@ -39,20 +45,26 @@ fn read_length_and_skip(data: &[u8], number_of_bytes: usize) -> &[u8] {
         count += 1;
     }
     let to_skip = size + number_of_bytes;
-    skip(data, to_skip)
+    return skip(data, to_skip)
 }
 
 // Read TLS extension
-fn read_extension(client_hello: &[u8]) -> (&[u8], usize, &[u8]) {
+fn read_extension(client_hello: &[u8]) -> Option<(&[u8], usize, &[u8])> {
+    if client_hello.len() < 4 {
+        return None
+    }
     let byte0 = client_hello[0];
     let byte1 = client_hello[1];
     let byte2 = client_hello[2];
     let byte3 = client_hello[3];
     let extension_type = (byte0 as usize) * 256 + (byte1 as usize);
     let length = (byte2 as usize) * 256 + (byte3 as usize);
+    if !client_hello.len() >= 4+ length {
+        return None
+    }
     let data = &client_hello[4..4 + length];
     let remaining = &client_hello[4 + length..];
-    (remaining, extension_type, data)
+    Some((remaining, extension_type, data))
 }
 
 // Convert bytes to usize
@@ -75,27 +87,38 @@ pub fn parse(client_hello: &[u8]) -> Result<ClientHello, SNIError> {
             msg: format!("tls header pre check failed ({len} bytes)"),
         });
     }
-    if client_hello[0] != 0x16 {
+    if client_hello.len() < 1 || client_hello[0] != 0x16 {
         return Err(SNIError {
             msg: String::from("invalid initial byte. Expect 0x16"),
         });
     }
-    if client_hello[1] != 0x03 {
+    if client_hello.len() < 2 || client_hello[1] != 0x03 {
         return Err(SNIError {
             msg: String::from("expect version byte 0x03"),
         });
     }
-    if client_hello[2] < 0x01 || client_hello[3] > 0x04 {
+    if client_hello.len() < 4 || client_hello[2] < 0x01 || client_hello[3] > 0x04 {
         return Err(SNIError {
             msg: String::from("only support TLS 1.0 ~ 1.3 (outer)"),
         });
     }
 
+    if client_hello.len() < 6 {
+        return Err(SNIError {
+            msg: String::from("insufficient length (6)")
+        })
+    }
     let data_len = to_int(&client_hello[3..5]);
     if client_hello.len() < data_len + 5 {
         return Err(SNIError {
             msg: String::from("data length mismatch(outer)"),
         });
+    }
+
+    if client_hello.len() < 10 {
+        return Err(SNIError {
+            msg: String::from("insufficient length (9)")
+        })
     }
     let inner_data_len = to_int(&client_hello[7..9]);
     if client_hello.len() != inner_data_len + 9 {
@@ -104,6 +127,11 @@ pub fn parse(client_hello: &[u8]) -> Result<ClientHello, SNIError> {
         });
     }
 
+    if client_hello.len() < 12 {
+        return Err(SNIError {
+            msg: "insufficient length (12)".into()
+        })
+    }
     let inner_version_bytes = &client_hello[9..11];
     if inner_version_bytes[0] != 0x03 {
         return Err(SNIError {
@@ -116,18 +144,32 @@ pub fn parse(client_hello: &[u8]) -> Result<ClientHello, SNIError> {
         });
     }
 
-    let mut client_hello = skip(client_hello, 43);
-    client_hello = read_length_and_skip(client_hello, 1); // read the 31 random bytes
-    client_hello = read_length_and_skip(client_hello, 2); // read and skip cipher suites 00 62
-    client_hello = read_length_and_skip(client_hello, 1); // skip the compression extension
-    client_hello = skip(client_hello, 2); // skip remaining size identifier
+    if client_hello.len() < 43 {
+        return Err(SNIError {
+            msg: "insufficient length (43)".into()
+        })
+    }
+    let mut client_hello = skip(client_hello, 43)?;
+    client_hello = read_length_and_skip(client_hello, 1)?; // read the 31 random bytes
+
+    client_hello = read_length_and_skip(client_hello, 2)?; // read and skip cipher suites 00 62
+    client_hello = read_length_and_skip(client_hello, 1)?; // skip the compression extension
+    client_hello = skip(client_hello, 2)?; // skip remaining size identifier
 
     let mut sni_data: Option<&[u8]> = None;
     while !client_hello.is_empty() {
-        let (new_client_hello, extension_type, extension_data) = read_extension(client_hello);
-        client_hello = new_client_hello;
-        if extension_type == 0 {
-            sni_data = Some(extension_data);
+        let next_match = read_extension(client_hello);
+        match next_match {
+            None => {
+                break;
+            },
+            Some(inner) => {
+                let (new_client_hello, extension_type, extension_data) = inner;
+                client_hello = new_client_hello;
+                if extension_type == 0 {
+                    sni_data = Some(extension_data);
+                }
+            }
         }
     }
 
