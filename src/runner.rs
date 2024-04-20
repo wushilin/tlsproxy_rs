@@ -252,7 +252,7 @@ impl Runner {
                 return Ok(());
             },
             _ => {
-
+                info!("{conn_id} tls header parse OK")
             }
         }
         let client_hello = sni_host_result.unwrap();
