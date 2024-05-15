@@ -1,3 +1,4 @@
+use log::{info, warn, error};
 
 pub struct ClientHello {
     pub sni_host: String,
@@ -102,9 +103,12 @@ pub fn parse(client_hello: &[u8]) -> Result<ClientHello, SNIError> {
         });
     }
     if client_hello.len() < 4 || client_hello[2] < 0x01 || client_hello[3] > 0x04 {
-        return Err(SNIError {
-            msg: String::from("only support TLS 1.0 ~ 1.3 (outer)"),
-        });
+        // apparently google chrome does not send this in 1.2,1.3, it sends 1.6 or 1.7 sometimes.
+        // So I am disabling this. 
+        // info!("Version byte {} - {}", client_hello[2], client_hello[3]);
+        // return Err(SNIError {
+        //     msg: String::from("only support TLS 1.0 ~ 1.3 (outer)"),
+        // });
     }
 
     if client_hello.len() < 6 {

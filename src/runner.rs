@@ -205,15 +205,17 @@ impl Runner {
             match read_result {
                 Ok(nread) => {
                     if nread == 0 {
-                        // end of file closed
+                        info!("alert! zero byte read! the tls header is probably longer than the buffer allocated!");
                         return None;
                     }
+                    // info!("Read {nread} bytes in header!");
                     read_count += nread;
                     if tlsheader::pre_check(&buffer[..read_count]) {
                         return Some(read_count);
                     }
                 },
-                Err(_) => {
+                Err(what) => {
+                    info!("Something happened {what}");
                     return None;
                 }
             }
@@ -230,7 +232,7 @@ impl Runner {
     ) -> Result<()> {
         info!("{conn_id} {name} worker started");
         let mut socket = socket;
-        let mut tlsheader_buffer = vec![0u8; 1024];
+        let mut tlsheader_buffer = vec![0u8; 4096];
         let timeout = Duration::from_secs(3);
         let header_len = Self::read_header_with_timeout(&mut socket, timeout, &mut tlsheader_buffer).await;
         match header_len {
