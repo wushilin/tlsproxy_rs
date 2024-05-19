@@ -1,22 +1,4 @@
 listeners:
-  aaaa:
-    bind: aaaa
-    target_port: 443
-    policy: DENY
-    rules:
-      static_hosts: []
-      patterns: []
-    max_idle_time_ms: 3600000
-    speed_limit: 0.75
-  '1443':
-    bind: 0.0.0.0:2443
-    target_port: 443
-    policy: DENY
-    rules:
-      static_hosts: []
-      patterns: []
-    max_idle_time_ms: 3600000
-    speed_limit: 10240000.0
   SSH:
     bind: 0.0.0.0:1443
     target_port: 1443
@@ -27,6 +9,24 @@ listeners:
       - ^www.g.*$
     max_idle_time_ms: 3600000
     speed_limit: 0.0
+  '1443':
+    bind: 0.0.0.0:2443
+    target_port: 443
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns: []
+    max_idle_time_ms: 3600000
+    speed_limit: 10240000.0
+  aaaa:
+    bind: 0.0.0.0:17877
+    target_port: 443
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns: []
+    max_idle_time_ms: 3600000
+    speed_limit: 0.75
 options:
   log_config_file: log4rs.yaml
   self_ips:

@@ -1,5 +1,3 @@
-use log::{info, warn, error};
-
 pub struct ClientHello {
     pub sni_host: String,
 }
