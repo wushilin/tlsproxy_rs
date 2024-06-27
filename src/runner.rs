@@ -140,6 +140,41 @@ impl Runner {
         }
     }
 
+    async fn handle_new_socket(
+        name:Arc<String>,
+        conn_id:u64, 
+        socket:TcpStream, 
+        remote_address:SocketAddr,
+        listener_config: Arc<Listener>,
+        stats: Arc<ListenerStats>,
+        controller: Arc<RwLock<Controller>>,
+        self_addresses: Arc<Vec<SocketAddr>>
+    ) -> JoinHandle<Option<()>> {
+        let mut controller_inner = controller.write().await;
+        let controller_clone_inner = Arc::clone(&controller);
+        let name = Arc::clone(&name);
+        let jh = controller_inner.spawn(async move {
+            let stats_local = Arc::clone(&stats);
+            
+            let new_active = stats_local.increase_conn_count();
+            let new_total = stats_local.total_count();
+            activetracker::put(conn_id, remote_address).await;
+            info!("{conn_id} ({name}) new connection from {remote_address:?} active {new_active} total {new_total}");
+            let stats_local_clone = Arc::clone(&stats_local);
+            let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
+            if rr.is_err() {
+                let err = rr.err().unwrap();
+                warn!("{conn_id} connection error: {err}");
+            }
+            let new_active = stats_local.decrease_conn_count();
+            let new_total = stats_local.total_count();
+            activetracker::remove(conn_id).await;
+            info!("{conn_id} closing connection: active {new_active} total {new_total}");
+        }).await;
+
+        return jh;
+    }
+
     async fn run_listener(
         name: String,
         listener: TcpListener,
@@ -151,37 +186,30 @@ impl Runner {
         let name = Arc::new(name);
         loop {
             let self_addresses = Arc::clone(&self_addresses);
-            let (socket, _) = listener.accept().await?;
-            let conn_id = id();
-            let stats = Arc::clone(&stats);
-            let listener_config = Arc::clone(&listener_config);
-            let controller_clone = Arc::clone(&controller);
-            let mut controller_inner = controller_clone.write().await;
-            let controller_clone_inner = Arc::clone(&controller);
-            let name = Arc::clone(&name);
-            controller_inner.spawn(async move {
-                let stats_local = Arc::clone(&stats);
-                let addr = socket.peer_addr();
-                if addr.is_err() {
-                    warn!("{conn_id} has no peer addr. closing");
-                    return;
+            let accept_result = listener.accept().await;
+            match accept_result {
+                Ok((socket, addr)) => {
+                    let conn_id = id();
+                    let join_handle = Self::handle_new_socket(
+                        Arc::clone(&name),
+                        conn_id, 
+                        socket, 
+                        addr, 
+                        Arc::clone(&listener_config),
+                        Arc::clone(&stats),
+                        Arc::clone(&controller),
+                        Arc::clone(&self_addresses)
+                    ).await;
+                    // We don't nee to wait it to complete
+                    drop(join_handle);
+                },
+                Err(cause) => {
+                    warn!("listener {name} accept error: {cause}");
+                    // continue processing
+                    continue;
                 }
-                let addr = addr.unwrap();
-                let new_active = stats_local.increase_conn_count();
-                let new_total = stats_local.total_count();
-                activetracker::put(conn_id, addr).await;
-                info!("{conn_id} ({name}) new connection from {addr:?} active {new_active} total {new_total}");
-                let stats_local_clone = Arc::clone(&stats_local);
-                let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
-                if rr.is_err() {
-                    let err = rr.err().unwrap();
-                    warn!("{conn_id} connection error: {err}");
-                }
-                let new_active = stats_local.decrease_conn_count();
-                let new_total = stats_local.total_count();
-                activetracker::remove(conn_id).await;
-                info!("{conn_id} closing connection: active {new_active} total {new_total}");
-            }).await;
+            }
+            
         }
     }
 
@@ -192,7 +220,7 @@ impl Runner {
             Ok(inner) => {
                 inner
             },
-            _ => {
+            Err(_) => {
                 None
             }
         }
