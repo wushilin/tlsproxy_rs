@@ -9,6 +9,7 @@ use log::{info, warn, error};
 use tokio::net::lookup_host;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -161,7 +162,9 @@ impl Runner {
             active_tracker::put(conn_id, remote_address).await;
             info!("{conn_id} ({name}) new connection from {remote_address:?} active {new_active} total {new_total}");
             let stats_local_clone = Arc::clone(&stats_local);
+            let start = Instant::now();
             let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
+            let elapsed = start.elapsed();
             if rr.is_err() {
                 let err = rr.err().unwrap();
                 warn!("{conn_id} connection error: {err}");
@@ -169,7 +172,7 @@ impl Runner {
             let new_active = stats_local.decrease_conn_count();
             let new_total = stats_local.total_count();
             active_tracker::remove(conn_id).await;
-            info!("{conn_id} closing connection: active {new_active} total {new_total}");
+            info!("{conn_id} closing connection: active {new_active} total {new_total} duration {elapsed:?}");
         }).await;
 
         return jh;
@@ -347,7 +350,6 @@ impl Runner {
         let limiter = <Limiter>::new(listener_config.speed_limit());
         let limiter1 = limiter.clone();
         let limiter2 = limiter.clone();
-        let start = std::time::Instant::now();
         let jh1 = Self::pipe(
             conn_id,
             lr,
@@ -387,8 +389,7 @@ impl Runner {
         let _ = jh.await;
         let uploaded_total = uploaded.load(Ordering::SeqCst);
         let downloaded_total = downloaded.load(Ordering::SeqCst);
-        let elapsed = start.elapsed();
-        info!("{conn_id} end uploaded {uploaded_total} downloaded {downloaded_total} duration: {elapsed:?}");
+        info!("{conn_id} end uploaded {uploaded_total} downloaded {downloaded_total}");
         Ok(())
     }
     async fn run_idle_tracker(
