@@ -3,11 +3,11 @@ pub mod listener_stats;
 pub mod resolver;
 pub mod manager;
 pub mod runner;
-pub mod idletracker;
-pub mod adminserver;
+pub mod idle_tracker;
+pub mod admin_server;
 pub mod controller;
-pub mod tlsheader;
-pub mod activetracker;
+pub mod tls_header;
+pub mod active_tracker;
 
 extern crate rocket;
 use std::error::Error;
@@ -18,7 +18,7 @@ use log::{info, error};
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load_file("config.yaml").await.unwrap();
     config.init_logging();
-    adminserver::init(&config).await;
+    admin_server::init(&config).await;
     let start_result = manager::start(config).await;
     match start_result {
         Ok(result) => {
@@ -41,6 +41,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             error!("failed to start all listeners: {cause}");
         }
     }
-    let _ = adminserver::run_rocket().await?;
+    let _ = admin_server::run_rocket().await?;
     Ok(())
 }

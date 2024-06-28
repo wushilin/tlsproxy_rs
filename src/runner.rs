@@ -1,6 +1,6 @@
-use crate::activetracker;
+use crate::active_tracker;
 use crate::controller::Controller;
-use crate::idletracker::IdleTracker;
+use crate::idle_tracker::IdleTracker;
 use anyhow::anyhow;
 use anyhow::Result;
 use async_speed_limit::Limiter;
@@ -24,7 +24,7 @@ use crate::{
     config::{Config, Listener},
     listener_stats::ListenerStats,
     resolver,
-    tlsheader,
+    tls_header,
 };
 
 lazy_static! {
@@ -158,7 +158,7 @@ impl Runner {
             
             let new_active = stats_local.increase_conn_count();
             let new_total = stats_local.total_count();
-            activetracker::put(conn_id, remote_address).await;
+            active_tracker::put(conn_id, remote_address).await;
             info!("{conn_id} ({name}) new connection from {remote_address:?} active {new_active} total {new_total}");
             let stats_local_clone = Arc::clone(&stats_local);
             let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
@@ -168,7 +168,7 @@ impl Runner {
             }
             let new_active = stats_local.decrease_conn_count();
             let new_total = stats_local.total_count();
-            activetracker::remove(conn_id).await;
+            active_tracker::remove(conn_id).await;
             info!("{conn_id} closing connection: active {new_active} total {new_total}");
         }).await;
 
@@ -231,14 +231,14 @@ impl Runner {
         loop {
             let read_result = socket.read(&mut buffer[read_count..]).await;
             match read_result {
-                Ok(nread) => {
-                    if nread == 0 {
+                Ok(n_read) => {
+                    if n_read == 0 {
                         info!("alert! zero byte read! the tls header is probably longer than the buffer allocated!");
                         return None;
                     }
-                    // info!("Read {nread} bytes in header!");
-                    read_count += nread;
-                    if tlsheader::pre_check(&buffer[..read_count]) {
+                    // info!("Read {n_read} bytes in header!");
+                    read_count += n_read;
+                    if tls_header::pre_check(&buffer[..read_count]) {
                         return Some(read_count);
                     }
                 },
@@ -260,9 +260,9 @@ impl Runner {
     ) -> Result<()> {
         info!("{conn_id} {name} worker started");
         let mut socket = socket;
-        let mut tlsheader_buffer = vec![0u8; 4096];
+        let mut tls_header_buffer = vec![0u8; 4096];
         let timeout = Duration::from_secs(3);
-        let header_len = Self::read_header_with_timeout(&mut socket, timeout, &mut tlsheader_buffer).await;
+        let header_len = Self::read_header_with_timeout(&mut socket, timeout, &mut tls_header_buffer).await;
         match header_len {
             None => {
                 info!("{conn_id} tls header timed out after {timeout:?}");
@@ -275,7 +275,7 @@ impl Runner {
 
         let header_len = header_len.unwrap();
 
-        let sni_host_result = tlsheader::parse(&tlsheader_buffer[..header_len]);
+        let sni_host_result = tls_header::parse(&tls_header_buffer[..header_len]);
         match sni_host_result {
             Err(cause) => {
                 info!("{conn_id} tls header error: {cause}");
@@ -332,7 +332,7 @@ impl Runner {
         let context_clone = Arc::clone(&context);
         let uploaded = Arc::new(AtomicU64::new(0));
         let downloaded = Arc::new(AtomicU64::new(0));
-        let header_write_result = rw.write_all(&tlsheader_buffer[..header_len]).await;
+        let header_write_result = rw.write_all(&tls_header_buffer[..header_len]).await;
         match header_write_result {
             Err(cause) => {
                 warn!("{conn_id} tls header write error: {cause}");
@@ -347,6 +347,7 @@ impl Runner {
         let limiter = <Limiter>::new(listener_config.speed_limit());
         let limiter1 = limiter.clone();
         let limiter2 = limiter.clone();
+        let start = std::time::Instant::now();
         let jh1 = Self::pipe(
             conn_id,
             lr,
@@ -386,14 +387,15 @@ impl Runner {
         let _ = jh.await;
         let uploaded_total = uploaded.load(Ordering::SeqCst);
         let downloaded_total = downloaded.load(Ordering::SeqCst);
-        info!("{conn_id} end uploaded {uploaded_total} downloaded {downloaded_total}");
+        let elapsed = start.elapsed();
+        info!("{conn_id} end uploaded {uploaded_total} downloaded {downloaded_total} duration: {elapsed:?}");
         Ok(())
     }
     async fn run_idle_tracker(
         conn_id: u64,
         jh1: JoinHandle<Option<()>>,
         jh2: JoinHandle<Option<()>>,
-        idletracker: Arc<Mutex<IdleTracker>>,
+        idle_tracker: Arc<Mutex<IdleTracker>>,
         root_context: Arc<RwLock<Controller>>,
     ) -> JoinHandle<Option<()>> {
         root_context
@@ -412,7 +414,7 @@ impl Runner {
                         }
                         break;
                     }
-                    if idletracker.lock().await.is_expired() {
+                    if idle_tracker.lock().await.is_expired() {
                         info!("{conn_id} idle time out. aborting.");
                         if !jh1.is_finished() {
                             jh1.abort();
@@ -432,7 +434,7 @@ impl Runner {
         reader_i: ReadHalf<TcpStream>,
         writer_i: WriteHalf<TcpStream>,
         context: Arc<ListenerStats>,
-        idletracker: Arc<Mutex<IdleTracker>>,
+        idle_tracker: Arc<Mutex<IdleTracker>>,
         is_upload: bool,
         counter: Arc<AtomicU64>,
         controller: Arc<RwLock<Controller>>,
@@ -478,7 +480,7 @@ impl Runner {
                             } else {
                                 context.increase_downloaded_bytes(n);
                             }
-                            idletracker.lock().await.mark();
+                            idle_tracker.lock().await.mark();
                         }
                     }
                 }
