@@ -357,11 +357,11 @@ impl Runner {
             },
             Ok(addresses) => {
                 for next_address in addresses {
-                    for next_self_address in self_addresses.iter() {
-                        if next_address.ip() == next_self_address.ip() {
-                            warn!("{conn_id} rejected self connection: {}", next_self_address.ip());
-                            return Ok(());
-                        }
+                    let self_addresses_clone = Arc::clone(&self_addresses);
+                    let is_local = Self::is_local(&next_address, self_addresses_clone);
+                    if is_local {
+                        warn!("{conn_id} rejected self connection: {}", next_address.ip());
+                        return Ok(());
                     }
                 }
             }
