@@ -6,7 +6,9 @@ use anyhow::Result;
 use async_speed_limit::Limiter;
 use lazy_static::lazy_static;
 use log::{info, warn, error};
+use rocket::local;
 use tokio::net::lookup_host;
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -157,21 +159,27 @@ impl Runner {
         let jh = controller_inner.spawn(async move {
             let stats_local = Arc::clone(&stats);
             
-            let new_active = stats_local.increase_conn_count();
-            let new_total = stats_local.total_count();
-            active_tracker::put(conn_id, remote_address).await;
+            let mut new_active = stats_local.increase_conn_count();
+            let mut new_total = stats_local.total_count();
             info!("{conn_id} ({name}) new connection from {remote_address:?} active {new_active} total {new_total}");
-            let stats_local_clone = Arc::clone(&stats_local);
+            let self_addresses_clone = Arc::clone(&self_addresses);
+            let is_remote_local = Self::is_local(&remote_address, self_addresses_clone);
             let start = Instant::now();
-            let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
-            let elapsed = start.elapsed();
-            if rr.is_err() {
-                let err = rr.err().unwrap();
-                warn!("{conn_id} connection error: {err}");
+            if is_remote_local {
+                info!("{conn_id} connection is from this machine. closing.");
+            } else {
+                active_tracker::put(conn_id, remote_address).await;
+                let stats_local_clone = Arc::clone(&stats_local);
+                let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
+                if rr.is_err() {
+                    let err = rr.err().unwrap();
+                    warn!("{conn_id} connection error: {err}");
+                }
+                active_tracker::remove(conn_id).await;
             }
-            let new_active = stats_local.decrease_conn_count();
-            let new_total = stats_local.total_count();
-            active_tracker::remove(conn_id).await;
+            new_active = stats_local.decrease_conn_count();
+            new_total = stats_local.total_count();
+            let elapsed = start.elapsed();
             info!("{conn_id} closing connection: active {new_active} total {new_total} duration {elapsed:?}");
         }).await;
 
@@ -253,9 +261,40 @@ impl Runner {
         }
     }
 
-    async fn is_local(addr:&SocketAddr) -> bool{
-        true
+    fn is_local(addr:&SocketAddr, local_addresses: Arc<Vec<SocketAddr>>) -> bool{
+        info!("checking if {addr} is local");
+        match addr {
+            SocketAddr::V4(v4a) => {
+                let ip = v4a.ip();
+                
+                match ip.octets() {
+                    [127, _, _, _] =>  {
+                        info!("{v4a} is v4, and starts with 127, it is!");
+                        return true
+                    },
+                    _ => {
+                    },
+                }
+            },
+            SocketAddr::V6(v6a) => {
+                let ip = v6a.ip();
+                if ip.is_loopback() {
+                    info!("{v6a} is v6 and is loopback, it is!");
+                    return true
+                }
+            }
+        }
+        for next_self_address in local_addresses.iter() {
+            if addr.ip() == next_self_address.ip() {
+                info!("{addr} matches self ip {next_self_address}, it is");
+                return true
+            }
+        }
+
+        info!("{addr} it is not...");
+        false
     }
+
     async fn worker(
         name: Arc<String>,
         conn_id: u64,
