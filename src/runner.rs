@@ -221,6 +221,10 @@ impl Runner {
             }
         }
     }
+
+    async fn is_local(addr:&SocketAddr) -> bool{
+        true
+    }
     async fn worker(
         name: Arc<String>,
         conn_id: u64,
