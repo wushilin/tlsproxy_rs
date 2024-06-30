@@ -161,12 +161,12 @@ impl Runner {
             
             let mut new_active = stats_local.increase_conn_count();
             let mut new_total = stats_local.total_count();
-            info!("{conn_id} ({name}) new connection from {remote_address:?} active {new_active} total {new_total}");
+            info!("{conn_id} ({name}) new connection from {remote_address} active {new_active} total {new_total}");
             let self_addresses_clone = Arc::clone(&self_addresses);
-            let is_remote_local = Self::is_local(&remote_address, self_addresses_clone);
+            let is_remote_local = Self::is_local(conn_id, &remote_address, self_addresses_clone);
             let start = Instant::now();
             if is_remote_local {
-                info!("{conn_id} connection is from this machine. closing.");
+                info!("{conn_id} pre-connection check: connection is from this machine. closing {remote_address}");
             } else {
                 active_tracker::put(conn_id, remote_address).await;
                 let stats_local_clone = Arc::clone(&stats_local);
@@ -261,15 +261,15 @@ impl Runner {
         }
     }
 
-    fn is_local(addr:&SocketAddr, local_addresses: Arc<Vec<SocketAddr>>) -> bool{
-        info!("checking if {addr} is local");
+    fn is_local(conn_id: u64, addr:&SocketAddr, local_addresses: Arc<Vec<SocketAddr>>) -> bool{
+        info!("{conn_id} checking if {addr} is a local address");
         match addr {
             SocketAddr::V4(v4a) => {
                 let ip = v4a.ip();
                 
                 match ip.octets() {
                     [127, _, _, _] =>  {
-                        info!("{v4a} is v4, and starts with 127, it is!");
+                        info!("{conn_id} {v4a} is v4, and starts with 127, it is local.");
                         return true
                     },
                     _ => {
@@ -279,19 +279,19 @@ impl Runner {
             SocketAddr::V6(v6a) => {
                 let ip = v6a.ip();
                 if ip.is_loopback() {
-                    info!("{v6a} is v6 and is loopback, it is!");
+                    info!("{conn_id} {v6a} is v6 and is loopback, it is local");
                     return true
                 }
             }
         }
         for next_self_address in local_addresses.iter() {
             if addr.ip() == next_self_address.ip() {
-                info!("{addr} matches self ip {next_self_address}, it is");
+                info!("{conn_id} {addr} matches self ip {next_self_address}, it is local");
                 return true
             }
         }
 
-        info!("{addr} it is not...");
+        info!("{conn_id} {addr} it is not local");
         false
     }
 
@@ -358,7 +358,7 @@ impl Runner {
             Ok(addresses) => {
                 for next_address in addresses {
                     let self_addresses_clone = Arc::clone(&self_addresses);
-                    let is_local = Self::is_local(&next_address, self_addresses_clone);
+                    let is_local = Self::is_local(conn_id, &next_address, self_addresses_clone);
                     if is_local {
                         warn!("{conn_id} rejected self connection: {}", next_address.ip());
                         return Ok(());
