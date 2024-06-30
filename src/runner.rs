@@ -1,6 +1,6 @@
-use crate::activetracker;
+use crate::active_tracker;
 use crate::controller::Controller;
-use crate::idletracker::IdleTracker;
+use crate::idle_tracker::IdleTracker;
 use anyhow::anyhow;
 use anyhow::Result;
 use async_speed_limit::Limiter;
@@ -9,6 +9,7 @@ use log::{info, warn, error};
 use tokio::net::lookup_host;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -24,7 +25,7 @@ use crate::{
     config::{Config, Listener},
     listener_stats::ListenerStats,
     resolver,
-    tlsheader,
+    tls_header,
 };
 
 lazy_static! {
@@ -140,6 +141,43 @@ impl Runner {
         }
     }
 
+    async fn handle_new_socket(
+        name:Arc<String>,
+        conn_id:u64, 
+        socket:TcpStream, 
+        remote_address:SocketAddr,
+        listener_config: Arc<Listener>,
+        stats: Arc<ListenerStats>,
+        controller: Arc<RwLock<Controller>>,
+        self_addresses: Arc<Vec<SocketAddr>>
+    ) -> JoinHandle<Option<()>> {
+        let mut controller_inner = controller.write().await;
+        let controller_clone_inner = Arc::clone(&controller);
+        let name = Arc::clone(&name);
+        let jh = controller_inner.spawn(async move {
+            let stats_local = Arc::clone(&stats);
+            
+            let new_active = stats_local.increase_conn_count();
+            let new_total = stats_local.total_count();
+            active_tracker::put(conn_id, remote_address).await;
+            info!("{conn_id} ({name}) new connection from {remote_address:?} active {new_active} total {new_total}");
+            let stats_local_clone = Arc::clone(&stats_local);
+            let start = Instant::now();
+            let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
+            let elapsed = start.elapsed();
+            if rr.is_err() {
+                let err = rr.err().unwrap();
+                warn!("{conn_id} connection error: {err}");
+            }
+            let new_active = stats_local.decrease_conn_count();
+            let new_total = stats_local.total_count();
+            active_tracker::remove(conn_id).await;
+            info!("{conn_id} closing connection: active {new_active} total {new_total} duration {elapsed:?}");
+        }).await;
+
+        return jh;
+    }
+
     async fn run_listener(
         name: String,
         listener: TcpListener,
@@ -151,37 +189,30 @@ impl Runner {
         let name = Arc::new(name);
         loop {
             let self_addresses = Arc::clone(&self_addresses);
-            let (socket, _) = listener.accept().await?;
-            let conn_id = id();
-            let stats = Arc::clone(&stats);
-            let listener_config = Arc::clone(&listener_config);
-            let controller_clone = Arc::clone(&controller);
-            let mut controller_inner = controller_clone.write().await;
-            let controller_clone_inner = Arc::clone(&controller);
-            let name = Arc::clone(&name);
-            controller_inner.spawn(async move {
-                let stats_local = Arc::clone(&stats);
-                let addr = socket.peer_addr();
-                if addr.is_err() {
-                    warn!("{conn_id} has no peer addr. closing");
-                    return;
+            let accept_result = listener.accept().await;
+            match accept_result {
+                Ok((socket, addr)) => {
+                    let conn_id = id();
+                    let join_handle = Self::handle_new_socket(
+                        Arc::clone(&name),
+                        conn_id, 
+                        socket, 
+                        addr, 
+                        Arc::clone(&listener_config),
+                        Arc::clone(&stats),
+                        Arc::clone(&controller),
+                        Arc::clone(&self_addresses)
+                    ).await;
+                    // We don't nee to wait it to complete
+                    drop(join_handle);
+                },
+                Err(cause) => {
+                    warn!("listener {name} accept error: {cause}");
+                    // continue processing
+                    continue;
                 }
-                let addr = addr.unwrap();
-                let new_active = stats_local.increase_conn_count();
-                let new_total = stats_local.total_count();
-                activetracker::put(conn_id, addr).await;
-                info!("{conn_id} ({name}) new connection from {addr:?} active {new_active} total {new_total}");
-                let stats_local_clone = Arc::clone(&stats_local);
-                let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
-                if rr.is_err() {
-                    let err = rr.err().unwrap();
-                    warn!("{conn_id} connection error: {err}");
-                }
-                let new_active = stats_local.decrease_conn_count();
-                let new_total = stats_local.total_count();
-                activetracker::remove(conn_id).await;
-                info!("{conn_id} closing connection: active {new_active} total {new_total}");
-            }).await;
+            }
+            
         }
     }
 
@@ -192,7 +223,7 @@ impl Runner {
             Ok(inner) => {
                 inner
             },
-            _ => {
+            Err(_) => {
                 None
             }
         }
@@ -203,14 +234,14 @@ impl Runner {
         loop {
             let read_result = socket.read(&mut buffer[read_count..]).await;
             match read_result {
-                Ok(nread) => {
-                    if nread == 0 {
+                Ok(n_read) => {
+                    if n_read == 0 {
                         info!("alert! zero byte read! the tls header is probably longer than the buffer allocated!");
                         return None;
                     }
-                    // info!("Read {nread} bytes in header!");
-                    read_count += nread;
-                    if tlsheader::pre_check(&buffer[..read_count]) {
+                    // info!("Read {n_read} bytes in header!");
+                    read_count += n_read;
+                    if tls_header::pre_check(&buffer[..read_count]) {
                         return Some(read_count);
                     }
                 },
@@ -236,9 +267,9 @@ impl Runner {
     ) -> Result<()> {
         info!("{conn_id} {name} worker started");
         let mut socket = socket;
-        let mut tlsheader_buffer = vec![0u8; 4096];
+        let mut tls_header_buffer = vec![0u8; 4096];
         let timeout = Duration::from_secs(3);
-        let header_len = Self::read_header_with_timeout(&mut socket, timeout, &mut tlsheader_buffer).await;
+        let header_len = Self::read_header_with_timeout(&mut socket, timeout, &mut tls_header_buffer).await;
         match header_len {
             None => {
                 info!("{conn_id} tls header timed out after {timeout:?}");
@@ -251,7 +282,7 @@ impl Runner {
 
         let header_len = header_len.unwrap();
 
-        let sni_host_result = tlsheader::parse(&tlsheader_buffer[..header_len]);
+        let sni_host_result = tls_header::parse(&tls_header_buffer[..header_len]);
         match sni_host_result {
             Err(cause) => {
                 info!("{conn_id} tls header error: {cause}");
@@ -308,7 +339,7 @@ impl Runner {
         let context_clone = Arc::clone(&context);
         let uploaded = Arc::new(AtomicU64::new(0));
         let downloaded = Arc::new(AtomicU64::new(0));
-        let header_write_result = rw.write_all(&tlsheader_buffer[..header_len]).await;
+        let header_write_result = rw.write_all(&tls_header_buffer[..header_len]).await;
         match header_write_result {
             Err(cause) => {
                 warn!("{conn_id} tls header write error: {cause}");
@@ -369,7 +400,7 @@ impl Runner {
         conn_id: u64,
         jh1: JoinHandle<Option<()>>,
         jh2: JoinHandle<Option<()>>,
-        idletracker: Arc<Mutex<IdleTracker>>,
+        idle_tracker: Arc<Mutex<IdleTracker>>,
         root_context: Arc<RwLock<Controller>>,
     ) -> JoinHandle<Option<()>> {
         root_context
@@ -388,7 +419,7 @@ impl Runner {
                         }
                         break;
                     }
-                    if idletracker.lock().await.is_expired() {
+                    if idle_tracker.lock().await.is_expired() {
                         info!("{conn_id} idle time out. aborting.");
                         if !jh1.is_finished() {
                             jh1.abort();
@@ -408,7 +439,7 @@ impl Runner {
         reader_i: ReadHalf<TcpStream>,
         writer_i: WriteHalf<TcpStream>,
         context: Arc<ListenerStats>,
-        idletracker: Arc<Mutex<IdleTracker>>,
+        idle_tracker: Arc<Mutex<IdleTracker>>,
         is_upload: bool,
         counter: Arc<AtomicU64>,
         controller: Arc<RwLock<Controller>>,
@@ -454,7 +485,7 @@ impl Runner {
                             } else {
                                 context.increase_downloaded_bytes(n);
                             }
-                            idletracker.lock().await.mark();
+                            idle_tracker.lock().await.mark();
                         }
                     }
                 }
