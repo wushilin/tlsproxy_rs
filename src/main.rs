@@ -8,7 +8,8 @@ pub mod admin_server;
 pub mod controller;
 pub mod tls_header;
 pub mod active_tracker;
-
+pub mod request_id;
+pub mod extensible;
 extern crate rocket;
 use std::error::Error;
 use config::Config;

@@ -1,12 +1,12 @@
 listeners:
   SSH:
-    bind: 0.0.0.0:1443
-    target_port: 1443
+    bind: 0.0.0.0:443
+    target_port: 443
     policy: DENY
     rules:
       static_hosts: []
       patterns:
-      - ^www.g.*$
+      - ^www.gaaaa.*$
     max_idle_time_ms: 3600000
     speed_limit: 0.0
   '1443':

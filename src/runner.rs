@@ -6,6 +6,8 @@ use anyhow::Result;
 use async_speed_limit::Limiter;
 use lazy_static::lazy_static;
 use log::{info, warn, error};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 use tokio::net::lookup_host;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +29,8 @@ use crate::{
     resolver,
     tls_header,
 };
+use crate::extensible::Extensible;
+use crate::request_id::RequestId;
 
 lazy_static! {
     static ref COUNTER: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -39,9 +43,6 @@ pub struct Runner {
     pub self_addresses: Arc<Vec<SocketAddr>>
 }
 
-fn id() -> u64 {
-    COUNTER.fetch_add(1, Ordering::SeqCst) + 1
-}
 impl Runner {
     pub fn new(
         name: String,
@@ -116,6 +117,8 @@ impl Runner {
             .await;
         let fail_reason = tokio::select! {
             _ = sleep(Duration::from_secs(1)) => {
+                // trade off. typically if it fails we won't receive confirmation in rx
+                // within 1 second (e.g. a bind typically fails within 1 sec)
                 None
             },
             what = rx.recv() => {
@@ -123,19 +126,19 @@ impl Runner {
             }
         };
         let name = name.clone();
-        match fail_reason {
+        return match fail_reason {
             None => {
                 info!("listener {name} start cancelled");
-                return Ok(stats);
+                Ok(stats)
             }
             Some(fail_reason) => match fail_reason {
                 None => {
                     warn!("listener {name} started without error");
-                    return Ok(stats);
+                    Ok(stats)
                 }
                 Some(cause) => {
                     info!("listener {name} start with error {cause}");
-                    return Err(anyhow!("{}", cause));
+                    Err(anyhow!("{}", cause))
                 }
             },
         }
@@ -143,8 +146,7 @@ impl Runner {
 
     async fn handle_new_socket(
         name:Arc<String>,
-        conn_id:u64, 
-        socket:TcpStream, 
+        ext:Extensible<TcpStream>,
         remote_address:SocketAddr,
         listener_config: Arc<Listener>,
         stats: Arc<ListenerStats>,
@@ -156,29 +158,29 @@ impl Runner {
         let name = Arc::clone(&name);
         let jh = controller_inner.spawn(async move {
             let stats_local = Arc::clone(&stats);
-            
+            let request_id = ext.get_extension::<RequestId>().await.unwrap();
             let mut new_active = stats_local.increase_conn_count();
             let mut new_total = stats_local.total_count();
-            info!("{conn_id} ({name}) new connection from {remote_address} active {new_active} total {new_total}");
+            info!("{request_id} ({name}) new connection from {remote_address} active {new_active} total {new_total}");
             let self_addresses_clone = Arc::clone(&self_addresses);
-            let is_remote_local = Self::is_local(conn_id, &remote_address, self_addresses_clone);
+            let is_remote_local = Self::is_local(&request_id, &remote_address, self_addresses_clone);
             let start = Instant::now();
             if is_remote_local {
-                info!("{conn_id} pre-connection check: connection is from this machine. closing {remote_address}");
+                info!("{request_id} pre-connection check: connection is from this machine. closing {remote_address}");
             } else {
-                active_tracker::put(conn_id, remote_address).await;
+                active_tracker::put(&request_id, remote_address).await;
                 let stats_local_clone = Arc::clone(&stats_local);
-                let rr = Self::worker(name, conn_id, listener_config, socket, stats_local_clone, controller_clone_inner, self_addresses).await;
+                let rr = Self::worker(name, ext, listener_config, stats_local_clone, controller_clone_inner, self_addresses).await;
                 if rr.is_err() {
                     let err = rr.err().unwrap();
-                    warn!("{conn_id} connection error: {err}");
+                    warn!("{request_id} connection error: {err}");
                 }
-                active_tracker::remove(conn_id).await;
+                active_tracker::remove(&request_id).await;
             }
             new_active = stats_local.decrease_conn_count();
             new_total = stats_local.total_count();
             let elapsed = start.elapsed();
-            info!("{conn_id} closing connection: active {new_active} total {new_total} duration {elapsed:?}");
+            info!("{request_id} closing connection: active {new_active} total {new_total} duration {elapsed:?}");
         }).await;
 
         return jh;
@@ -198,11 +200,12 @@ impl Runner {
             let accept_result = listener.accept().await;
             match accept_result {
                 Ok((socket, addr)) => {
-                    let conn_id = id();
+                    let conn_id = RequestId::new();
+                    let ext = Extensible::of(socket);
+                    ext.extend(conn_id).await;
                     let join_handle = Self::handle_new_socket(
                         Arc::clone(&name),
-                        conn_id, 
-                        socket, 
+                        ext,
                         addr, 
                         Arc::clone(&listener_config),
                         Arc::clone(&stats),
@@ -259,15 +262,15 @@ impl Runner {
         }
     }
 
-    fn is_local(conn_id: u64, addr:&SocketAddr, local_addresses: Arc<Vec<SocketAddr>>) -> bool{
-        info!("{conn_id} checking if {addr} is a local address");
+    fn is_local(request_id: &RequestId, addr:&SocketAddr, local_addresses: Arc<Vec<SocketAddr>>) -> bool{
+        info!("{request_id} checking if {addr} is a local address");
         match addr {
             SocketAddr::V4(v4a) => {
                 let ip = v4a.ip();
                 
                 match ip.octets() {
                     [127, _, _, _] =>  {
-                        info!("{conn_id} {v4a} is v4, and starts with 127, it is local.");
+                        info!("{request_id} {v4a} is v4, and starts with 127, it is local.");
                         return true
                     },
                     _ => {
@@ -277,36 +280,36 @@ impl Runner {
             SocketAddr::V6(v6a) => {
                 let ip = v6a.ip();
                 if ip.is_loopback() {
-                    info!("{conn_id} {v6a} is v6 and is loopback, it is local");
+                    info!("{request_id} {v6a} is v6 and is loopback, it is local");
                     return true
                 }
             }
         }
         for next_self_address in local_addresses.iter() {
             if addr.ip() == next_self_address.ip() {
-                info!("{conn_id} {addr} matches self ip {next_self_address}, it is local");
+                info!("{request_id} {addr} matches self ip {next_self_address}, it is local");
                 return true
             }
         }
 
-        info!("{conn_id} {addr} it is not local");
+        info!("{request_id} {addr} it is not local");
         false
     }
 
     async fn worker(
         name: Arc<String>,
-        conn_id: u64,
+        ext: Extensible<TcpStream>,
         listener_config: Arc<Listener>,
-        socket: TcpStream,
         context: Arc<ListenerStats>,
         controller: Arc<RwLock<Controller>>,
         self_addresses: Arc<Vec<SocketAddr>>,
     ) -> Result<()> {
+        let conn_id = ext.get_extension::<RequestId>().await.unwrap();
         info!("{conn_id} {name} worker started");
-        let mut socket = socket;
+        let mut ext = ext;
         let mut tls_header_buffer = vec![0u8; 4096];
         let timeout = Duration::from_secs(3);
-        let header_len = Self::read_header_with_timeout(&mut socket, timeout, &mut tls_header_buffer).await;
+        let header_len = Self::read_header_with_timeout(&mut ext, timeout, &mut tls_header_buffer).await;
         match header_len {
             None => {
                 info!("{conn_id} tls header timed out after {timeout:?}");
@@ -356,7 +359,7 @@ impl Runner {
             Ok(addresses) => {
                 for next_address in addresses {
                     let self_addresses_clone = Arc::clone(&self_addresses);
-                    let is_local = Self::is_local(conn_id, &next_address, self_addresses_clone);
+                    let is_local = Self::is_local(&conn_id, &next_address, self_addresses_clone);
                     if is_local {
                         warn!("{conn_id} rejected self connection: {}", next_address.ip());
                         return Ok(());
@@ -368,7 +371,7 @@ impl Runner {
         let r_stream = tokio::time::timeout(Duration::from_secs(5), connect_future).await??;
         let local_addr = r_stream.local_addr()?;
         info!("{conn_id} connected to {resolved} via {local_addr:?}");
-        let (lr, lw) = tokio::io::split(socket);
+        let (lr, lw) = tokio::io::split(ext);
 
         let (rr, mut rw) = tokio::io::split(r_stream);
 
@@ -391,8 +394,12 @@ impl Runner {
         let limiter = <Limiter>::new(listener_config.speed_limit());
         let limiter1 = limiter.clone();
         let limiter2 = limiter.clone();
+        let conn_id1 = Arc::clone(&conn_id);
+        let conn_id2 = Arc::clone(&conn_id);
+        let conn_id3 = Arc::clone(&conn_id);
+
         let jh1 = Self::pipe(
-            conn_id,
+            conn_id1,
             lr,
             rw,
             context_clone,
@@ -406,7 +413,7 @@ impl Runner {
         let context_clone = Arc::clone(&context);
         let controller_clone = Arc::clone(&controller);
         let jh2 = Self::pipe(
-            conn_id,
+            conn_id2,
             rr,
             lw,
             context_clone,
@@ -420,7 +427,7 @@ impl Runner {
 
         let controller_clone = Arc::clone(&controller);
         let jh = Self::run_idle_tracker(
-            conn_id,
+            conn_id3,
             jh1,
             jh2,
             Arc::clone(&idle_tracker),
@@ -434,7 +441,7 @@ impl Runner {
         Ok(())
     }
     async fn run_idle_tracker(
-        conn_id: u64,
+        conn_id: Arc<RequestId>,
         jh1: JoinHandle<Option<()>>,
         jh2: JoinHandle<Option<()>>,
         idle_tracker: Arc<Mutex<IdleTracker>>,
@@ -471,24 +478,26 @@ impl Runner {
             })
             .await
     }
-    async fn pipe(
-        in_conn_id: u64,
-        reader_i: ReadHalf<TcpStream>,
-        writer_i: WriteHalf<TcpStream>,
+    async fn pipe<S,T>(
+        request_id: Arc<RequestId>,
+        reader_i: ReadHalf<T>,
+        writer_i: WriteHalf<S>,
         context: Arc<ListenerStats>,
         idle_tracker: Arc<Mutex<IdleTracker>>,
         is_upload: bool,
         counter: Arc<AtomicU64>,
         controller: Arc<RwLock<Controller>>,
         limiter: Limiter,
-    ) -> JoinHandle<Option<()>> {
+    ) -> JoinHandle<Option<()>> 
+    where 
+        T: AsyncRead + AsyncWrite + Sync + Send + Unpin + 'static, 
+        S: AsyncRead + AsyncWrite + Sync + Send + Unpin + 'static {
         let mut reader = reader_i;
         let mut writer = writer_i;
         let direction = match is_upload {
             true => "upload",
             false => "download",
         };
-        let conn_id = in_conn_id;
         controller
             .write()
             .await
@@ -526,7 +535,7 @@ impl Runner {
                         }
                     }
                 }
-                info!("{conn_id} {direction} ended");
+                info!("{request_id} {direction} ended");
             })
             .await
     }
