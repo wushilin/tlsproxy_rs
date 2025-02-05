@@ -38,7 +38,7 @@ lazy_static! {
     static ref COUNTER: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     static ref HOST_PORT_REGEX: Arc<Regex> = Arc::new(Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*,\s*port\s*=\s*(\d+)\s*$").unwrap());
     static ref HOST_REGEX: Arc<Regex> = Arc::new(Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*$").unwrap());
-    static ref PLAIN_REGEX: Arc<Regex> = Arc::new(Regex::new(r"^\s*(\S+):(\d\+)\s*$").unwrap());
+    static ref PLAIN_REGEX: Arc<Regex> = Arc::new(Regex::new(r"(?i)^\s*(\S+):(\d+)\s*$").unwrap());
 }
 pub struct Runner {
     pub name: String,
