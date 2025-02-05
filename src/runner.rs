@@ -1,6 +1,7 @@
 use crate::active_tracker;
 use crate::controller::Controller;
 use crate::idle_tracker::IdleTracker;
+use crate::hostutil::{HostAndPort, ParseError};
 use anyhow::anyhow;
 use anyhow::Result;
 use async_speed_limit::Limiter;
@@ -378,29 +379,9 @@ impl Runner {
             info!("{conn_id} resolved {to_resolve} to {resolved} (no hit)")
         }
 
-        let host_and_port = Self::parse_host_port(&resolved);
-        let actual_host: String;
-        let actual_port: u16;
+        let host_and_port = HostAndPort::parse_or_default(&resolved, listener_config.target_port);
 
-        match host_and_port {
-            Err(cause) => {
-                info!("{conn_id} {resolved} is invalid: {cause}");
-                return Ok(())
-            }, 
-            Ok((host, port)) => {
-                actual_host = host;
-                match port {
-                    Some(inner) => {
-                        actual_port = inner;
-                    },
-                    None => {
-                        actual_port = listener_config.target_port;
-                    }
-                }
-            }
-        }
-
-        let resolved = format!("{actual_host}:{actual_port}");
+        let resolved = host_and_port.to_string();
         info!("{conn_id} final target: {resolved}");
         if !did_hit_resolver {
             // check self connection
