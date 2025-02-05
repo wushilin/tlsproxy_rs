@@ -38,6 +38,7 @@ lazy_static! {
     static ref COUNTER: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     static ref HOST_PORT_REGEX: Arc<Regex> = Arc::new(Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*,\s*port\s*=\s*(\d+)\s*$").unwrap());
     static ref HOST_REGEX: Arc<Regex> = Arc::new(Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*$").unwrap());
+    static ref PLAIN_REGEX: Arc<Regex> = Arc::new(Regex::new(r"^\s*(\S+):(\d\+)\s*$").unwrap());
 }
 pub struct Runner {
     pub name: String,
@@ -312,7 +313,12 @@ impl Runner {
         if let Some(caps) = HOST_REGEX.captures(input) {
             return Ok((caps[1].to_string(), None));
         }
-        return Ok((input.to_string(), None))
+        if let Some(caps) = PLAIN_REGEX.captures(input) {
+            let host = caps[1].to_string();
+            let port = caps[2].parse::<u16>()?; // Convert port to u16 safely
+            return Ok((host, Some(port)));
+        }
+        return Err(anyhow!(format!("Invalid format {input}")));
     }
 
     async fn worker(
