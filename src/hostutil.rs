@@ -13,7 +13,7 @@ lazy_static! {
         Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*,\s*port\s*=\s*(\d+)\s*$").unwrap(),
         Regex::new(r"(?i)^\s*(\S+)\s*:\s*(\d+)\s*$").unwrap(),
         Regex::new(r"(?i)^\s*(\S+)\s*@\s*(\d+)\s*$").unwrap(),
-        Regex::new(r"(?i)^\s*(\S+)\s*|\s*(\d+)\s*$").unwrap(),
+        Regex::new(r"(?i)^\s*(\S+)\s*\|\s*(\d+)\s*$").unwrap(),
     ]);
 }
 
