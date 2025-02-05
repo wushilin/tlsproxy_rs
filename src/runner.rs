@@ -364,11 +364,12 @@ impl Runner {
                 return Ok(());
             }
         }
-        let (resolved, did_hit_resolver) = resolver::resolve(&sni_target).await;
+        let to_resolve = format!("{sni_target}:{}", listener_config.target_port);
+        let (resolved, did_hit_resolver) = resolver::resolve(&to_resolve).await;
         if did_hit_resolver {
-            info!("{conn_id} resolved {sni_target} to {resolved} (hit)");
+            info!("{conn_id} resolved {to_resolve} to {resolved} (hit)");
         } else {
-            info!("{conn_id} resolved {sni_target} to {resolved} (no hit)")
+            info!("{conn_id} resolved {to_resolve} to {resolved} (no hit)")
         }
 
         let host_and_port = Self::parse_host_port(&resolved);
