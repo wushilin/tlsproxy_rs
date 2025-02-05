@@ -318,7 +318,7 @@ impl Runner {
             let port = caps[2].parse::<u16>()?; // Convert port to u16 safely
             return Ok((host, Some(port)));
         }
-        return Err(anyhow!(format!("invalid format {input}")));
+        return Ok((input.into(), None))
     }
 
     async fn worker(
