@@ -23,12 +23,13 @@ async fn init_inner(new:HashMap<String, String>) {
     config_1.extend(new.clone());
 }
 
-pub async fn resolve(host:&str) -> String {
+// Resolve return resolved address, and a boolean indicating if actual resolution happened
+pub async fn resolve(host:&str) -> (String, bool) {
     let result = CONFIG.read().await;
     let result = result.get(host);
     if result.is_none() {
-        return host.into();
+        return (host.into(), false);
     }
     let result = result.unwrap().clone();
-    return result;
+    return (result, true);
 }

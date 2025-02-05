@@ -15,6 +15,8 @@ use std::time::Instant;
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use regex::Regex;
+
 use tokio::{
     io::{ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
@@ -34,6 +36,8 @@ use crate::request_id::RequestId;
 
 lazy_static! {
     static ref COUNTER: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    static ref HOST_PORT_REGEX: Arc<Regex> = Arc::new(Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*,\s*port\s*=\s*(\d+)\s*$").unwrap());
+    static ref HOST_REGEX: Arc<Regex> = Arc::new(Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*$").unwrap());
 }
 pub struct Runner {
     pub name: String,
@@ -296,6 +300,21 @@ impl Runner {
         false
     }
 
+    // Resolver may return host=<host|ipv4|ipv6>,port=<u16> format
+    // Resolver can also return <host|ipv4|ipv6> format, where port is the original port
+    
+    fn parse_host_port(input: &str) -> Result<(String, Option<u16>)> {
+        if let Some(caps) = HOST_PORT_REGEX.captures(input) {
+            let host = caps[1].to_string();
+            let port = caps[2].parse::<u16>()?; // Convert port to u16 safely
+            return Ok((host, Some(port)));
+        }
+        if let Some(caps) = HOST_REGEX.captures(input) {
+            return Ok((caps[1].to_string(), None));
+        }
+        return Ok((input.to_string(), None))
+    }
+
     async fn worker(
         name: Arc<String>,
         ext: Extensible<TcpStream>,
@@ -345,27 +364,58 @@ impl Runner {
                 return Ok(());
             }
         }
-        let resolved = resolver::resolve(&sni_target).await;
-        info!("{conn_id} resolved {sni_target} to {resolved}");
+        let (resolved, did_hit_resolver) = resolver::resolve(&sni_target).await;
+        if did_hit_resolver {
+            info!("{conn_id} resolved {sni_target} to {resolved} (hit)");
+        } else {
+            info!("{conn_id} resolved {sni_target} to {resolved} (no hit)")
+        }
 
-        let resolved = format!("{resolved}:{}", listener_config.target_port);
-        // check self connection
-        let dns_result = lookup_host(&resolved).await;
-        match dns_result {
+        let host_and_port = Self::parse_host_port(&resolved);
+        let actual_host: String;
+        let actual_port: u16;
+
+        match host_and_port {
             Err(cause) => {
-                warn!("{conn_id} dns error: {cause}");
-                return Ok(());
-            },
-            Ok(addresses) => {
-                for next_address in addresses {
-                    let self_addresses_clone = Arc::clone(&self_addresses);
-                    let is_local = Self::is_local(&conn_id, &next_address, self_addresses_clone);
-                    if is_local {
-                        warn!("{conn_id} rejected self connection: {}", next_address.ip());
-                        return Ok(());
+                info!("{conn_id} {resolved} is invalid: {cause}");
+                return Ok(())
+            }, 
+            Ok((host, port)) => {
+                actual_host = host;
+                match port {
+                    Some(inner) => {
+                        actual_port = inner;
+                    },
+                    None => {
+                        actual_port = listener_config.target_port;
                     }
                 }
             }
+        }
+
+        let resolved = format!("{actual_host}:{actual_port}");
+        info!("{conn_id} final target: {resolved}");
+        if !did_hit_resolver {
+            // check self connection
+            let dns_result = lookup_host(&resolved).await;
+            match dns_result {
+                Err(cause) => {
+                    warn!("{conn_id} dns error: {cause}");
+                    return Ok(());
+                },
+                Ok(addresses) => {
+                    for next_address in addresses {
+                        let self_addresses_clone = Arc::clone(&self_addresses);
+                        let is_local = Self::is_local(&conn_id, &next_address, self_addresses_clone);
+                        if is_local {
+                            warn!("{conn_id} rejected self connection: {}", next_address.ip());
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        } else {
+            info!("{conn_id} skiped target check as resolver did hit");
         }
         let connect_future = TcpStream::connect(&resolved);
         let r_stream = tokio::time::timeout(Duration::from_secs(5), connect_future).await??;
