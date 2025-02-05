@@ -1,7 +1,5 @@
 #!/bin/sh
 #
-
-rm -rf dist
-ng build -c production
-#rm -rf ../static/*
-cp -r dist/angular-ui/*.* ../static
+ng build --configuration production
+rm ../static/*
+cp dist/angular-ui/* ../static/
