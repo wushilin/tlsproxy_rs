@@ -216,13 +216,13 @@
 
       <!-- Position Column -->
       <ng-container matColumnDef="from">
-        <th mat-header-cell *matHeaderCellDef> From (host:port format)</th>
+        <th mat-header-cell *matHeaderCellDef> From (SNI Host Names)</th>
         <td mat-cell *matCellDef="let element"> {{element[0]}} </td>
       </ng-container>
 
       <!-- Name Column -->
       <ng-container matColumnDef="to">
-        <th mat-header-cell *matHeaderCellDef> To (host:port format) </th>
+        <th mat-header-cell *matHeaderCellDef> To (bare, or host=xxx,port=xxx, or host=xxx format) </th>
         <td mat-cell *matCellDef="let element"> {{element[1]}} </td>
       </ng-container>
       <ng-container matColumnDef="action">
@@ -265,3 +265,4 @@
     </div>
   </div>
 </mat-expansion-panel>
+
