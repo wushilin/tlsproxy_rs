@@ -1,7 +1,7 @@
 use crate::active_tracker;
 use crate::controller::Controller;
 use crate::idle_tracker::IdleTracker;
-use crate::hostutil::{HostAndPort, ParseError};
+use crate::hostutil::HostAndPort;
 use anyhow::anyhow;
 use anyhow::Result;
 use async_speed_limit::Limiter;
@@ -302,26 +302,6 @@ impl Runner {
         false
     }
 
-    // Resolver may return host=<host|ipv4|ipv6>,port=<u16> format
-    // Resolver can also return <host|ipv4|ipv6> format, where port is the original port
-    
-    fn parse_host_port(input: &str) -> Result<(String, Option<u16>)> {
-        if let Some(caps) = HOST_PORT_REGEX.captures(input) {
-            let host = caps[1].to_string();
-            let port = caps[2].parse::<u16>()?; // Convert port to u16 safely
-            return Ok((host, Some(port)));
-        }
-        if let Some(caps) = HOST_REGEX.captures(input) {
-            return Ok((caps[1].to_string(), None));
-        }
-        if let Some(caps) = PLAIN_REGEX.captures(input) {
-            let host = caps[1].to_string();
-            let port = caps[2].parse::<u16>()?; // Convert port to u16 safely
-            return Ok((host, Some(port)));
-        }
-        return Ok((input.into(), None))
-    }
-
     async fn worker(
         name: Arc<String>,
         ext: Extensible<TcpStream>,
@@ -383,6 +363,7 @@ impl Runner {
 
         let resolved = host_and_port.to_string();
         info!("{conn_id} final target: {resolved}");
+        // bypass self connection check if it is resolver's instruction. In this case, probably you want to allow it
         if !did_hit_resolver {
             // check self connection
             let dns_result = lookup_host(&resolved).await;
