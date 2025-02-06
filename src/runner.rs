@@ -352,11 +352,13 @@ impl Runner {
             }
         }
         let to_resolve = format!("{sni_target}:{}", listener_config.target_port);
-        let (resolved, did_hit_resolver) = resolver::resolve(&to_resolve).await;
+        let resolved_opt= resolver::resolve(&to_resolve).await;
+        let did_hit_resolver = resolved_opt.is_some();
+        let resolved = resolved_opt.unwrap_or(to_resolve.clone());
         if did_hit_resolver {
-            info!("{conn_id} resolved {to_resolve} to {resolved} (hit)");
+            info!("{conn_id} resolved `{to_resolve}` to `{resolved}` (hit)");
         } else {
-            info!("{conn_id} resolved {to_resolve} to {resolved} (no hit)")
+            info!("{conn_id} `{to_resolve}` did not resolve (no hit). using `{to_resolve}` as is");
         }
 
         let host_and_port = HostAndPort::parse_or_default(&resolved, listener_config.target_port);

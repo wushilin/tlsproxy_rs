@@ -24,12 +24,8 @@ async fn init_inner(new:HashMap<String, String>) {
 }
 
 // Resolve return resolved address, and a boolean indicating if actual resolution happened
-pub async fn resolve(host:&str) -> (String, bool) {
+pub async fn resolve(host:&str) -> Option<String> {
     let result = CONFIG.read().await;
-    let result = result.get(host);
-    if result.is_none() {
-        return (host.into(), false);
-    }
-    let result = result.unwrap().clone();
-    return (result, true);
+    let result = result.get(host)?;
+    return Some(result.into())
 }
