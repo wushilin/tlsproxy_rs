@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap, convert::Infallible, error::Error, fmt::Display, io::Cursor, path::{Path, PathBuf}, sync::Arc
+    collections::HashMap, convert::Infallible, error::Error, fmt::Display, io::Cursor, path::PathBuf, sync::Arc
 };
 use include_dir::{include_dir, Dir};
 use regex::Regex;
@@ -17,7 +17,6 @@ use rocket::{config::TlsConfig, Request};
 use rocket::{
     catch, catchers,
     config::{MutualTls, Shutdown},
-    fs::NamedFile,
     get,
     http::{ContentType, Header, Status},
     post, put,
@@ -164,7 +163,6 @@ struct PartialContent {
     content_type: ContentType,
     content_length: usize,
     range_header: Option<String>,
-    total_length: usize,
 }
 
 impl<'r> Responder<'r, 'static> for PartialContent {
@@ -265,7 +263,6 @@ async fn static_handler(file: PathBuf, _who: Authenticated, range: RangeHeader) 
             content_type,
             content_length: partial_content.len(),
             range_header: Some(content_range),
-            total_length,
         })
     } else {
         // Full content
@@ -274,7 +271,6 @@ async fn static_handler(file: PathBuf, _who: Authenticated, range: RangeHeader) 
             content_type,
             content_length: total_length,
             range_header: None,
-            total_length,
         })
     }
 }
