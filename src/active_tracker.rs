@@ -1,18 +1,20 @@
-use std::{sync::Arc, collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+// Active tracker tracks the active connection for debugging purpose.
+use crate::request_id::RequestId;
 use lazy_static::lazy_static;
 use tokio::sync::RwLock;
-use crate::request_id::RequestId;
 
 lazy_static! {
-    static ref ACTIVE: Arc<RwLock<HashMap<RequestId, SocketAddr>>> = Arc::new(RwLock::new(HashMap::new()));
+    static ref ACTIVE: Arc<RwLock<HashMap<RequestId, SocketAddr>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 }
 
 pub async fn reset() {
     ACTIVE.write().await.clear()
 }
 
-pub async fn put(request_id:&RequestId, addr:SocketAddr) {
+pub async fn put(request_id: &RequestId, addr: SocketAddr) {
     let mut w = ACTIVE.write().await;
     w.insert(request_id.clone(), addr);
 }
