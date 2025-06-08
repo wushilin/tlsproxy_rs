@@ -27,7 +27,7 @@ async fn init_inner(new:HashMap<String, String>) {
     suffix_1.clear();
     for(key, value) in &new {
         if key.starts_with("suffix:") {
-            let new_key = key[7:];
+            let new_key = &key[7..];
             info!("Adding DNS by suffix {} -> {}", new_key, value);
             suffix_1.insert(new_key.into(), value.clone());
         }
@@ -44,7 +44,7 @@ pub async fn resolve(host:&str) -> Option<String> {
         },
         None => {
             let suffix_1 = SUFFIX.read().await;
-            for(key, value) in &suffix_1 {
+            for(key, value) in &*suffix_1 {
                 if host.ends_with(key) {
                     return Some(value.into());
                 }
