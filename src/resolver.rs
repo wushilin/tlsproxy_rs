@@ -8,6 +8,7 @@ use log::info;
 
 lazy_static! {
     static ref CONFIG: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    static ref SUFFIX: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
 }
 
 pub async fn init(config:&Config) {
@@ -21,6 +22,16 @@ async fn init_inner(new:HashMap<String, String>) {
     let mut config_1 = CONFIG.write().await;
     config_1.clear();
     config_1.extend(new.clone());
+
+    let mut suffix_1 = SUFFIX.write().await;
+    suffix_1.clear();
+    for(key, value) in &new {
+        if key.starts_with("suffix:") {
+            let new_key = key[7:];
+            info!("Adding DNS by suffix {} -> {}", new_key, value);
+            suffix_1.insert(new_key.into(), value.clone());
+        }
+    }
 }
 
 // Resolve return resolved address, and a boolean indicating if actual resolution happened
@@ -32,8 +43,13 @@ pub async fn resolve(host:&str) -> Option<String> {
             return Some(inner.into());
         },
         None => {
-            let default_result = result.get("default")?;
-            return Some(default_result.into());
+            let suffix_1 = SUFFIX.read().await;
+            for(key, value) in &suffix_1 {
+                if host.ends_with(key) {
+                    return Some(value.into());
+                }
+            }
+            return None;
         }
     }
 }
