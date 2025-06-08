@@ -26,6 +26,14 @@ async fn init_inner(new:HashMap<String, String>) {
 // Resolve return resolved address, and a boolean indicating if actual resolution happened
 pub async fn resolve(host:&str) -> Option<String> {
     let result = CONFIG.read().await;
-    let result = result.get(host)?;
-    return Some(result.into())
+    let direct_result = result.get(host);
+    match direct_result {
+        Some(inner) => {
+            return Some(inner.into());
+        },
+        None => {
+            let default_result = result.get("default")?;
+            return Some(default_result.into());
+        }
+    }
 }
