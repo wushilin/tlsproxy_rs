@@ -21,16 +21,27 @@ pub async fn init(config:&Config) {
 async fn init_inner(new:HashMap<String, String>) {
     let mut config_1 = CONFIG.write().await;
     config_1.clear();
-    config_1.extend(new.clone());
+    // Convert it to a lower cased key map first
+    let new_lc:HashMap<String, String> = new.clone().into_iter()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect();
+
+    let direct_lc:HashMap<String, String> = new_lc.clone().into_iter()
+        .filter(|(k, _v)| !k.starts_with("suffix:"))
+        .collect();
+
+    let suffix_lc:HashMap<String, String> = new_lc.clone().into_iter()
+        .filter(|(k, _v)| k.starts_with("suffix:"))
+        .collect();
+
+    config_1.extend(direct_lc.clone());
 
     let mut suffix_1 = SUFFIX.write().await;
     suffix_1.clear();
-    for(key, value) in &new {
-        if key.starts_with("suffix:") {
-            let new_key = &key[7..];
-            info!("Adding DNS by suffix {} -> {}", new_key, value);
-            suffix_1.insert(new_key.into(), value.clone());
-        }
+    for(key, value) in &suffix_lc{
+        let new_key = &key[7..];
+        info!("Adding DNS by suffix {} -> {}", new_key, value);
+        suffix_1.insert(new_key.into(), value.clone());
     }
 }
 
@@ -45,7 +56,8 @@ pub async fn resolve(host:&str) -> Option<String> {
         None => {
             let suffix_1 = SUFFIX.read().await;
             for(key, value) in &*suffix_1 {
-                if host.ends_with(key) {
+                let host_lc = host.to_lowercase();
+                if host_lc.ends_with(key) {
                     return Some(value.into());
                 }
             }
