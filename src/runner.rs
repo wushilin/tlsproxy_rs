@@ -10,6 +10,8 @@ use log::{info, warn, error};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::lookup_host;
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -46,7 +48,7 @@ pub struct Runner {
     pub listener: Listener,
     pub config: Arc<RwLock<Config>>,
     pub controller: Arc<RwLock<Controller>>,
-    pub self_addresses: Arc<Vec<SocketAddr>>
+    pub self_addresses: Arc<HashSet<IpAddr>>
 }
 
 impl Runner {
@@ -55,7 +57,7 @@ impl Runner {
         listener: Listener,
         config: Arc<RwLock<Config>>,
         root_context: Arc<RwLock<Controller>>,
-        self_addresses: Arc<Vec<SocketAddr>>,
+        self_addresses: Arc<HashSet<IpAddr>>,
     ) -> Runner {
         Runner {
             name,
@@ -157,7 +159,7 @@ impl Runner {
         listener_config: Arc<Listener>,
         stats: Arc<ListenerStats>,
         controller: Arc<RwLock<Controller>>,
-        self_addresses: Arc<Vec<SocketAddr>>
+        self_addresses: Arc<HashSet<IpAddr>>
     ) -> JoinHandle<Option<()>> {
         let mut controller_inner = controller.write().await;
         let controller_clone_inner = Arc::clone(&controller);
@@ -198,7 +200,7 @@ impl Runner {
         listener_config: Arc<Listener>,
         stats: Arc<ListenerStats>,
         controller: Arc<RwLock<Controller>>,
-        self_addresses: Arc<Vec<SocketAddr>>
+        self_addresses: Arc<HashSet<IpAddr>>
     ) -> Result<()> {
         let name = Arc::new(name);
         loop {
@@ -268,7 +270,7 @@ impl Runner {
         }
     }
 
-    fn is_local(request_id: &RequestId, addr:&SocketAddr, local_addresses: Arc<Vec<SocketAddr>>) -> bool{
+    fn is_local(request_id: &RequestId, addr:&SocketAddr, local_addresses: Arc<HashSet<IpAddr>>) -> bool{
         info!("{request_id} checking if {addr} is a local address");
         match addr {
             SocketAddr::V4(v4a) => {
@@ -291,11 +293,9 @@ impl Runner {
                 }
             }
         }
-        for next_self_address in local_addresses.iter() {
-            if addr.ip() == next_self_address.ip() {
-                info!("{request_id} {addr} matches self ip {next_self_address}, it is local");
-                return true
-            }
+        if local_addresses.contains(&addr.ip()) {
+            info!("{request_id} {addr} is in local addresses, it is local");
+            return true
         }
 
         info!("{request_id} {addr} it is not local");
@@ -308,7 +308,7 @@ impl Runner {
         listener_config: Arc<Listener>,
         context: Arc<ListenerStats>,
         controller: Arc<RwLock<Controller>>,
-        self_addresses: Arc<Vec<SocketAddr>>,
+        self_addresses: Arc<HashSet<IpAddr>>,
     ) -> Result<()> {
         let conn_id = ext.get_extension::<RequestId>().await.unwrap();
         info!("{conn_id} {name} worker started");

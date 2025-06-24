@@ -11,6 +11,7 @@ pub mod active_tracker;
 pub mod request_id;
 pub mod extensible;
 pub mod hostutil;
+pub mod ifutil;
 extern crate rocket;
 use std::error::Error;
 use config::Config;

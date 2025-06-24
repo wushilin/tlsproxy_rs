@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
 use crate::active_tracker;
 use crate::controller::Controller;
 use crate::listener_stats::StatsSerde;
 use crate::runner::Runner;
+use crate::ifutil;
 use crate::{
     config::Config,
     listener_stats::ListenerStats,
@@ -132,21 +134,25 @@ pub async fn start(config: Config) -> Result<HashMap<String, Result<bool>>> {
     let config_x = Arc::new(RwLock::new(config.clone()));
     let (tx, mut rx) = mpsc::channel(config.listeners.len());
     let self_ips = config.options.self_ips.clone();
-    let mut self_addresses = Vec::new();
+    let mut self_addresses:HashSet<IpAddr> = HashSet::new();
     for next_host in self_ips {
         let next_host = format!("{next_host}:9999");
         let addresses = lookup_host(&next_host).await;
-        match addresses {
-            Err(cause) => {
-                error!("unable to resolve {next_host}:{cause}");
-            },
-            Ok(addresses) => {
-                for next_address in addresses {
-                    self_addresses.push(next_address);
-                }
-            }
-        }
+        addresses
+            .inspect_err(|e| error!("unable to resolve DNS for {next_host}: {e}"))
+            .ok().map(|addresses| {
+            addresses.for_each(|addr| {
+                info!("adding self address from lookup_host: {addr} ({next_host})");
+                self_addresses.insert(addr.ip());
+            });
+        });
     }
+    let ifutil_addresses = ifutil::list_local_ip_addresses();
+    for next_address in ifutil_addresses {
+        info!("adding self address from list_local_ip_addresses: {next_address}");
+        self_addresses.insert(next_address);
+    }
+    info!("self addresses: {:?}", self_addresses);
     let self_addresses = Arc::new(self_addresses);
     for (name, listener) in &config.listeners {
         let name = name.clone();
