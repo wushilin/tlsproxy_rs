@@ -136,14 +136,15 @@ pub async fn start(config: Config) -> Result<HashMap<String, Result<bool>>> {
     let self_ips = config.options.self_ips.clone();
     let mut self_addresses:HashSet<IpAddr> = HashSet::new();
     for next_host in self_ips {
-        let next_host = format!("{next_host}:9999");
-        let addresses = lookup_host(&next_host).await;
+        let next_host_with_port = format!("{next_host}:9999");
+        let addresses = lookup_host(&next_host_with_port).await;
         addresses
             .inspect_err(|e| error!("unable to resolve DNS for {next_host}: {e}"))
             .ok().map(|addresses| {
             addresses.for_each(|addr| {
-                info!("adding self address from lookup_host: {addr} ({next_host})");
-                self_addresses.insert(addr.ip());
+                let ip_addr = addr.ip();
+                info!("adding self address from lookup_host: {ip_addr} ({next_host})");
+                self_addresses.insert(ip_addr);
             });
         });
     }
