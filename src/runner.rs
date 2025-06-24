@@ -171,10 +171,13 @@ impl Runner {
             let mut new_total = stats_local.total_count();
             info!("{request_id} ({name}) new connection from {remote_address} active {new_active} total {new_total}");
             let self_addresses_clone = Arc::clone(&self_addresses);
+            // Check if the remote address is local
+            // If it is local, we will not process it
+            // If it is not local, we will process it
             let is_remote_local = Self::is_local(&request_id, &remote_address, self_addresses_clone);
             let start = Instant::now();
             if is_remote_local {
-                info!("{request_id} pre-connection check: connection is from this machine. closing {remote_address}");
+                info!("{request_id} pre-connection check: connection is from this machine. closing {remote_address} to prevent self connection");
             } else {
                 active_tracker::put(&request_id, remote_address).await;
                 let stats_local_clone = Arc::clone(&stats_local);
@@ -366,6 +369,8 @@ impl Runner {
         let resolved = host_and_port.to_string();
         info!("{conn_id} final target: {resolved}");
         // bypass self connection check if it is resolver's instruction. In this case, probably you want to allow it
+        // The connection target can't be a local address, so we need to check it
+        // however, if resolver allowed it, we will not check it
         if !did_hit_resolver {
             // check self connection
             let dns_result = lookup_host(&resolved).await;
@@ -374,6 +379,7 @@ impl Runner {
                     warn!("{conn_id} dns error: {cause}");
                     return Ok(());
                 },
+                // If any of the resolved IP addresses is a local address, we will reject the connection
                 Ok(addresses) => {
                     for next_address in addresses {
                         let self_addresses_clone = Arc::clone(&self_addresses);
