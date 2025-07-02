@@ -47,8 +47,9 @@ async fn init_inner(new:HashMap<String, String>) {
 
 // Resolve return resolved address, and a boolean indicating if actual resolution happened
 pub async fn resolve(host:&str) -> Option<String> {
+    let host_lc = host.to_lowercase();
     let result = CONFIG.read().await;
-    let direct_result = result.get(host);
+    let direct_result = result.get(&host_lc);
     match direct_result {
         Some(inner) => {
             return Some(inner.into());
@@ -56,7 +57,6 @@ pub async fn resolve(host:&str) -> Option<String> {
         None => {
             let suffix_1 = SUFFIX.read().await;
             for(key, value) in &*suffix_1 {
-                let host_lc = host.to_lowercase();
                 if host_lc.ends_with(key) {
                     return Some(value.into());
                 }
