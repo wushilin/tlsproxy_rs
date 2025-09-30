@@ -1,14 +1,32 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use lazy_static::lazy_static;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::config::Config;
+use std::cmp::Ordering;
 use log::info;
 
 lazy_static! {
     static ref CONFIG: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
-    static ref SUFFIX: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    static ref SUFFIX: Arc<RwLock<BTreeMap<LenKey, String>>> = Arc::new(RwLock::new(BTreeMap::new()));
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct LenKey(String);
+
+impl Ord for LenKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // longest first
+        other.0.len().cmp(&self.0.len())
+            .then_with(|| self.0.cmp(&other.0))
+    }
+}
+
+impl PartialOrd for LenKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 pub async fn init(config:&Config) {
@@ -41,7 +59,7 @@ async fn init_inner(new:HashMap<String, String>) {
     for(key, value) in &suffix_lc{
         let new_key = &key[7..];
         info!("Adding DNS by suffix {} -> {}", new_key, value);
-        suffix_1.insert(new_key.into(), value.clone());
+        suffix_1.insert(LenKey(new_key.into()), value.clone());
     }
 }
 
@@ -57,7 +75,7 @@ pub async fn resolve(host:&str) -> Option<String> {
         None => {
             let suffix_1 = SUFFIX.read().await;
             for(key, value) in &*suffix_1 {
-                if host_lc.ends_with(key) {
+                if host_lc.ends_with(&key.0) {
                     return Some(value.into());
                 }
             }
