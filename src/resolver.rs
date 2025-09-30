@@ -70,12 +70,14 @@ pub async fn resolve(host:&str) -> Option<String> {
     let direct_result = result.get(&host_lc);
     match direct_result {
         Some(inner) => {
+            info!("DNS direct match {} -> {}", host_lc, inner);
             return Some(inner.into());
         },
         None => {
             let suffix_1 = SUFFIX.read().await;
             for(key, value) in &*suffix_1 {
                 if host_lc.ends_with(&key.0) {
+                    info!("DNS suffix match {} -> {}", host_lc, value);
                     return Some(value.into());
                 }
             }
