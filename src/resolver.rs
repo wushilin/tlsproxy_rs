@@ -77,7 +77,7 @@ pub async fn resolve(host:&str) -> Option<String> {
             let suffix_1 = SUFFIX.read().await;
             for(key, value) in &*suffix_1 {
                 if host_lc.ends_with(&key.0) {
-                    info!("DNS suffix match {} -> {}", host_lc, value);
+                    info!("DNS suffix match {} -> {} by suffix `{}`", host_lc, value, key.0);
                     return Some(value.into());
                 }
             }
