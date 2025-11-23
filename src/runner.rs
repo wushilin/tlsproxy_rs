@@ -101,6 +101,7 @@ impl Runner {
                         let _ = tx.send(None).await; // tell listener started successfully
                         let name_clone_result = name_clone.clone();
                         let result = Self::run_listener(
+                            Arc::clone(&self.config),
                             name_clone,
                             inner_listener,
                             listener_config,
@@ -153,6 +154,7 @@ impl Runner {
     }
 
     async fn handle_new_socket(
+        config: Arc<RwLock<Config>>,
         name:Arc<String>,
         ext:Extensible<TcpStream>,
         remote_address:SocketAddr,
@@ -174,14 +176,24 @@ impl Runner {
             // Check if the remote address is local
             // If it is local, we will not process it
             // If it is not local, we will process it
-            let is_remote_local = Self::is_local(&request_id, &remote_address, self_addresses_clone);
+            let disable_check_ip = config.read().await.disable_check_ip.unwrap_or(false);
+            let local_ip_check_result =if ! disable_check_ip {
+                let is_remote_local = Self::is_local(&request_id, &remote_address, self_addresses_clone);
+                info!("{request_id} pre-connection check: {remote_address} is local: {is_remote_local}");
+                !is_remote_local
+            } else {
+                // if we disabled check, the check result is always true
+                info!("{request_id} pre-connection check: disabled. skipping");
+                true
+            };
+
             let start = Instant::now();
-            if is_remote_local {
+            if !local_ip_check_result {
                 info!("{request_id} pre-connection check: connection is from this machine. closing {remote_address} to prevent self connection");
             } else {
                 active_tracker::put(&request_id, remote_address).await;
                 let stats_local_clone = Arc::clone(&stats_local);
-                let rr = Self::worker(name, ext, listener_config, stats_local_clone, controller_clone_inner, self_addresses).await;
+                let rr = Self::worker(config, name, ext, listener_config, stats_local_clone, controller_clone_inner, self_addresses).await;
                 if rr.is_err() {
                     let err = rr.err().unwrap();
                     warn!("{request_id} connection error: {err}");
@@ -198,6 +210,7 @@ impl Runner {
     }
 
     async fn run_listener(
+        config: Arc<RwLock<Config>>,
         name: String,
         listener: TcpListener,
         listener_config: Arc<Listener>,
@@ -215,6 +228,7 @@ impl Runner {
                     let ext = Extensible::of(socket);
                     ext.extend(conn_id).await;
                     let join_handle = Self::handle_new_socket(
+                        Arc::clone(&config),
                         Arc::clone(&name),
                         ext,
                         addr, 
@@ -306,6 +320,7 @@ impl Runner {
     }
 
     async fn worker(
+        config: Arc<RwLock<Config>>,
         name: Arc<String>,
         ext: Extensible<TcpStream>,
         listener_config: Arc<Listener>,
@@ -383,7 +398,19 @@ impl Runner {
                 Ok(addresses) => {
                     for next_address in addresses {
                         let self_addresses_clone = Arc::clone(&self_addresses);
-                        let is_local = Self::is_local(&conn_id, &next_address, self_addresses_clone);
+                        let is_local = {
+                            let disable_check_ip = config.read().await.disable_check_ip.unwrap_or(false);
+                            if ! disable_check_ip {
+                                info!("{conn_id} local ip check: enabled. checking {next_address}");
+                                let result =Self::is_local(&conn_id, &next_address, self_addresses_clone);
+                                info!("{conn_id} local ip check: result: {result}");
+                                result
+                            } else {
+                                // if we disabled check, the check result is always false
+                                info!("{conn_id} local ip check: disabled. skipping");
+                                false
+                            }
+                        };
                         if is_local {
                             warn!("{conn_id} rejected self connection: {}", next_address.ip());
                             return Ok(());

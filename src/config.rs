@@ -10,6 +10,7 @@ pub struct Config {
     pub listeners: HashMap<String, Listener>,
     pub options:Options,
     pub dns: HashMap<String, String>,
+    pub disable_check_ip: Option<bool>,
     pub admin_server: Option<AdminServerConfig>,
 }
 
@@ -75,6 +76,7 @@ impl Default for Config {
             listeners: HashMap::new(),
             options: Default::default(),
             dns: HashMap::new(),
+            disable_check_ip: None,
             admin_server: None
         }
     }
