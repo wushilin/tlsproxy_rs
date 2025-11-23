@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use regex::Regex;
 use tokio::fs;
-use serde_yaml;
+use serde_yaml_ng;
 use serde_derive::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,12 +115,12 @@ impl Config {
     pub async fn load_file(filename:&str) -> Result<Config, Box<dyn Error>> {
         let content = fs::read_to_string(filename).await?;
     
-        let config:Config = serde_yaml::from_str(&content)?;
+        let config:Config = serde_yaml_ng::from_str(&content)?;
         return Ok(config);
     }
 
     pub fn load_string(content:&str) -> Result<Config, Box<dyn Error>> {
-        let config:Config = serde_yaml::from_str(&content)?;
+        let config:Config = serde_yaml_ng::from_str(&content)?;
         return Ok(config);
     }
 
