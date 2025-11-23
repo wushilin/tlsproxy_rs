@@ -59,7 +59,10 @@ async fn init_inner(new:HashMap<String, String>) {
         .filter(|(k, _v)| k.starts_with("regex:"))
         .collect();
 
-    config_1.extend(direct_lc.clone());
+    for(key, value) in &direct_lc{
+        info!("Adding DNS by explicit {} -> {}", key, value);
+        config_1.insert(key.to_lowercase(), value.clone());
+    }
 
     let mut suffix_1 = SUFFIX.write().await;
     suffix_1.clear();
@@ -77,7 +80,7 @@ async fn init_inner(new:HashMap<String, String>) {
             .case_insensitive(true)
             .build()
             .unwrap();
-        info!("Adding DNS by regex {} -> {}", regex, value);
+        info!("Adding DNS by regex {} -> {}", new_regex_str, value);
         regex_1.push((new_regex, value.clone()));
     }
 }
