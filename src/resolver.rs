@@ -72,7 +72,8 @@ async fn init_inner(new:HashMap<String, String>) {
     let mut regex_1 = REGEX.write().await;
     regex_1.clear();
     for(regex, value) in &regex_lc{
-        let new_regex = RegexBuilder::new(regex)
+        let new_regex_str = regex["regex:".len()..].to_string();
+        let new_regex = RegexBuilder::new(&new_regex_str)
             .case_insensitive(true)
             .build()
             .unwrap();

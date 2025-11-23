@@ -73,7 +73,39 @@ options:
   - 127.0.0.1  # If target server resolves to this host it will be rejected
   - me.jungle # If target server resolves to one of the addresses by this domain, it will be rejected
 dns:
-  home.wushilin.net: 192.168.44.100 # DNS override. If target host is home.wushilin.net, it would be resolved as 192.168.44.100. The DNS can be domain to domain redirection as well. e.g. you can use www.google.com as resolve result
+  # DNS override configuration
+  # You can resolve DNS in 3 ways:
+  #
+  # 1. Explicit matching (highest priority):
+  #    github.com:443 -> my.local.host:443
+  #    Matches exact hostname:port combinations
+  #
+  # 2. Suffix matching (medium priority):
+  #    suffix:thub.com:443 -> my.local.host:443
+  #    Matches hostnames ending with the specified suffix
+  #    Longer suffixes have higher priority than shorter ones
+  #
+  # 3. Regex matching (lowest priority):
+  #    regex:.*thub.com:443 -> my.local.host:443
+  #    Matches hostnames using regular expressions
+  #    Tried in order of their definition when explicit and suffix don't match
+  #
+  # Priority order:
+  # 1. Explicit matches are checked first (highest priority)
+  # 2. Then suffix matches (longer suffixes checked before shorter ones)
+  # 3. Finally regex matches are tried in order of definition
+  #
+  # Example:
+  home.wushilin.net: 192.168.44.100 # Explicit match
+  # suffix:thub.com:443 -> my.local.host:443 # Suffix match example
+  # regex:.*thub.com:443 -> my.local.host:443 # Regex match example
+# If you only service requests from trusted network, then you can disable IP check
+# By Default, the service refuses to connect to any local address, unless
+# it is defined in the dns override earlier
+# Also, it refuses connection came from local addresses (e.g. ::1, 127.0.0.1) 
+# to prevent circular connection, that check can be disabled by setting
+# disable_check_ip -> true
+disable_check_ip: false
 admin_server:
   bind_address: 0.0.0.0  # Admin server bind to this address
   bind_port: 48889 # Admin server bind to this port
