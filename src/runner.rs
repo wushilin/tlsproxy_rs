@@ -10,6 +10,8 @@ use log::{info, warn, error};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::lookup_host;
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -46,7 +48,7 @@ pub struct Runner {
     pub listener: Listener,
     pub config: Arc<RwLock<Config>>,
     pub controller: Arc<RwLock<Controller>>,
-    pub self_addresses: Arc<Vec<SocketAddr>>
+    pub self_addresses: Arc<HashSet<IpAddr>>
 }
 
 impl Runner {
@@ -55,7 +57,7 @@ impl Runner {
         listener: Listener,
         config: Arc<RwLock<Config>>,
         root_context: Arc<RwLock<Controller>>,
-        self_addresses: Arc<Vec<SocketAddr>>,
+        self_addresses: Arc<HashSet<IpAddr>>,
     ) -> Runner {
         Runner {
             name,
@@ -99,6 +101,7 @@ impl Runner {
                         let _ = tx.send(None).await; // tell listener started successfully
                         let name_clone_result = name_clone.clone();
                         let result = Self::run_listener(
+                            Arc::clone(&self.config),
                             name_clone,
                             inner_listener,
                             listener_config,
@@ -151,13 +154,14 @@ impl Runner {
     }
 
     async fn handle_new_socket(
+        config: Arc<RwLock<Config>>,
         name:Arc<String>,
         ext:Extensible<TcpStream>,
         remote_address:SocketAddr,
         listener_config: Arc<Listener>,
         stats: Arc<ListenerStats>,
         controller: Arc<RwLock<Controller>>,
-        self_addresses: Arc<Vec<SocketAddr>>
+        self_addresses: Arc<HashSet<IpAddr>>
     ) -> JoinHandle<Option<()>> {
         let mut controller_inner = controller.write().await;
         let controller_clone_inner = Arc::clone(&controller);
@@ -169,14 +173,27 @@ impl Runner {
             let mut new_total = stats_local.total_count();
             info!("{request_id} ({name}) new connection from {remote_address} active {new_active} total {new_total}");
             let self_addresses_clone = Arc::clone(&self_addresses);
-            let is_remote_local = Self::is_local(&request_id, &remote_address, self_addresses_clone);
+            // Check if the remote address is local
+            // If it is local, we will not process it
+            // If it is not local, we will process it
+            let disable_check_ip = config.read().await.disable_check_ip.unwrap_or(false);
+            let local_ip_check_result =if ! disable_check_ip {
+                let is_remote_local = Self::is_local(&request_id, &remote_address, self_addresses_clone);
+                info!("{request_id} pre-connection check: {remote_address} is local: {is_remote_local}");
+                !is_remote_local
+            } else {
+                // if we disabled check, the check result is always true
+                info!("{request_id} pre-connection check: disabled. skipping");
+                true
+            };
+
             let start = Instant::now();
-            if is_remote_local {
-                info!("{request_id} pre-connection check: connection is from this machine. closing {remote_address}");
+            if !local_ip_check_result {
+                info!("{request_id} pre-connection check: connection is from this machine. closing {remote_address} to prevent self connection");
             } else {
                 active_tracker::put(&request_id, remote_address).await;
                 let stats_local_clone = Arc::clone(&stats_local);
-                let rr = Self::worker(name, ext, listener_config, stats_local_clone, controller_clone_inner, self_addresses).await;
+                let rr = Self::worker(config, name, ext, listener_config, stats_local_clone, controller_clone_inner, self_addresses).await;
                 if rr.is_err() {
                     let err = rr.err().unwrap();
                     warn!("{request_id} connection error: {err}");
@@ -193,12 +210,13 @@ impl Runner {
     }
 
     async fn run_listener(
+        config: Arc<RwLock<Config>>,
         name: String,
         listener: TcpListener,
         listener_config: Arc<Listener>,
         stats: Arc<ListenerStats>,
         controller: Arc<RwLock<Controller>>,
-        self_addresses: Arc<Vec<SocketAddr>>
+        self_addresses: Arc<HashSet<IpAddr>>
     ) -> Result<()> {
         let name = Arc::new(name);
         loop {
@@ -210,6 +228,7 @@ impl Runner {
                     let ext = Extensible::of(socket);
                     ext.extend(conn_id).await;
                     let join_handle = Self::handle_new_socket(
+                        Arc::clone(&config),
                         Arc::clone(&name),
                         ext,
                         addr, 
@@ -268,7 +287,7 @@ impl Runner {
         }
     }
 
-    fn is_local(request_id: &RequestId, addr:&SocketAddr, local_addresses: Arc<Vec<SocketAddr>>) -> bool{
+    fn is_local(request_id: &RequestId, addr:&SocketAddr, local_addresses: Arc<HashSet<IpAddr>>) -> bool{
         info!("{request_id} checking if {addr} is a local address");
         match addr {
             SocketAddr::V4(v4a) => {
@@ -291,11 +310,9 @@ impl Runner {
                 }
             }
         }
-        for next_self_address in local_addresses.iter() {
-            if addr.ip() == next_self_address.ip() {
-                info!("{request_id} {addr} matches self ip {next_self_address}, it is local");
-                return true
-            }
+        if local_addresses.contains(&addr.ip()) {
+            info!("{request_id} {addr} is in local addresses, it is local");
+            return true
         }
 
         info!("{request_id} {addr} it is not local");
@@ -303,12 +320,13 @@ impl Runner {
     }
 
     async fn worker(
+        config: Arc<RwLock<Config>>,
         name: Arc<String>,
         ext: Extensible<TcpStream>,
         listener_config: Arc<Listener>,
         context: Arc<ListenerStats>,
         controller: Arc<RwLock<Controller>>,
-        self_addresses: Arc<Vec<SocketAddr>>,
+        self_addresses: Arc<HashSet<IpAddr>>,
     ) -> Result<()> {
         let conn_id = ext.get_extension::<RequestId>().await.unwrap();
         info!("{conn_id} {name} worker started");
@@ -366,6 +384,8 @@ impl Runner {
         let resolved = host_and_port.to_string();
         info!("{conn_id} final target: {resolved}");
         // bypass self connection check if it is resolver's instruction. In this case, probably you want to allow it
+        // The connection target can't be a local address, so we need to check it
+        // however, if resolver allowed it, we will not check it
         if !did_hit_resolver {
             // check self connection
             let dns_result = lookup_host(&resolved).await;
@@ -374,10 +394,23 @@ impl Runner {
                     warn!("{conn_id} dns error: {cause}");
                     return Ok(());
                 },
+                // If any of the resolved IP addresses is a local address, we will reject the connection
                 Ok(addresses) => {
                     for next_address in addresses {
                         let self_addresses_clone = Arc::clone(&self_addresses);
-                        let is_local = Self::is_local(&conn_id, &next_address, self_addresses_clone);
+                        let is_local = {
+                            let disable_check_ip = config.read().await.disable_check_ip.unwrap_or(false);
+                            if ! disable_check_ip {
+                                info!("{conn_id} local ip check: enabled. checking {next_address}");
+                                let result =Self::is_local(&conn_id, &next_address, self_addresses_clone);
+                                info!("{conn_id} local ip check: result: {result}");
+                                result
+                            } else {
+                                // if we disabled check, the check result is always false
+                                info!("{conn_id} local ip check: disabled. skipping");
+                                false
+                            }
+                        };
                         if is_local {
                             warn!("{conn_id} rejected self connection: {}", next_address.ip());
                             return Ok(());

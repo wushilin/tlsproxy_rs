@@ -32,6 +32,7 @@ options:
   self_ips:
   - 127.0.0.1
   - me.jungle
+disable_check_ip: false
 dns:
   home.wushilin.net: 192.168.44.100
 admin_server:
