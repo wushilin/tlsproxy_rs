@@ -1,0 +1,2 @@
+noprofile
+copy target/x86_64-unknown-linux-musl/release/tlsproxy oss://fleetman/prod/staging/tlsproxy/tlsproxy
