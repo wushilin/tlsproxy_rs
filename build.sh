@@ -1,10 +1,17 @@
 #!/bin/sh
 
-echo Building UI
-cd angular-ui
-sh build.sh
-cd -
-echo "UI Done"
+#!/bin/sh
+set -eu
+
+echo "Checking embedded UI"
+test -f static/index.html
+test -f static/app.js
+test -f static/styles.css
+if grep -REn 'https?://' static/index.html static/app.js static/styles.css; then
+  echo "External runtime URL found in embedded UI" >&2
+  exit 1
+fi
+
 echo "Building binary"
-cargo build --release
+cargo build --locked --release
 echo "Done"

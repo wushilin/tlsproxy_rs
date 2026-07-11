@@ -1,27 +1,36 @@
-pub mod config;
-pub mod listener_stats;
-pub mod resolver;
-pub mod manager;
-pub mod runner;
-pub mod idle_tracker;
-pub mod admin_server;
-pub mod controller;
-pub mod tls_header;
+#![allow(clippy::needless_return)]
+#![allow(clippy::option_map_unit_fn)]
+#![allow(clippy::too_many_arguments)]
+
 pub mod active_tracker;
-pub mod request_id;
+pub mod admin_server;
+pub mod ca;
+pub mod certificate;
+pub mod config;
+pub mod controller;
 pub mod extensible;
+pub mod hello_cache;
 pub mod hostutil;
-pub mod ifutil;
-extern crate rocket;
-use std::error::Error;
+pub mod idle_tracker;
+pub mod listener_stats;
+pub mod manager;
+pub mod request_id;
+pub mod resolver;
+pub mod runner;
+pub mod tls_header;
 use config::Config;
-use log::{info, error};
+use log::{error, info};
+use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Select a rustls crypto provider before any TLS component is constructed.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
     let config = Config::load_file("config.yaml").await.unwrap();
     config.init_logging();
-    admin_server::init(&config).await;
+    admin_server::init(&config).await?;
     let start_result = manager::start(config).await;
     match start_result {
         Ok(result) => {
@@ -33,17 +42,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         } else {
                             info!("started listener {name} (false)");
                         }
-                    },
+                    }
                     Err(inner_start_err) => {
                         info!("start listner {name} error: {inner_start_err}");
                     }
                 }
             }
-        },
+        }
         Err(cause) => {
             error!("failed to start all listeners: {cause}");
         }
     }
-    let _ = admin_server::run_rocket().await?;
+    admin_server::run().await?;
     Ok(())
 }

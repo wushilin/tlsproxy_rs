@@ -1,17 +1,23 @@
-use std::{sync::Arc, future::Future};
+use std::{future::Future, sync::Arc};
 
 use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_context::task::TaskController;
 
 pub struct Controller {
-    inner: Arc<RwLock<Option<TaskController>>>
+    inner: Arc<RwLock<Option<TaskController>>>,
+}
+
+impl Default for Controller {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Controller {
     pub fn new() -> Self {
         return Self {
-            inner: Arc::new(RwLock::new(Some(TaskController::new())))
-        }
+            inner: Arc::new(RwLock::new(Some(TaskController::new()))),
+        };
     }
 
     /// Cancelled controller will be refreshed. It can be reused again since this point
@@ -21,14 +27,14 @@ impl Controller {
         match ctrl {
             Some(inner) => {
                 inner.cancel();
-            },
+            }
             None => {
                 panic!("controller has no inner controller!");
             }
         }
     }
 
-    pub async fn spawn<T>(&mut self, future:T) -> JoinHandle<Option<T::Output>>
+    pub async fn spawn<T>(&mut self, future: T) -> JoinHandle<Option<T::Output>>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static,
@@ -38,7 +44,7 @@ impl Controller {
             Some(ctx) => {
                 let result = ctx.spawn(future);
                 return result;
-            },
+            }
             None => {
                 panic!("can't spawn when context is not initialized!")
             }
@@ -48,6 +54,8 @@ impl Controller {
 
 impl Clone for Controller {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }

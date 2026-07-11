@@ -1,22 +1,16 @@
-use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::{collections::HashMap, time::Instant};
 
 use crate::active_tracker;
 use crate::controller::Controller;
 use crate::listener_stats::StatsSerde;
 use crate::runner::Runner;
-use crate::ifutil;
-use crate::{
-    config::Config,
-    listener_stats::ListenerStats,
-    resolver,
-};
+use crate::{config::Config, listener_stats::ListenerStats, resolver};
 use anyhow::{anyhow, Result};
 use lazy_static::lazy_static;
-use log::{info, warn, error};
-use tokio::net::lookup_host;
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{mpsc, RwLock};
 #[derive(Debug, PartialEq, Clone)]
 pub enum Status {
     STARTING,
@@ -27,11 +21,17 @@ pub enum Status {
 
 lazy_static! {
     static ref STATUS: Arc<RwLock<Status>> = Arc::new(RwLock::new(Status::STOPPED));
-    static ref LISTENERS: Arc<RwLock<Vec<Arc<ListenerStats>>>> =
-        Arc::new(RwLock::new(Vec::new()));
+    static ref STARTED_AT: Arc<RwLock<Option<Instant>>> = Arc::new(RwLock::new(None));
+    static ref LISTENERS: Arc<RwLock<Vec<Arc<ListenerStats>>>> = Arc::new(RwLock::new(Vec::new()));
     static ref LISTENERS_STATUS: Arc<RwLock<HashMap<String, Result<bool, anyhow::Error>>>> =
         Arc::new(RwLock::new(HashMap::new()));
     static ref CONTROLLER: Arc<RwLock<Controller>> = Arc::new(RwLock::new(Controller::new()));
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerStatusSerde {
+    pub status: String,
+    pub uptime_ms: Option<u128>,
 }
 
 pub async fn cancel() {
@@ -51,7 +51,7 @@ pub async fn get_stats(name: &str) -> Option<Arc<ListenerStats>> {
 }
 
 pub async fn is_running(name: &str) -> bool {
-    get_stats(name).await.is_none()
+    get_stats(name).await.is_some()
 }
 
 pub async fn get_listener_stats() -> HashMap<String, StatsSerde> {
@@ -72,8 +72,12 @@ pub async fn stop() {
     }
     let mut listeners = LISTENERS.write().await;
     let mut listener_status = LISTENERS_STATUS.write().await;
-    info!("transitioning from `{status:?}` to `{:?}`", Status::STOPPING);
+    info!(
+        "transitioning from `{status:?}` to `{:?}`",
+        Status::STOPPING
+    );
     *status = Status::STOPPING;
+    *STARTED_AT.write().await = None;
     listeners.clear();
     active_tracker::reset().await;
     listener_status.clear();
@@ -87,6 +91,19 @@ pub async fn stop() {
 pub async fn get_run_status() -> Status {
     let r = STATUS.read().await;
     return r.clone();
+}
+
+pub async fn get_manager_status() -> ManagerStatusSerde {
+    let status = get_run_status().await;
+    let uptime_ms = STARTED_AT
+        .read()
+        .await
+        .as_ref()
+        .map(|started_at| started_at.elapsed().as_millis());
+    ManagerStatusSerde {
+        status: format!("{status:?}"),
+        uptime_ms,
+    }
 }
 
 pub async fn get_listener_status() -> HashMap<String, Result<bool, anyhow::Error>> {
@@ -115,7 +132,7 @@ pub async fn start(config: Config) -> Result<HashMap<String, Result<bool>>> {
         warn!("starting manager: failed (still running)");
         return Err(anyhow!("failed to start, still running"));
     }
-    if config.listeners.len() == 0 {
+    if config.listeners.is_empty() {
         warn!("starting manager: failed (no listeners defined)");
         return Err(anyhow!("failed to start, no listener"));
     }
@@ -131,68 +148,54 @@ pub async fn start(config: Config) -> Result<HashMap<String, Result<bool>>> {
     resolver::init(&config).await;
     active_tracker::reset().await;
 
-    let config_x = Arc::new(RwLock::new(config.clone()));
+    let ca = match crate::ca::LocalCa::from_config(&config) {
+        Ok(source) => source,
+        Err(cause) => {
+            *status = Status::STOPPED;
+            warn!("starting manager: failed ({cause})");
+            return Err(cause);
+        }
+    };
+    ca.spawn_eviction_job();
     let (tx, mut rx) = mpsc::channel(config.listeners.len());
-    let self_ips = config.options.self_ips.clone();
-    let mut self_addresses:HashSet<IpAddr> = HashSet::new();
-    for next_host in self_ips {
-        let next_host_with_port = format!("{next_host}:9999");
-        let addresses = lookup_host(&next_host_with_port).await;
-        addresses
-            .inspect_err(|e| error!("unable to resolve DNS for {next_host}: {e}"))
-            .ok().map(|addresses| {
-            addresses.for_each(|addr| {
-                let ip_addr = addr.ip();
-                info!("adding self address from lookup_host: {ip_addr} ({next_host})");
-                self_addresses.insert(ip_addr);
-            });
-        });
-    }
-    let ifutil_addresses = ifutil::list_local_ip_addresses();
-    for next_address in ifutil_addresses {
-        info!("adding self address from list_local_ip_addresses: {next_address}");
-        self_addresses.insert(next_address);
-    }
-    info!("self addresses: {:?}", self_addresses);
-    let self_addresses = Arc::new(self_addresses);
     for (name, listener) in &config.listeners {
         let name = name.clone();
-        let local_config = Arc::clone(&config_x);
         let controller_local = Arc::clone(&CONTROLLER);
-        let self_addresses = Arc::clone(&self_addresses);
-        let r = Runner::new(
-            name.clone(),
-            listener.clone(),
-            local_config,
-            controller_local,
-            self_addresses,
-        );
-    
+        let r = Runner::new(name.clone(), listener.clone(), controller_local, ca.clone());
+
         let context = r.start();
         let mut w = CONTROLLER.write().await;
-    
+
         let tx = tx.clone();
         w.spawn(async move {
             let result1 = context.await;
             match result1 {
                 Ok(some) => {
                     LISTENERS.write().await.push(some);
-                    LISTENERS_STATUS.write().await.insert(name.clone(), Ok(true));
+                    LISTENERS_STATUS
+                        .write()
+                        .await
+                        .insert(name.clone(), Ok(true));
                     info!("starting manager: {name} started OK");
                 }
                 Err(cause) => {
                     error!("starting manager: {name} start failed ({cause})");
-                    LISTENERS_STATUS.write().await.insert(name.clone(), Err(cause));
+                    LISTENERS_STATUS
+                        .write()
+                        .await
+                        .insert(name.clone(), Err(cause));
                 }
             }
             let _ = tx.send(()).await;
-        }).await;
+        })
+        .await;
     }
     for _ in 0..config.listeners.len() {
         rx.recv().await;
     }
     info!("starting manager: succeeded");
     *status = Status::STARTED;
+    *STARTED_AT.write().await = Some(Instant::now());
     //return get_listener_status();
     return Ok(get_listener_status().await);
 }

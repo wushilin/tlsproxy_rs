@@ -1,48 +1,43 @@
 listeners:
-  SSH:
-    bind: 0.0.0.0:443
+  '1443':
+    bind: 0.0.0.0:1443
     target_port: 443
     policy: DENY
     rules:
       static_hosts: []
-      patterns:
-      - ^www.gaaaa.*$
+      patterns: []
     max_idle_time_ms: 3600000
     speed_limit: 0.0
-  '1443':
-    bind: 0.0.0.0:2443
-    target_port: 443
-    policy: DENY
-    rules:
-      static_hosts: []
-      patterns: []
-    max_idle_time_ms: 3600000
-    speed_limit: 10240000.0
-  aaaa:
-    bind: 0.0.0.0:17877
-    target_port: 443
-    policy: DENY
-    rules:
-      static_hosts: []
-      patterns: []
-    max_idle_time_ms: 3600000
-    speed_limit: 0.75
+    mode: terminate
+    upstream_tls: true
 options:
   log_config_file: log4rs.yaml
-  self_ips:
-  - 127.0.0.1
-  - me.jungle
-disable_check_ip: false
+  runtime_dir: ./runtime
 dns:
-  home.wushilin.net: 192.168.44.100
+  exact:
+  - from: home.wushilin.net
+    to: 192.168.44.100
+  - from: aa
+    to: aaaa
+  suffix:
+  - from: .abc.com:443
+    to: 127.0.0.1:443
+  regex:
+  - hostname: aaaa
+    port: 444
+    to: 192.168.44.100
+ca:
+  localca:
+    ca_cert: local_ca/CA.pem
+    ca_key: local_ca/CA.key
+    working_dir: local_ca
 admin_server:
   bind_address: 0.0.0.0
   bind_port: 48888
   username: admin
   password: pass1234
-  tls_cert: null
-  tls_key: null
-  tls_ca_cert: null
-  mutual_tls: null
-  tls: false
-  rocket_log_level: critical
+  tls: true
+  san:
+  - localhost
+  - 127.0.0.1
+  - ::1

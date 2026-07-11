@@ -9,7 +9,7 @@ pub struct HostAndPort {
 }
 
 lazy_static! {
-    static ref SUPPORTED_REGEX_LIST:Arc<Vec<Regex>> = Arc::new(vec![
+    static ref SUPPORTED_REGEX_LIST: Arc<Vec<Regex>> = Arc::new(vec![
         Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*,\s*port\s*=\s*(\d+)\s*$").unwrap(),
         Regex::new(r"(?i)^\s*(\S+)\s*:\s*(\d+)\s*$").unwrap(),
         Regex::new(r"(?i)^\s*(\S+)\s*@\s*(\d+)\s*$").unwrap(),
@@ -18,36 +18,36 @@ lazy_static! {
 }
 
 impl HostAndPort {
-    pub fn new(host:String, port: u16) -> Self {
-        return Self {
-            host,
-            port,
-        }
+    pub fn new(host: String, port: u16) -> Self {
+        return Self { host, port };
     }
 
     // Parse a host port spec. If host is sufficient, return the parsed result
     // If it is failing, return host:default_port
-    pub fn parse_or_default(host:&str, default_port: u16) -> Self {
+    pub fn parse_or_default(host: &str, default_port: u16) -> Self {
         let result = host.parse();
         match result {
             Err(_cause) => {
-                return HostAndPort{
+                return HostAndPort {
                     host: host.into(),
                     port: default_port,
                 }
-            },
+            }
             Ok(inner_result) => {
                 return inner_result;
             }
         }
     }
-    pub fn to_string(&self) -> String {
-        return format!("{}:{}", self.host, self.port)
-    }
 }
 
 pub struct ParseError {
-    cause: String
+    cause: String,
+}
+
+impl Display for HostAndPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
 }
 
 impl Display for ParseError {
@@ -64,30 +64,29 @@ impl FromStr for HostAndPort {
             match next {
                 Some(result) => {
                     return result;
-                },
+                }
                 None => {
                     continue;
                 }
             }
         }
-        return Err(ParseError{cause: format!("unsupported HostAndPort spec `{input}`. Support `host:port`, `host@port`, `host|port`, `host=xxx,port=yyy` formats only")})
+        return Err(ParseError{cause: format!("unsupported HostAndPort spec `{input}`. Support `host:port`, `host@port`, `host|port`, `host=xxx,port=yyy` formats only")});
     }
 }
 
-fn try_match(regex:&Regex, input:&str) -> Option<Result<HostAndPort, ParseError>> {
+fn try_match(regex: &Regex, input: &str) -> Option<Result<HostAndPort, ParseError>> {
     if let Some(caps) = regex.captures(input) {
-        let host:String = caps[1].into();
-        let port_str:String = caps[2].into();
+        let host: String = caps[1].into();
+        let port_str: String = caps[2].into();
         let port_result = port_str.parse();
         match port_result {
             Ok(port) => {
-                return Some(Ok(HostAndPort {
-                    host,
-                    port,
-                }));
-            },
+                return Some(Ok(HostAndPort { host, port }));
+            }
             Err(_cause) => {
-                return Some(Err(ParseError{cause: format!("{port_str} (in {input}) is not valid port")}));
+                return Some(Err(ParseError {
+                    cause: format!("{port_str} (in {input}) is not valid port"),
+                }));
             }
         }
     }

@@ -32,8 +32,11 @@ Supports
 # Building
 
 ```bash
-$ cargo build --release
+$ sh build.sh
 ```
+
+The management console is dependency-free and embedded into the release binary
+at compile time. It does not require Node.js or runtime Internet access.
 
 # Running
 ## Directory structure
@@ -44,13 +47,13 @@ And copy `target/release/tlsproxy` to a separate folder.
 
 In the same folder, you should also copy the following files:
 
-- static/
 - config.yaml
 - log4rs.yaml
 
-If you want to enable TLS, please create your `server.pem`, `server.key` and `ca.pem`.
-
-You may refer to https://github.com/wushilin/minica for cert management.
+When admin TLS or listener TLS termination is enabled, tlsproxy creates or
+reuses a local CA under `runtime_dir`, then signs certificates with that CA.
+Keep the CA key private and install `CA.pem` in clients that should trust the
+generated certificates.
 
 ## Prepare configuration
 
@@ -59,6 +62,8 @@ Example config.yaml
 listeners:
   HTTPS:
     bind: 0.0.0.0:1443  # TLS proxy binds to 0.0.0.0:1443
+    mode: passthrough # passthrough forwards TLS unchanged; terminate decrypts TLS
+    upstream_tls: false # terminate mode only; encrypt upstream without authenticating it
     target_port: 443  # Proxy all requests to port 443
     policy: DENY  # If rules matched, they will be denied (possible values: ALLOW|DENY). basically the rules is blacklist. If it is ALLOW, it would act as a whitelist
     rules:
@@ -69,56 +74,69 @@ listeners:
     speed_limit: 0.0 # Speed limit for each connection. 0 is no limit. unit is bytes/second, shared by upload/download together
 options:
   log_config_file: log4rs.yaml  # log4rs config
-  self_ips:
-  - 127.0.0.1  # If target server resolves to this host it will be rejected
-  - me.jungle # If target server resolves to one of the addresses by this domain, it will be rejected
+  runtime_dir: ./runtime  # runtime artifacts; local CA data lives under this directory
 dns:
-  # DNS override configuration
-  # You can resolve DNS in 3 ways:
-  #
-  # 1. Explicit matching (highest priority):
-  #    github.com:443 -> my.local.host:443
-  #    Matches exact hostname:port combinations
-  #
-  # 2. Suffix matching (medium priority):
-  #    suffix:thub.com:443 -> my.local.host:443
-  #    Matches hostnames ending with the specified suffix
-  #    Longer suffixes have higher priority than shorter ones
-  #
-  # 3. Regex matching (lowest priority):
-  #    regex:.*thub.com:443 -> my.local.host:443
-  #    Matches hostnames using regular expressions
-  #    Tried in order of their definition when explicit and suffix don't match
-  #
-  # Priority order:
-  # 1. Explicit matches are checked first (highest priority)
-  # 2. Then suffix matches (longer suffixes checked before shorter ones)
-  # 3. Finally regex matches are tried in order of definition
-  #
-  # Example:
-  home.wushilin.net: 192.168.44.100 # Explicit match
-  # suffix:thub.com:443 -> my.local.host:443 # Suffix match example
-  # regex:.*thub.com:443 -> my.local.host:443 # Regex match example
-# If you only service requests from trusted network, then you can disable IP check
-# By Default, the service refuses to connect to any local address, unless
-# it is defined in the dns override earlier
-# Also, it refuses connection came from local addresses (e.g. ::1, 127.0.0.1) 
-# to prevent circular connection, that check can be disabled by setting
-# disable_check_ip -> true
-disable_check_ip: false
+  # DNS overrides, applied to the SNI hostname before connecting upstream.
+  # Three rule kinds, each in its own section. Resolution priority (first hit
+  # wins):
+  #   1. exact host:port
+  #   2. exact host (any port)
+  #   3. suffix rules with a port (longest suffix first)
+  #   4. suffix rules without a port (longest suffix first)
+  #   5. regex rules, in definition order
+  # If nothing matches, normal DNS applies. In every rule, a `to` without a
+  # port keeps the port that would have been used.
+  exact:
+  - from: home.wushilin.net        # no port = matches any port
+    to: 192.168.44.100
+  # - from: github.com:443         # host:port = that port only
+  #   to: my.local.host:443
+  suffix:
+  # Matches the domain and all its subdomains at label boundaries:
+  # `.abc.com` matches `x.abc.com` and `abc.com`, but never `notabc.com`.
+  # - from: .internal.abc.com:443
+  #   to: 127.0.0.1:443
+  regex:
+  # Case-insensitive, matched against the HOSTNAME ONLY — the port is never
+  # part of the text the pattern sees. Use `port` to restrict the rule.
+  # - hostname: '^api\d+\.abc\.com$'
+  #   port: 443                     # optional; omit to match any port
+  #   to: 127.0.0.1:443
+# Self-connection loops (the proxy connecting back to itself, directly or
+# through NAT/port-forwarding) are detected automatically: the proxy remembers
+# the TLS ClientHello randoms it forwarded in the last 10 seconds and closes
+# any inbound connection presenting one of them. No configuration is needed.
+# Local CA for every certificate the proxy manages: the admin server
+# certificate and on-demand terminating-listener certificates. When the
+# section is absent, these defaults are used.
+#
+# Paths are always resolved under {runtime_dir}. Ad-hoc SNI certificates are
+# cached in memory only. The admin certificate is cached in memory, loaded from
+# disk on restart, immediately evicted if within 72 hours of expiry, and saved
+# after lazy renewal. All generated leaf certificates are valid for 365 days.
+ca:
+  localca:
+    ca_cert: local_ca/CA.pem
+    ca_key: local_ca/CA.key
+    working_dir: local_ca
 admin_server:
   bind_address: 0.0.0.0  # Admin server bind to this address
-  bind_port: 48889 # Admin server bind to this port
+  bind_port: 48888 # Admin server bind to this port
   username: admin # Admin server requires the basic user
   password: pass1234 # Admin server require the basic password
-  tls_cert: null # TLS cert for admin server, required if tls => true
-  tls_key: null # TLS key for admin server, required if tls => true
-  tls_ca_cert: null # TLS CA cert for admin server, required if tls => true 
-  mutual_tls: null # Enable mtls or not true|false|null. If set to true, tls must also be true!
   tls: false # Enable TLS or not
-  rocket_log_level: critical # Rocket log level
+  san: # Subject alternative names for the admin certificate (DNS names and IPs)
+  - localhost
+  - 127.0.0.1
+  - ::1
 
 ```
+
+Terminating listeners mint a leaf certificate on demand for the exact SNI in
+the client ClientHello, after the listener ACL allows that SNI. These ad-hoc
+certificates are cached in memory and are not written to disk. With
+`upstream_tls: true`, the proxy encrypts the upstream leg but does not
+authenticate the upstream certificate, so it provides no MITM detection.
 
 Sample log4rs.yaml
 ```yaml
@@ -181,7 +199,7 @@ WantedBy=multi-user.target
 
 Just run the tlsproxy. No argument required. All support files must be in the same folder
 
-Visit your server at http://host:48889 to start managing.
+Visit your server at http://host:48888 to start managing.
 
 If prompted for Basic auth, please enter the username and password
 
