@@ -267,6 +267,12 @@ async fn put_dns_config(data: String) -> Result<Response, ISE> {
     let _guard = LOCK.write().await;
     let config_file = config_file().await;
     let dns: crate::config::DnsConfig = convert_error(serde_json::from_str(&data))?;
+    for rule in &dns.regex {
+        convert_error(
+            crate::resolver::compile_dns_pattern(&rule.hostname)
+                .map_err(|cause| format!("invalid DNS regex `{}`: {cause}", rule.hostname)),
+        )?;
+    }
     let mut conf: PFConfig = convert_error(PFConfig::load_file(&config_file).await)?;
     conf.dns = dns;
     write_config_file(&config_file, &conf).await?;
