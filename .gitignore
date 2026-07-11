@@ -14,3 +14,4 @@ admin-server.key
 *.pdb
 .vscode/
 *.log
+runtime/
