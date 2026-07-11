@@ -209,6 +209,8 @@ impl Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Listener {
     pub bind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub target_port: u16,
     pub policy: Policy,
     pub rules: Rules,
@@ -228,6 +230,7 @@ pub enum ListenerMode {
     #[default]
     Passthrough,
     Terminate,
+    Forward,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,9 +316,35 @@ dns: {}
         assert!(config.listeners["web"].upstream_tls);
     }
 
+    #[test]
+    fn forward_listener_accepts_target_list() {
+        let yaml = r#"
+listeners:
+  plain:
+    bind: 127.0.0.1:18080
+    target: target1.host.com:80; target2.host.com:1080
+    target_port: 443
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns: []
+    mode: forward
+options:
+  log_config_file: ""
+dns: {}
+"#;
+        let config = Config::load_string(yaml).expect("forward configuration should parse");
+        assert_eq!(config.listeners["plain"].mode, ListenerMode::Forward);
+        assert_eq!(
+            config.listeners["plain"].target.as_deref(),
+            Some("target1.host.com:80; target2.host.com:1080")
+        );
+    }
+
     fn listener(policy: Policy) -> Listener {
         Listener {
             bind: "127.0.0.1:0".into(),
+            target: None,
             target_port: 443,
             policy,
             rules: Rules {

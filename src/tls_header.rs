@@ -79,7 +79,7 @@ where
 /// Reassembles the handshake payload from the buffered TLS records and returns
 /// the 32-byte ClientHello random (handshake header 4 bytes + legacy version 2
 /// bytes, then the random). The hello may span multiple records.
-fn extract_client_random(buffered: &[u8]) -> Option<[u8; 32]> {
+pub(crate) fn extract_client_random(buffered: &[u8]) -> Option<[u8; 32]> {
     const HANDSHAKE_PREFIX: usize = 4 + 2; // handshake header + legacy version
     const NEEDED: usize = HANDSHAKE_PREFIX + 32;
     let mut handshake = Vec::with_capacity(NEEDED);

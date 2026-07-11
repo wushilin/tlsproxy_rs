@@ -190,6 +190,12 @@ pub async fn resolve(host: &str, port: u16) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{ExactDnsRule, RegexDnsRule, SuffixDnsRule};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    lazy_static! {
+        static ref TEST_LOCK: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    }
 
     fn exact(from: &str, to: &str) -> ExactDnsRule {
         ExactDnsRule {
@@ -215,6 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolution_priority_is_exact_then_suffix_then_regex() {
+        let _guard = TEST_LOCK.lock().await;
         init_inner(&DnsConfig {
             exact: vec![
                 exact("api.internal.example.com:443", "exact-port.example:443"),
@@ -261,6 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn suffix_respects_label_boundaries_and_matches_bare_domain() {
+        let _guard = TEST_LOCK.lock().await;
         init_inner(&DnsConfig {
             exact: vec![],
             suffix: vec![suffix(".abc.com", "hit.example")],
@@ -281,6 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn regex_matches_hostname_without_port_and_honors_port_filter() {
+        let _guard = TEST_LOCK.lock().await;
         init_inner(&DnsConfig {
             exact: vec![],
             suffix: vec![],
@@ -311,6 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_regex_is_skipped_not_fatal() {
+        let _guard = TEST_LOCK.lock().await;
         let count = init_inner(&DnsConfig {
             exact: vec![exact("ok.test", "target.test")],
             suffix: vec![],

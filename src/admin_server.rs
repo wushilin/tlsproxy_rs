@@ -270,6 +270,7 @@ async fn put_dns_config(data: String) -> Result<Response, ISE> {
     let mut conf: PFConfig = convert_error(PFConfig::load_file(&config_file).await)?;
     conf.dns = dns;
     write_config_file(&config_file, &conf).await?;
+    convert_error(crate::forward::reconcile_configured_listeners(&conf.listeners).await)?;
     Ok(json_response(data))
 }
 
@@ -280,6 +281,7 @@ async fn put_listener_config(data: String) -> Result<Response, ISE> {
     let mut conf: PFConfig = convert_error(PFConfig::load_file(&config_file).await)?;
     conf.listeners = map;
     write_config_file(&config_file, &conf).await?;
+    convert_error(crate::forward::reconcile_configured_listeners(&conf.listeners).await)?;
     Ok(json_response(data))
 }
 
@@ -410,6 +412,46 @@ async fn restart_and_apply_config() -> Result<Response, ISE> {
     return Ok(json_response(result));
 }
 
+async fn start_listener(UrlPath(name): UrlPath<String>) -> Result<Response, ISE> {
+    let _guard = LOCK.write().await;
+    let config_file = config_file().await;
+    let conf: PFConfig = convert_error(PFConfig::load_file(&config_file).await)?;
+    let result = convert_error(manager::start_listener(&name, conf).await)?;
+    let result = serialize_listener_operation_result(result)?;
+    Ok(json_response(result))
+}
+
+async fn stop_listener(UrlPath(name): UrlPath<String>) -> Result<Response, ISE> {
+    let _guard = LOCK.write().await;
+    let changed = convert_error(manager::stop_listener(&name).await)?;
+    let result = SimpleOperationResult {
+        success: true,
+        changed,
+        message: None,
+    };
+    Ok(json_response(serde_json::to_string(&result).unwrap()))
+}
+
+async fn restart_listener(UrlPath(name): UrlPath<String>) -> Result<Response, ISE> {
+    let _guard = LOCK.write().await;
+    let config_file = config_file().await;
+    let conf: PFConfig = convert_error(PFConfig::load_file(&config_file).await)?;
+    let result = convert_error(manager::restart_listener(&name, conf).await)?;
+    let result = serialize_listener_operation_result(result)?;
+    Ok(json_response(result))
+}
+
+fn serialize_listener_operation_result(
+    result: HashMap<String, Result<manager::ListenerStatusSerde, anyhow::Error>>,
+) -> Result<String, ISE> {
+    let mut result_converted = HashMap::new();
+    for (key, value) in result {
+        let new_error = value.map_err(ISE::from);
+        result_converted.insert(key, new_error);
+    }
+    convert_error(serde_json::to_string(&result_converted))
+}
+
 async fn reset_original_config() -> Result<Response, ISE> {
     let _guard = LOCK.write().await;
     let config_file = config_file().await;
@@ -522,6 +564,18 @@ fn router() -> Router {
         .route("/apiserver/status/manager", get(get_manager_status))
         .route("/apiserver/stats/listeners", get(get_listener_stats))
         .route("/apiserver/active/listeners", get(get_active_connections))
+        .route(
+            "/apiserver/config/listeners/{name}/start",
+            post(start_listener),
+        )
+        .route(
+            "/apiserver/config/listeners/{name}/stop",
+            post(stop_listener),
+        )
+        .route(
+            "/apiserver/config/listeners/{name}/restart",
+            post(restart_listener),
+        )
         .route("/apiserver/config/stop", post(stop))
         .route("/apiserver/config/start", post(start))
         .route("/apiserver/config/apply", post(restart_and_apply_config))
@@ -580,6 +634,7 @@ mod tests {
             "test".into(),
             Listener {
                 bind: bind.into(),
+                target: None,
                 target_port: 443,
                 policy: crate::config::Policy::DENY,
                 rules: Rules {

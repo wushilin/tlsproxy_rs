@@ -9,6 +9,7 @@ pub mod certificate;
 pub mod config;
 pub mod controller;
 pub mod extensible;
+pub mod forward;
 pub mod hello_cache;
 pub mod hostutil;
 pub mod idle_tracker;
@@ -86,7 +87,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
             for (name, inner_result) in result {
                 match inner_result {
                     Ok(inner_start_result) => {
-                        if inner_start_result {
+                        if inner_start_result.running {
                             info!("started listener {name}");
                         } else {
                             info!("started listener {name} (false)");

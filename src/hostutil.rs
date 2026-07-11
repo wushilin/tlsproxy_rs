@@ -38,6 +38,14 @@ impl HostAndPort {
             }
         }
     }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 pub struct ParseError {

@@ -8,6 +8,7 @@ const state = {
   statuses: {},
   manager: { status: 'STOPPED', uptime_ms: null },
   activeConnections: [],
+  activeConnectionsTimer: null,
   updatedAt: null,
   dirty: false,
 };
@@ -39,14 +40,19 @@ document.querySelector('#reload-button').addEventListener('click', async () => {
   loadAll();
 });
 saveButton.addEventListener('click', saveAll);
+document.addEventListener('click', event => {
+  if (!event.target.closest?.('[data-action-menu], .floating-action-menu')) closeActionMenus();
+});
+window.addEventListener('resize', closeActionMenus);
+window.addEventListener('scroll', closeActionMenus, true);
 window.addEventListener('beforeunload', event => {
   if (state.dirty) event.preventDefault();
 });
 
 loadAll();
 setInterval(() => {
-  if (state.view === 'dashboard') refreshStats();
-}, 5000);
+  if (['dashboard', 'listeners'].includes(state.view)) refreshStats();
+}, 3000);
 
 /* ---------- Theme ---------- */
 
@@ -122,9 +128,12 @@ async function refreshStats() {
     state.manager = manager || state.manager;
     state.updatedAt = new Date();
     updateManagerStatus();
-    if (state.view !== 'dashboard') return;
-    if (failureShapeChanged) render();
-    else refreshDashboardInPlace();
+    if (state.view === 'dashboard') {
+      if (failureShapeChanged) render();
+      else refreshDashboardInPlace();
+    } else if (state.view === 'listeners') {
+      render();
+    }
   } catch (_) {
     managerStatus.textContent = 'Unreachable';
     managerStatus.className = 'status-pill danger';
@@ -135,12 +144,23 @@ function failureSignature(statuses = {}) {
   return Object.entries(statuses).map(([name, s]) => `${name}:${s?.Err ? 1 : 0}`).sort().join('|');
 }
 
+function statusOk(status) {
+  if (status?.Ok && typeof status.Ok === 'object') return status.Ok;
+  if (status?.Ok === true) return { running: true, backends: [] };
+  return null;
+}
+
+function listenerBackends(name) {
+  return statusOk(state.statuses[name])?.backends || [];
+}
+
 function normalizeListeners(listeners = {}) {
   return Object.fromEntries(Object.entries(listeners).map(([name, listener]) => [
     name,
     cleanListener({
       mode: listener.mode || 'passthrough',
       bind: listener.bind || '',
+      target: listener.target || '',
       target_port: Number(listener.target_port || 443),
       policy: listener.policy || 'DENY',
       max_idle_time_ms: listener.max_idle_time_ms ?? 3600000,
@@ -189,14 +209,18 @@ function markDirty() { setDirty(true); }
 function updateManagerStatus() {
   const statuses = Object.values(state.statuses);
   const failed = statuses.filter(status => status?.Err).length;
+  const running = statuses.filter(status => statusOk(status)?.running).length;
   if (!statuses.length) {
     managerStatus.textContent = 'Stopped';
     managerStatus.className = 'status-pill neutral';
   } else if (failed) {
     managerStatus.textContent = `${failed} listener${failed > 1 ? 's' : ''} failed`;
     managerStatus.className = 'status-pill warning';
+  } else if (!running) {
+    managerStatus.textContent = 'Stopped';
+    managerStatus.className = 'status-pill neutral';
   } else {
-    managerStatus.textContent = 'Running';
+    managerStatus.textContent = `${running} running`;
     managerStatus.className = 'status-pill success';
   }
 }
@@ -218,7 +242,7 @@ function renderDashboard() {
     const listener = state.listeners[name];
     const item = state.stats[name] || { total: 0, active: 0, uploaded_bytes: 0, downloaded_bytes: 0 };
     const error = state.statuses[name]?.Err;
-    const running = Object.keys(state.statuses).length > 0;
+    const running = Boolean(statusOk(state.statuses[name])?.running);
     const pill = error
       ? '<span class="status-pill danger">Failed</span>'
       : running
@@ -290,27 +314,42 @@ function renderListeners() {
   const names = Object.keys(state.listeners).sort((a, b) => a.localeCompare(b));
   const rows = names.map(name => {
     const listener = state.listeners[name];
-    const error = state.statuses[name]?.Err;
-    const upstream = listener.mode === 'terminate'
+    const status = state.statuses[name];
+    const error = status?.Err;
+    const running = Boolean(statusOk(status)?.running);
+    const statusPill = error
+      ? '<span class="status-pill danger">Failed</span>'
+      : running
+      ? '<span class="status-pill success">Online</span>'
+      : '<span class="status-pill neutral">Stopped</span>';
+    const upstream = listener.mode === 'forward'
+      ? renderForwardUpstream(listener, listenerBackends(name))
+      : listener.mode === 'terminate'
       ? (listener.upstream_tls ? '<span class="badge accent">TLS</span>' : '<span class="badge">Plaintext</span>')
       : '<span class="muted">Same TLS stream</span>';
+    const targetCount = splitTargets(listener.target).length;
+    const target = listener.mode === 'forward'
+      ? `<span class="muted">${fmt(targetCount)} backend${targetCount === 1 ? '' : 's'}</span>`
+      : `<span class="num">${Number(listener.target_port) || ''}</span>`;
+    const policy = listener.mode === 'forward' ? '<span class="muted">n/a</span>' : escapeHtml(listener.policy);
+    const hosts = listener.mode === 'forward' ? '<span class="muted">-</span>' : fmt((listener.rules.static_hosts || []).length);
+    const regex = listener.mode === 'forward' ? '<span class="muted">-</span>' : fmt((listener.rules.patterns || []).length);
     return `
       <tr>
         <td><strong>${escapeHtml(name)}</strong>${error ? '<div class="error-note">Failed</div>' : ''}</td>
+        <td>${statusPill}</td>
         <td><code>${escapeHtml(listener.bind)}</code></td>
-        <td class="num">${Number(listener.target_port) || ''}</td>
+        <td>${target}</td>
         <td><span class="badge accent">${escapeHtml(modeLabel(listener.mode))}</span></td>
         <td>${upstream}</td>
-        <td>${escapeHtml(listener.policy)}</td>
-        <td class="num">${(listener.rules.static_hosts || []).length}</td>
-        <td class="num">${(listener.rules.patterns || []).length}</td>
+        <td>${policy}</td>
+        <td class="num">${hosts}</td>
+        <td class="num">${regex}</td>
         <td class="row-actions">
-          <button class="button small" data-active-listener="${escapeAttr(name)}">Connections</button>
-          <button class="button small" data-edit-listener="${escapeAttr(name)}">Edit</button>
-          <button class="button small outline-danger" data-delete-listener="${escapeAttr(name)}">Remove</button>
+          <button class="button small" data-action-menu="${escapeAttr(name)}">Actions</button>
         </td>
       </tr>
-      ${error ? `<tr><td colspan="9" class="error-note">↳ ${escapeHtml(error.message || String(error))}</td></tr>` : ''}`;
+      ${error ? `<tr><td colspan="10" class="error-note">↳ ${escapeHtml(error.message || String(error))}</td></tr>` : ''}`;
   }).join('');
   return `
     <section class="panel">
@@ -319,13 +358,14 @@ function renderListeners() {
           <h2>Listeners</h2>
           <p>Inbound endpoints and their routing mode.</p>
         </div>
+        <span class="badge" id="listener-updated-at">Updated ${state.updatedAt ? state.updatedAt.toLocaleTimeString() : 'just now'}</span>
         <button class="button primary" data-add-listener>Add listener</button>
       </div>
       <div class="table-wrap">
         ${rows ? `
-          <table>
+          <table class="listener-table">
             <thead><tr>
-              <th>Name</th><th>Bind</th><th class="num">Target port</th><th>Mode</th>
+              <th>Name</th><th>Status</th><th>Bind</th><th>Target</th><th>Mode</th>
               <th>Upstream</th><th>Policy</th><th class="num">Hosts</th><th class="num">Regex</th><th></th>
             </tr></thead>
             <tbody>${rows}</tbody>
@@ -333,7 +373,24 @@ function renderListeners() {
           <div class="empty"><strong>No listeners configured</strong>Add a listener to start proxying traffic.</div>`}
       </div>
     </section>
-    <div class="note info">Terminate mode mints a local-CA certificate for the requested SNI after ACL allow. Upstream TLS encrypts the proxy-to-upstream leg but does not authenticate the upstream certificate.</div>`;
+    <div class="note info">Forward mode accepts plaintext clients and randomly selects an online backend. Upstream TLS encrypts the proxy-to-upstream leg without authenticating the upstream certificate.</div>`;
+}
+
+function renderForwardUpstream(listener, backends) {
+  const transport = listener.upstream_tls ? '<span class="badge accent">TLS</span>' : '<span class="badge">Plaintext</span>';
+  return `<div class="forward-upstream">${transport}${renderBackendBadges(backends, listener.target)}</div>`;
+}
+
+function renderBackendBadges(backends, configuredTargets = '') {
+  const items = backends.length
+    ? backends
+    : splitTargets(configuredTargets).map(name => ({ name, online: false, since_ms: null }));
+  if (!items.length) return '<span class="muted">No targets</span>';
+  return `<div class="backend-list">${items.map(backend => `
+    <span class="backend-chip ${backend.online ? 'online' : 'offline'}" title="${escapeAttr(backend.online ? 'Online' : 'Offline')} since ${escapeAttr(formatSince(backend.since_ms))}">
+      <span>${escapeHtml(backend.name)}</span>
+      <small>${backend.online ? 'online' : 'offline'} &middot; ${escapeHtml(formatSince(backend.since_ms))}</small>
+    </span>`).join('')}</div>`;
 }
 
 function renderDns() {
@@ -393,13 +450,36 @@ function bindView() {
   });
   content.querySelector('[data-add-listener]')?.addEventListener('click', () => openListenerDialog());
   content.querySelectorAll('[data-active-listener]').forEach(button => {
-    button.addEventListener('click', () => openActiveConnectionsDialog(button.dataset.activeListener));
+    button.addEventListener('click', () => {
+      closeActionMenus();
+      openActiveConnectionsDialog(button.dataset.activeListener);
+    });
+  });
+  content.querySelectorAll('[data-action-menu]').forEach(button => {
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      openActionMenu(button, button.dataset.actionMenu);
+    });
+  });
+  content.querySelectorAll('[data-listener-operation]').forEach(button => {
+    button.addEventListener('click', () => {
+      closeActionMenus();
+      const index = button.dataset.listenerOperation.lastIndexOf(':');
+      listenerOperation(
+        button.dataset.listenerOperation.slice(0, index),
+        button.dataset.listenerOperation.slice(index + 1),
+      );
+    });
   });
   content.querySelectorAll('[data-edit-listener]').forEach(button => {
-    button.addEventListener('click', () => openListenerDialog(button.dataset.editListener));
+    button.addEventListener('click', () => {
+      closeActionMenus();
+      openListenerDialog(button.dataset.editListener);
+    });
   });
   content.querySelectorAll('[data-delete-listener]').forEach(button => {
     button.addEventListener('click', async () => {
+      closeActionMenus();
       const name = button.dataset.deleteListener;
       if (!await confirmAction(`Remove listener “${name}”?`,
         'The listener is removed from the pending configuration. It keeps running until you save and apply.')) return;
@@ -429,6 +509,65 @@ function bindView() {
   bindDnsDialog();
 }
 
+function closeActionMenus() {
+  document.querySelectorAll('.floating-action-menu').forEach(menu => menu.remove());
+}
+
+function openActionMenu(anchor, name) {
+  const existing = document.querySelector('.floating-action-menu');
+  if (existing?.dataset.listener === name) {
+    existing.remove();
+    return;
+  }
+  closeActionMenus();
+  const menu = document.createElement('div');
+  menu.className = 'floating-action-menu';
+  menu.dataset.listener = name;
+  menu.innerHTML = `
+    <button type="button" class="icon-action" title="Start" aria-label="Start listener" data-listener-operation="${escapeAttr(name)}:start">&#9654;</button>
+    <button type="button" class="icon-action" title="Stop" aria-label="Stop listener" data-listener-operation="${escapeAttr(name)}:stop">&#9632;</button>
+    <button type="button" class="icon-action" title="Restart" aria-label="Restart listener" data-listener-operation="${escapeAttr(name)}:restart">&#8635;</button>
+    <button type="button" data-edit-listener="${escapeAttr(name)}">Edit</button>
+    <button type="button" data-active-listener="${escapeAttr(name)}">Connections</button>
+    <button type="button" class="danger-text" data-delete-listener="${escapeAttr(name)}">Remove</button>`;
+  document.body.appendChild(menu);
+  bindFloatingActionMenu(menu);
+  const rect = anchor.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  const left = Math.max(8, Math.min(window.innerWidth - menuRect.width - 8, rect.right - menuRect.width));
+  const top = Math.max(8, Math.min(window.innerHeight - menuRect.height - 8, rect.bottom + 6));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+function bindFloatingActionMenu(menu) {
+  menu.querySelector('[data-active-listener]')?.addEventListener('click', event => {
+    closeActionMenus();
+    openActiveConnectionsDialog(event.currentTarget.dataset.activeListener);
+  });
+  menu.querySelector('[data-edit-listener]')?.addEventListener('click', event => {
+    closeActionMenus();
+    openListenerDialog(event.currentTarget.dataset.editListener);
+  });
+  menu.querySelector('[data-delete-listener]')?.addEventListener('click', async event => {
+    closeActionMenus();
+    const name = event.currentTarget.dataset.deleteListener;
+    if (!await confirmAction(`Remove listener “${name}”?`,
+      'The listener is removed from the pending configuration. It keeps running until you save and apply.')) return;
+    delete state.listeners[name];
+    markDirty();
+    render();
+  });
+  menu.querySelectorAll('[data-listener-operation]').forEach(button => {
+    button.addEventListener('click', event => {
+      closeActionMenus();
+      const value = event.currentTarget.dataset.listenerOperation;
+      const index = value.lastIndexOf(':');
+      listenerOperation(value.slice(0, index), value.slice(index + 1));
+    });
+  });
+}
+
 function bindListenerDialog() {
   const dialog = document.querySelector('#listener-dialog');
   const form = document.querySelector('#listener-form');
@@ -448,6 +587,7 @@ function openListenerDialog(name = null) {
   document.querySelector('#listener-original-name').value = name || '';
   document.querySelector('#listener-name').value = name || '';
   document.querySelector('#listener-bind').value = source.bind || '';
+  document.querySelector('#listener-target').value = source.target || '';
   document.querySelector('#listener-target-port').value = Number(source.target_port || 443);
   document.querySelector('#listener-mode').value = source.mode || 'passthrough';
   document.querySelector('#listener-upstream-tls').checked = Boolean(source.upstream_tls);
@@ -464,7 +604,13 @@ function openListenerDialog(name = null) {
 function syncListenerDialogMode() {
   const mode = document.querySelector('#listener-mode')?.value || 'passthrough';
   const section = document.querySelector('#listener-upstream-section');
-  if (section) section.hidden = mode !== 'terminate';
+  const targetSection = document.querySelector('#listener-target-section');
+  const targetPort = document.querySelector('#listener-target-port');
+  const aclSection = document.querySelector('#listener-acl-section');
+  if (section) section.hidden = !['terminate', 'forward'].includes(mode);
+  if (targetSection) targetSection.hidden = mode !== 'forward';
+  if (targetPort) targetPort.required = mode !== 'forward';
+  if (aclSection) aclSection.hidden = mode === 'forward';
 }
 
 function saveListenerDialog() {
@@ -476,6 +622,7 @@ function saveListenerDialog() {
   }
   const listener = cleanListener({
     bind: document.querySelector('#listener-bind').value.trim(),
+    target: document.querySelector('#listener-target').value.trim(),
     target_port: Number(document.querySelector('#listener-target-port').value),
     mode: document.querySelector('#listener-mode').value,
     upstream_tls: document.querySelector('#listener-upstream-tls').checked,
@@ -558,6 +705,15 @@ async function openActiveConnectionsDialog(listenerName) {
   document.querySelector('#active-dialog-title').textContent = `Active connections: ${listenerName}`;
   document.querySelector('#active-dialog-body').innerHTML = '<div class="empty"><strong>Loading connections</strong></div>';
   dialog.showModal();
+  clearActiveConnectionsTimer();
+  dialog.onclose = clearActiveConnectionsTimer;
+  await refreshActiveConnectionsDialog(listenerName);
+  state.activeConnectionsTimer = setInterval(() => {
+    if (dialog.open) refreshActiveConnectionsDialog(listenerName);
+  }, 3000);
+}
+
+async function refreshActiveConnectionsDialog(listenerName) {
   try {
     const active = await request('/active/listeners');
     state.activeConnections = Array.isArray(active) ? active : [];
@@ -581,6 +737,13 @@ async function openActiveConnectionsDialog(listenerName) {
       </div>` : '<div class="empty"><strong>No active connections</strong>This listener has no open proxy connections right now.</div>';
   } catch (error) {
     document.querySelector('#active-dialog-body').innerHTML = `<div class="empty"><strong>Unable to load connections</strong>${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function clearActiveConnectionsTimer() {
+  if (state.activeConnectionsTimer) {
+    clearInterval(state.activeConnectionsTimer);
+    state.activeConnectionsTimer = null;
   }
 }
 
@@ -628,6 +791,46 @@ async function serviceOperation(operation) {
   }
 }
 
+async function listenerOperation(name, operation) {
+  const messages = {
+    start: [`Start listener “${name}”?`, 'Pending configuration is saved first, then only this listener starts.'],
+    stop: [`Stop listener “${name}”?`, 'Active connections for this listener will close. Other listeners keep running.'],
+    restart: [`Restart listener “${name}”?`, 'Pending configuration is saved first, then only this listener restarts.'],
+  };
+  if (messages[operation] && !await confirmAction(...messages[operation])) return;
+  const shouldPersist = ['start', 'restart'].includes(operation);
+  const validationError = shouldPersist ? validateConfiguration() : null;
+  if (validationError) return notify(validationError, true);
+  busy(true);
+  try {
+    if (shouldPersist) {
+      await persistConfiguration();
+      setDirty(false);
+    }
+    if (operation === 'restart') {
+      await request(`/config/listeners/${encodeURIComponent(name)}/stop`, { method: 'POST', body: '' });
+      await sleepMs(500);
+      await request(`/config/listeners/${encodeURIComponent(name)}/start`, { method: 'POST', body: '' });
+    } else {
+      await request(`/config/listeners/${encodeURIComponent(name)}/${operation}`, { method: 'POST', body: '' });
+    }
+    notify({
+      start: `Listener ${name} started.`,
+      stop: `Listener ${name} stopped.`,
+      restart: `Listener ${name} restarted.`,
+    }[operation] || `Listener ${name} updated.`);
+    await loadAll();
+  } catch (error) {
+    notify(`Listener ${operation} failed: ${error.message}`, true);
+  } finally {
+    busy(false);
+  }
+}
+
+function sleepMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function persistConfiguration() {
   await request('/config/listeners', { method: 'PUT', body: JSON.stringify(state.listeners) });
   await request('/config/dns', { method: 'PUT', body: JSON.stringify(state.dns) });
@@ -657,13 +860,21 @@ function validateConfiguration() {
 
 function validateListener(name, listener) {
   if (!listener.bind?.trim()) return `Listener ${name} requires a bind address.`;
-  if (!Number.isInteger(listener.target_port) || listener.target_port < 1 || listener.target_port > 65535) {
+  if (listener.mode !== 'forward' && (!Number.isInteger(listener.target_port) || listener.target_port < 1 || listener.target_port > 65535)) {
     return `Listener ${name} requires a target port from 1 to 65535.`;
   }
-  if (!['passthrough', 'terminate'].includes(listener.mode)) return `Listener ${name} has an invalid mode.`;
-  if (!['ALLOW', 'DENY'].includes(listener.policy)) return `Listener ${name} has an invalid policy.`;
-  for (const pattern of listener.rules?.patterns || []) {
-    try { new RegExp(pattern); } catch (_) { return `Listener ${name} has an invalid regex: ${pattern}`; }
+  if (!['passthrough', 'terminate', 'forward'].includes(listener.mode)) return `Listener ${name} has an invalid mode.`;
+  if (listener.mode === 'forward' && !splitTargets(listener.target).length) return `Listener ${name} requires at least one forward target.`;
+  for (const target of splitTargets(listener.target)) {
+    if (!/^[^\s:]+:\d+$/.test(target)) return `Listener ${name} has an invalid forward target: ${target}`;
+    const port = Number(target.slice(target.lastIndexOf(':') + 1));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return `Listener ${name} has an invalid forward target port: ${target}`;
+  }
+  if (listener.mode !== 'forward') {
+    if (!['ALLOW', 'DENY'].includes(listener.policy)) return `Listener ${name} has an invalid policy.`;
+    for (const pattern of listener.rules?.patterns || []) {
+      try { new RegExp(pattern); } catch (_) { return `Listener ${name} has an invalid regex: ${pattern}`; }
+    }
   }
   return null;
 }
@@ -671,6 +882,7 @@ function validateListener(name, listener) {
 function defaultListener() {
   return cleanListener({
     bind: '0.0.0.0:1443',
+    target: '',
     target_port: 443,
     policy: 'DENY',
     rules: { static_hosts: [], patterns: [] },
@@ -685,21 +897,34 @@ function cleanListener(listener) {
   const mode = listener.mode || 'passthrough';
   return {
     bind: listener.bind || '',
+    target: listener.target || '',
     target_port: Number(listener.target_port || 443),
     policy: listener.policy || 'DENY',
     rules: {
-      static_hosts: listener.rules?.static_hosts || [],
-      patterns: listener.rules?.patterns || [],
+      static_hosts: mode === 'forward' ? [] : (listener.rules?.static_hosts || []),
+      patterns: mode === 'forward' ? [] : (listener.rules?.patterns || []),
     },
     max_idle_time_ms: listener.max_idle_time_ms ?? 3600000,
     speed_limit: listener.speed_limit ?? 0,
     mode,
-    upstream_tls: mode === 'terminate' && Boolean(listener.upstream_tls),
+    upstream_tls: ['terminate', 'forward'].includes(mode) && Boolean(listener.upstream_tls),
   };
 }
 
 function modeLabel(mode) {
-  return mode === 'terminate' ? 'TLS termination' : 'TLS passthrough';
+  if (mode === 'terminate') return 'TLS termination';
+  if (mode === 'forward') return 'Port forward';
+  return 'TLS passthrough';
+}
+
+function splitTargets(targets = '') {
+  return targets.split(/[;,]/).map(item => item.trim()).filter(Boolean);
+}
+
+function formatSince(ms) {
+  if (!ms) return 'not checked';
+  const elapsed = Math.max(0, Date.now() - Number(ms));
+  return `${formatDuration(elapsed)} ago`;
 }
 
 /* ---------- UI primitives ---------- */
