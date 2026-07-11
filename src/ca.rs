@@ -8,6 +8,7 @@ use anyhow::{bail, Result};
 use log::{info, warn};
 use lru::LruCache;
 use rcgen::{Issuer, KeyPair};
+use rustls::pki_types::CertificateDer;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use time::OffsetDateTime;
@@ -32,6 +33,9 @@ struct LocalCaInner {
     ca_key: PathBuf,
     working_dir: PathBuf,
     issuer: Mutex<Issuer<'static, KeyPair>>,
+    /// CA certificate(s) appended to every served chain so clients see the
+    /// full chain instead of a bare leaf.
+    ca_chain: Vec<CertificateDer<'static>>,
     cache: Mutex<LruCache<String, CachedIdentity>>,
 }
 
@@ -57,6 +61,7 @@ impl LocalCa {
         let ca_cert = runtime_dir.join(force_relative(&config.ca_cert));
         let ca_key = runtime_dir.join(force_relative(&config.ca_key));
         let issuer = certificate::load_or_create_ca(&ca_cert, &ca_key)?;
+        let ca_chain = certificate::read_certificates(&ca_cert)?;
         info!(
             "initialized local CA manager: ca_cert=`{}`, ca_key=`{}`, working_dir=`{}`, cache_capacity={CACHE_CAPACITY}",
             ca_cert.display(),
@@ -69,6 +74,7 @@ impl LocalCa {
                 ca_key,
                 working_dir,
                 issuer: Mutex::new(issuer),
+                ca_chain,
                 cache: Mutex::new(LruCache::new(
                     NonZeroUsize::new(CACHE_CAPACITY).expect("cache capacity is non-zero"),
                 )),
@@ -180,7 +186,13 @@ impl LocalCa {
         );
         let minted = {
             let issuer = self.inner.issuer.lock().expect("CA issuer lock poisoned");
-            certificate::mint_leaf(&issuer, san, "TLS Proxy Local Leaf", LEAF_VALIDITY_DAYS)?
+            certificate::mint_leaf(
+                &issuer,
+                &self.inner.ca_chain,
+                san,
+                "TLS Proxy Local Leaf",
+                LEAF_VALIDITY_DAYS,
+            )?
         };
         if persist_admin {
             let paths = self.admin_paths();
@@ -243,7 +255,8 @@ impl LocalCa {
             return Ok(None);
         }
         let expires_at = certificate::certificate_file_expires_at(&paths.cert)?;
-        let certified_key = certificate::load_certified_key(&paths.cert, &paths.key)?;
+        let mut certified_key = certificate::load_certified_key(&paths.cert, &paths.key)?;
+        certificate::extend_chain(&mut certified_key, &self.inner.ca_chain);
         let key = Arc::new(certified_key);
         let mut cache = self.inner.cache.lock().expect("CA cache lock poisoned");
         cache.put(
@@ -400,6 +413,33 @@ mod tests {
             .path()
             .join("local_ca/example.test-cert.pem")
             .exists());
+    }
+
+    #[test]
+    fn minted_chain_includes_ca_certificate() {
+        let runtime = tempdir().unwrap();
+        let ca =
+            LocalCa::from_config(&config(runtime.path().to_string_lossy().into_owned())).unwrap();
+        let key = ca.resolve_or_mint("example.test").unwrap();
+        let ca_der = certificate::read_certificates(ca.ca_cert_path()).unwrap();
+        assert_eq!(key.cert.len(), 1 + ca_der.len());
+        assert_eq!(&key.cert[1..], ca_der.as_slice());
+    }
+
+    #[test]
+    fn admin_chain_includes_ca_even_when_loaded_from_disk() {
+        let runtime = tempdir().unwrap();
+        let config = config(runtime.path().to_string_lossy().into_owned());
+        let ca = LocalCa::from_config(&config).unwrap();
+        let minted = ca.resolve_admin(&["localhost".into()]).unwrap();
+        assert_eq!(minted.cert.len(), 2);
+
+        // A fresh instance loads the persisted leaf-only PEM from disk and
+        // must still serve the full chain.
+        let ca = LocalCa::from_config(&config).unwrap();
+        let loaded = ca.resolve_admin(&["localhost".into()]).unwrap();
+        assert_eq!(loaded.cert.len(), 2);
+        assert_eq!(minted.cert[1], loaded.cert[1]);
     }
 
     #[test]

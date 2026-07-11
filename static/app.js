@@ -373,7 +373,7 @@ function renderListeners() {
           <div class="empty"><strong>No listeners configured</strong>Add a listener to start proxying traffic.</div>`}
       </div>
     </section>
-    <div class="note info">Forward mode accepts plaintext clients and randomly selects an online backend. Upstream TLS encrypts the proxy-to-upstream leg without authenticating the upstream certificate.</div>`;
+    <div class="note info">Forward mode accepts plaintext clients and randomly selects an online backend; targets that have not been health-checked yet still count as eligible. Upstream TLS encrypts the proxy-to-upstream leg without authenticating the upstream certificate.</div>`;
 }
 
 function renderForwardUpstream(listener, backends) {
@@ -384,13 +384,17 @@ function renderForwardUpstream(listener, backends) {
 function renderBackendBadges(backends, configuredTargets = '') {
   const items = backends.length
     ? backends
-    : splitTargets(configuredTargets).map(name => ({ name, online: false, since_ms: null }));
+    : splitTargets(configuredTargets).map(name => ({ name, online: null, since_ms: null }));
   if (!items.length) return '<span class="muted">No targets</span>';
-  return `<div class="backend-list">${items.map(backend => `
-    <span class="backend-chip ${backend.online ? 'online' : 'offline'}" title="${escapeAttr(backend.online ? 'Online' : 'Offline')} since ${escapeAttr(formatSince(backend.since_ms))}">
+  return `<div class="backend-list">${items.map(backend => {
+    const state = backend.online === true ? 'online' : backend.online === false ? 'offline' : 'unknown';
+    const label = state === 'unknown' ? 'not checked yet' : state;
+    return `
+    <span class="backend-chip ${state}" title="${escapeAttr(state === 'unknown' ? 'Not checked yet; still eligible for selection' : `${state[0].toUpperCase()}${state.slice(1)} since ${formatSince(backend.since_ms)}`)}">
       <span>${escapeHtml(backend.name)}</span>
-      <small>${backend.online ? 'online' : 'offline'} &middot; ${escapeHtml(formatSince(backend.since_ms))}</small>
-    </span>`).join('')}</div>`;
+      <small>${label}${state === 'unknown' ? '' : ` &middot; ${escapeHtml(formatSince(backend.since_ms))}`}</small>
+    </span>`;
+  }).join('')}</div>`;
 }
 
 function renderDns() {

@@ -29,7 +29,8 @@ lazy_static! {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendStatusSerde {
     pub name: String,
-    pub online: bool,
+    /// Some(true) = up, Some(false) = down, None = not probed yet.
+    pub online: Option<bool>,
     pub since_ms: u128,
 }
 
@@ -198,12 +199,20 @@ impl MonitorGroup {
 
     async fn status(&self) -> BackendStatusSerde {
         let endpoints = self.endpoints.read().await;
-        let online = endpoints
-            .iter()
-            .any(|endpoint| endpoint.online == Some(true));
+        // Up if any endpoint is up; unknown while unprobed endpoints could
+        // still turn out up; down only when every endpoint is confirmed down
+        // (or DNS resolution produced no endpoints at all).
+        let online = if endpoints.iter().any(|endpoint| endpoint.online == Some(true)) {
+            Some(true)
+        } else if endpoints.iter().any(|endpoint| endpoint.online.is_none()) {
+            None
+        } else {
+            Some(false)
+        };
         let since_ms = endpoints
             .iter()
-            .filter_map(|endpoint| endpoint.online.map(|_| endpoint.since_ms))
+            .filter(|endpoint| endpoint.online == online)
+            .map(|endpoint| endpoint.since_ms)
             .min()
             .unwrap_or_else(now_ms);
         BackendStatusSerde {

@@ -238,6 +238,7 @@ tbody tr:hover td { background: color-mix(in srgb, var(--surface-2) 55%, transpa
 .backend-chip small { color: var(--muted); white-space: nowrap; }
 .backend-chip.online { color: var(--success); background: var(--success-soft); }
 .backend-chip.offline { color: var(--danger); background: var(--danger-soft); }
+.backend-chip.unknown { color: var(--muted); }
 
 /* ---------- Forms ---------- */
 

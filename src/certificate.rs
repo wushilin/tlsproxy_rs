@@ -58,8 +58,10 @@ pub fn prepare_local_identity(
             "local identity `{}` is missing, stale, or SAN-mismatched; generating new certificate",
             paths.cert.display()
         );
+        let ca_chain = read_certificates(&paths.ca_cert)?;
         generate_leaf(
             &issuer,
+            &ca_chain,
             &paths.cert,
             &paths.key,
             sans,
@@ -304,8 +306,19 @@ fn ip_bytes(ip: &IpAddr) -> Vec<u8> {
     }
 }
 
+/// Appends CA certificates to a served chain, skipping any already present,
+/// so clients receive the full chain rather than a bare leaf.
+pub fn extend_chain(key: &mut CertifiedKey, ca_chain: &[CertificateDer<'static>]) {
+    for ca in ca_chain {
+        if !key.cert.contains(ca) {
+            key.cert.push(ca.clone());
+        }
+    }
+}
+
 pub fn mint_leaf(
     issuer: &Issuer<'_, KeyPair>,
+    ca_chain: &[CertificateDer<'static>],
     san: &[String],
     common_name: &str,
     validity_days: u32,
@@ -332,7 +345,8 @@ pub fn mint_leaf(
     let key_der = PrivateKeyDer::try_from(key.serialize_der())
         .map_err(|_| anyhow!("generated private key is not a supported DER key"))?;
     let expires_at = certificate_expires_at(cert_der.as_ref())?;
-    let certified_key = certified_key_from_parts(vec![cert_der], key_der)?;
+    let mut certified_key = certified_key_from_parts(vec![cert_der], key_der)?;
+    extend_chain(&mut certified_key, ca_chain);
     info!(
         "minted new leaf certificate for SANs [{}] (valid until {})",
         san.join(", "),
@@ -348,6 +362,7 @@ pub fn mint_leaf(
 
 fn generate_leaf(
     issuer: &Issuer<'_, KeyPair>,
+    ca_chain: &[CertificateDer<'static>],
     cert_path: &Path,
     key_path: &Path,
     sans: Vec<SanType>,
@@ -361,7 +376,13 @@ fn generate_leaf(
             _ => Err(anyhow!("unsupported SAN type")),
         })
         .collect();
-    let minted = mint_leaf(issuer, &san_strings?, "TLS Proxy Server", validity_days)?;
+    let minted = mint_leaf(
+        issuer,
+        ca_chain,
+        &san_strings?,
+        "TLS Proxy Server",
+        validity_days,
+    )?;
     atomic_write(cert_path, minted.cert_pem.as_bytes(), false)?;
     atomic_write(key_path, minted.key_pem.as_bytes(), true)?;
     info!(
