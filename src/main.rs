@@ -58,8 +58,22 @@ struct ConfigPath {
     config: PathBuf,
 }
 
+/// Logs go to stdout so the supervising process manager can capture them.
+/// `RUST_LOG` overrides the default `info` filter.
+fn init_logging() {
+    use std::io::IsTerminal;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_logging();
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Run(ConfigPath {
         config: PathBuf::from(DEFAULT_CONFIG_FILE),
@@ -76,7 +90,6 @@ async fn run(config_path: PathBuf) -> Result<()> {
         .install_default()
         .ok();
     let config = load_config(&config_path).await?;
-    config.init_logging();
     admin_server::init(&config_path, &config)
         .await
         .map_err(|cause| anyhow::anyhow!("{cause}"))?;

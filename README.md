@@ -60,7 +60,6 @@ And copy `target/x86_64-unknown-linux-musl/release/tlsproxy` to a separate folde
 In the same folder, you should also copy the following files:
 
 - config.yaml
-- log4rs.yaml
 
 When admin TLS or listener TLS termination is enabled, tlsproxy creates or
 reuses a local CA under `runtime_dir`, then signs certificates with that CA.
@@ -85,7 +84,6 @@ listeners:
     max_idle_time_ms: 3600000
     speed_limit: 0.0 # Speed limit for each connection. 0 is no limit. unit is bytes/second, shared by upload/download together
 options:
-  log_config_file: log4rs.yaml  # log4rs config
   runtime_dir: ./runtime  # runtime artifacts; local CA data lives under this directory
 dns:
   # DNS overrides, applied to the SNI hostname before connecting upstream.
@@ -150,43 +148,9 @@ certificates are cached in memory and are not written to disk. With
 `upstream_tls: true`, the proxy encrypts the upstream leg but does not
 authenticate the upstream certificate, so it provides no MITM detection.
 
-Sample log4rs.yaml
-```yaml
-refresh_rate: 60 seconds
-
-appenders:
-  stdout:
-    kind: console
-  default:
-    kind: rolling_file
-    path: "tlsproxy.log"
-    append: true
-    encoder:
-      pattern: "{d(%Y-%m-%d %H:%M:%S%.3f %Z)} {M} {({l}):5.5} {f}:{L} - {m}{n}"
-    policy:
-      kind: compound
-      trigger:
-        kind: size
-        limit: 10 mb
-      roller:
-        kind: fixed_window
-        pattern: "tlsproxy.{}.log.gz"
-        count: 20
-        base: 1
-root:
-  level: info
-  appenders:
-    - default
-    - stdout
-
-loggers:
-  tlsproxy:
-    level: info
-    appenders:
-      - default
-      - stdout
-    additive: false
-```
+Logs are written to stdout so a process supervisor (systemd, processmaster,
+etc.) can capture them. The default level is `info`; override it with the
+standard `RUST_LOG` environment variable (e.g. `RUST_LOG=debug`).
 
 Sample systemd unit file
 ```yaml

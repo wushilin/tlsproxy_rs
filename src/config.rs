@@ -8,6 +8,7 @@ use tokio::fs;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     pub listeners: HashMap<String, Listener>,
+    #[serde(default)]
     pub options: Options,
     #[serde(default)]
     pub dns: DnsConfig,
@@ -189,22 +190,6 @@ impl Config {
         return Ok(config);
     }
 
-    pub fn init_logging(&self) {
-        let log_conf_file = &self.options.log_config_file;
-        if log_conf_file.is_empty() {
-            println!("not initing logging as no `log4rs.yaml` defined.");
-        } else {
-            let result = log4rs::init_file(log_conf_file, Default::default());
-            match result {
-                Err(cause) => {
-                    println!("failed to initialize logging from `{log_conf_file}`: {cause}");
-                }
-                Ok(_) => {
-                    println!("initialized logging from `{log_conf_file}`");
-                }
-            }
-        }
-    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Listener {
@@ -278,7 +263,6 @@ pub enum Policy {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
-    pub log_config_file: String,
     /// Directory for runtime artifacts such as the local CA.
     #[serde(default = "default_runtime_dir")]
     pub runtime_dir: String,
@@ -291,7 +275,6 @@ fn default_runtime_dir() -> String {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            log_config_file: "".into(),
             runtime_dir: default_runtime_dir(),
         }
     }
@@ -314,9 +297,7 @@ listeners:
     rules:
       static_hosts: []
       patterns: []
-options:
-  log_config_file: ""
-  self_ips: []
+options: {}
 dns: {}
 "#;
         let config = Config::load_string(yaml).expect("old configuration should deserialize");
@@ -337,9 +318,7 @@ listeners:
       patterns: []
     mode: terminate
     upstream_tls: true
-options:
-  log_config_file: ""
-  self_ips: []
+options: {}
 dns: {}
 "#;
         let config = Config::load_string(yaml).expect("termination configuration should parse");
@@ -360,8 +339,7 @@ listeners:
       static_hosts: []
       patterns: []
     mode: forward
-options:
-  log_config_file: ""
+options: {}
 dns: {}
 "#;
         let config = Config::load_string(yaml).expect("forward configuration should parse");
@@ -400,8 +378,7 @@ listeners:
     rules:
       static_hosts: []
       patterns: ['^api\d+\.example$', '(?i)^legacy\.example$']
-options:
-  log_config_file: ""
+options: {}
 dns: {}
 "#;
         let config = Config::load_string(yaml).expect("pattern configuration should parse");

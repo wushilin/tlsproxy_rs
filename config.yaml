@@ -24,7 +24,6 @@ listeners:
     mode: forward
     upstream_tls: true
 options:
-  log_config_file: log4rs.yaml
   runtime_dir: ./runtime
 dns:
   exact:

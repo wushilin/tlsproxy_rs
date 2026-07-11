@@ -303,14 +303,6 @@ async fn get_listener_status() -> Result<Response, ISE> {
 }
 
 async fn get_listener_stats() -> Result<Response, ISE> {
-    let stats = active_tracker::get_active_list().await;
-    info!("{} connections active", stats.len());
-    for active in stats.iter() {
-        info!(
-            "active connection {} on listener `{}` from {}",
-            active.request_id, active.listener, active.remote_address
-        );
-    }
     let result = manager::get_listener_stats().await;
     let result = convert_error(serde_json::to_string(&result))?;
     return Ok(json_response(result));
