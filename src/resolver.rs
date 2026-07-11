@@ -1,120 +1,326 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
+use crate::config::{Config, DnsConfig};
 use lazy_static::lazy_static;
+use log::{error, info};
 use regex::{Regex, RegexBuilder};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::config::Config;
-use std::cmp::Ordering;
-use log::info;
+
+// DNS overrides. Resolution priority (first hit wins):
+//   1. exact host:port
+//   2. exact host (any port)
+//   3. suffix rules with a port (longest suffix first)
+//   4. suffix rules without a port (longest suffix first)
+//   5. regex rules, in definition order (hostname-only match, optional port filter)
+
+#[derive(Debug, Clone)]
+struct SuffixRule {
+    /// suffix with any leading dot removed, lowercased
+    base: String,
+    port: Option<u16>,
+    to: String,
+}
+
+#[derive(Debug)]
+struct RegexRule {
+    pattern: Regex,
+    port: Option<u16>,
+    to: String,
+}
+
+#[derive(Default)]
+struct Tables {
+    exact_with_port: HashMap<(String, u16), String>,
+    exact_any_port: HashMap<String, String>,
+    /// port-qualified rules first, then port-less; longest base first within each group
+    suffix: Vec<SuffixRule>,
+    regex: Vec<RegexRule>,
+}
 
 lazy_static! {
-    static ref CONFIG: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
-    static ref SUFFIX: Arc<RwLock<BTreeMap<LenKey, String>>> = Arc::new(RwLock::new(BTreeMap::new()));
-    static ref REGEX: Arc<RwLock<Vec<(Regex, String)>>> = Arc::new(RwLock::new(vec![]));
+    static ref TABLES: Arc<RwLock<Tables>> = Arc::new(RwLock::new(Tables::default()));
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct LenKey(String);
-
-impl Ord for LenKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // longest first
-        other.0.len().cmp(&self.0.len())
-            .then_with(|| self.0.cmp(&other.0))
+/// Splits `value` into (host, Some(port)) when it ends with `:<u16>`,
+/// (value, None) otherwise. IPv6 literals in brackets keep working because a
+/// trailing `:port` is only recognized after the last colon.
+fn split_host_port(value: &str) -> (String, Option<u16>) {
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if let Ok(port) = port.parse::<u16>() {
+            return (host.to_lowercase(), Some(port));
+        }
     }
+    (value.to_lowercase(), None)
 }
 
-impl PartialOrd for LenKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-pub async fn init(config:&Config) {
+pub async fn init(config: &Config) {
     info!("initializing DNS override");
-    let dns = &config.dns;
-    init_inner(dns.clone()).await;
-    info!("initialized DNS override. {} entries loaded", dns.len());
+    let count = init_inner(&config.dns).await;
+    info!("initialized DNS override. {count} rules loaded");
 }
 
-async fn init_inner(new:HashMap<String, String>) {
-    let mut config_1 = CONFIG.write().await;
-    config_1.clear();
-    // Convert it to a lower cased key map first
-    let new_lc:HashMap<String, String> = new.clone().into_iter()
-        .map(|(k, v)| (k.to_lowercase(), v))
-        .collect();
+async fn init_inner(dns: &DnsConfig) -> usize {
+    let mut tables = Tables::default();
 
-    let direct_lc:HashMap<String, String> = new_lc.clone().into_iter()
-        .filter(|(k, _v)| 
-        !k.starts_with("suffix:") && !k.starts_with("regex:"))
-        .collect();
-
-    let suffix_lc:HashMap<String, String> = new_lc.clone().into_iter()
-        .filter(|(k, _v)| k.starts_with("suffix:"))
-        .collect();
-
-    let regex_lc:HashMap<String, String> = new_lc.clone().into_iter()
-        .filter(|(k, _v)| k.starts_with("regex:"))
-        .collect();
-
-    for(key, value) in &direct_lc{
-        info!("Adding DNS by explicit {} -> {}", key, value);
-        config_1.insert(key.to_lowercase(), value.clone());
+    for rule in &dns.exact {
+        let (host, port) = split_host_port(rule.from.trim());
+        match port {
+            Some(port) => {
+                info!("DNS rule: exact {host}:{port} -> {}", rule.to);
+                tables.exact_with_port.insert((host, port), rule.to.clone());
+            }
+            None => {
+                info!("DNS rule: exact {host} (any port) -> {}", rule.to);
+                tables.exact_any_port.insert(host, rule.to.clone());
+            }
+        }
     }
 
-    let mut suffix_1 = SUFFIX.write().await;
-    suffix_1.clear();
-    for(key, value) in &suffix_lc{
-        let new_key = &key[7..];
-        info!("Adding DNS by suffix {} -> {}", new_key, value);
-        suffix_1.insert(LenKey(new_key.into()), value.clone());
+    for rule in &dns.suffix {
+        let (suffix, port) = split_host_port(rule.from.trim());
+        let base = suffix.trim_start_matches('.').to_string();
+        if base.is_empty() {
+            error!("DNS rule: suffix `{}` is empty; skipping", rule.from);
+            continue;
+        }
+        match port {
+            Some(port) => info!("DNS rule: suffix .{base}:{port} -> {}", rule.to),
+            None => info!("DNS rule: suffix .{base} (any port) -> {}", rule.to),
+        }
+        tables.suffix.push(SuffixRule {
+            base,
+            port,
+            to: rule.to.clone(),
+        });
     }
+    // port-qualified before port-less; longest suffix first within each group.
+    // sort_by_key is stable, so equal keys keep their definition order.
+    tables
+        .suffix
+        .sort_by_key(|rule| (rule.port.is_none(), std::cmp::Reverse(rule.base.len())));
 
-    let mut regex_1 = REGEX.write().await;
-    regex_1.clear();
-    for(regex, value) in &regex_lc{
-        let new_regex_str = regex["regex:".len()..].to_string();
-        let new_regex = RegexBuilder::new(&new_regex_str)
+    for rule in &dns.regex {
+        let pattern = RegexBuilder::new(&rule.hostname)
             .case_insensitive(true)
-            .build()
-            .unwrap();
-        info!("Adding DNS by regex {} -> {}", new_regex_str, value);
-        regex_1.push((new_regex, value.clone()));
+            .build();
+        match pattern {
+            Ok(pattern) => {
+                info!(
+                    "DNS rule: regex {} (port {:?}) -> {}",
+                    rule.hostname, rule.port, rule.to
+                );
+                tables.regex.push(RegexRule {
+                    pattern,
+                    port: rule.port,
+                    to: rule.to.clone(),
+                });
+            }
+            Err(cause) => {
+                error!(
+                    "DNS rule: invalid regex `{}` ({cause}); skipping",
+                    rule.hostname
+                );
+            }
+        }
     }
+
+    let count = tables.exact_with_port.len()
+        + tables.exact_any_port.len()
+        + tables.suffix.len()
+        + tables.regex.len();
+    *TABLES.write().await = tables;
+    count
 }
 
-// Resolve return resolved address, and a boolean indicating if actual resolution happened
-pub async fn resolve(host:&str) -> Option<String> {
-    let host_lc = host.to_lowercase();
-    let result = CONFIG.read().await;
-    let direct_result = result.get(&host_lc);
-    match direct_result {
-        Some(inner) => {
-            info!("DNS direct match {} -> {}", host_lc, inner);
-            return Some(inner.into());
-        },
-        None => {
+/// True when `host` equals `base` or ends with `.base` (label boundary).
+fn suffix_matches(host: &str, base: &str) -> bool {
+    host == base
+        || (host.len() > base.len()
+            && host.ends_with(base)
+            && host.as_bytes()[host.len() - base.len() - 1] == b'.')
+}
+
+/// Resolves an override for `host` (an SNI hostname, no port) and `port`.
+/// Returns the replacement target (`host` or `host:port`) or None when no
+/// rule matches and normal DNS should apply.
+pub async fn resolve(host: &str, port: u16) -> Option<String> {
+    let host = host.to_lowercase();
+    let tables = TABLES.read().await;
+
+    if let Some(to) = tables.exact_with_port.get(&(host.clone(), port)) {
+        info!("DNS exact match {host}:{port} -> {to}");
+        return Some(to.clone());
+    }
+    if let Some(to) = tables.exact_any_port.get(&host) {
+        info!("DNS exact match {host} (any port) -> {to}");
+        return Some(to.clone());
+    }
+
+    for rule in &tables.suffix {
+        if rule.port.is_some_and(|rule_port| rule_port != port) {
+            continue;
+        }
+        if suffix_matches(&host, &rule.base) {
+            info!(
+                "DNS suffix match {host}:{port} -> {} by suffix `.{}`",
+                rule.to, rule.base
+            );
+            return Some(rule.to.clone());
         }
     }
 
-    let suffix_1 = SUFFIX.read().await;
-    for(key, value) in &*suffix_1 {
-        if host_lc.ends_with(&key.0) {
-            info!("DNS suffix match {} -> {} by suffix `{}`", host_lc, value, key.0);
-            return Some(value.into());
+    for rule in &tables.regex {
+        if rule.port.is_some_and(|rule_port| rule_port != port) {
+            continue;
+        }
+        if rule.pattern.is_match(&host) {
+            info!(
+                "DNS regex match {host}:{port} -> {} by regex `{}`",
+                rule.to, rule.pattern
+            );
+            return Some(rule.to.clone());
         }
     }
-    drop(suffix_1);
 
-    let regex_1 = REGEX.read().await;
-    for(regex, value) in &*regex_1 {
-        if regex.is_match(&host_lc) {
-            info!("DNS regex match {} -> {} by regex `{}`", host_lc, value, regex);
-            return Some(value.into());
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ExactDnsRule, RegexDnsRule, SuffixDnsRule};
+
+    fn exact(from: &str, to: &str) -> ExactDnsRule {
+        ExactDnsRule {
+            from: from.into(),
+            to: to.into(),
         }
     }
-    drop(regex_1);
-    return None;
+
+    fn suffix(from: &str, to: &str) -> SuffixDnsRule {
+        SuffixDnsRule {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+
+    fn regex(hostname: &str, port: Option<u16>, to: &str) -> RegexDnsRule {
+        RegexDnsRule {
+            hostname: hostname.into(),
+            port,
+            to: to.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolution_priority_is_exact_then_suffix_then_regex() {
+        init_inner(&DnsConfig {
+            exact: vec![
+                exact("api.internal.example.com:443", "exact-port.example:443"),
+                exact("api.internal.example.com", "exact-any.example:443"),
+            ],
+            suffix: vec![
+                suffix(".example.com", "suffix-short.example:443"),
+                suffix(".internal.example.com:443", "suffix-port.example:443"),
+                suffix(".internal.example.com", "suffix-long.example:443"),
+            ],
+            regex: vec![
+                regex("^api\\.", None, "regex-first.example:443"),
+                regex("example", None, "regex-second.example:443"),
+            ],
+        })
+        .await;
+
+        // exact host:port beats exact host beats everything else
+        assert_eq!(
+            resolve("api.internal.example.com", 443).await.as_deref(),
+            Some("exact-port.example:443")
+        );
+        assert_eq!(
+            resolve("api.internal.example.com", 8443).await.as_deref(),
+            Some("exact-any.example:443")
+        );
+        // suffix with port beats port-less suffix of the same length
+        assert_eq!(
+            resolve("web.internal.example.com", 443).await.as_deref(),
+            Some("suffix-port.example:443")
+        );
+        // port-less long suffix beats short one when the port rule filters out
+        assert_eq!(
+            resolve("web.internal.example.com", 8443).await.as_deref(),
+            Some("suffix-long.example:443")
+        );
+        // regex only fires when nothing above matched, in definition order
+        assert_eq!(
+            resolve("api.other.test", 443).await.as_deref(),
+            Some("regex-first.example:443")
+        );
+        assert_eq!(resolve("nothing.test", 443).await.as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn suffix_respects_label_boundaries_and_matches_bare_domain() {
+        init_inner(&DnsConfig {
+            exact: vec![],
+            suffix: vec![suffix(".abc.com", "hit.example")],
+            regex: vec![],
+        })
+        .await;
+
+        assert_eq!(
+            resolve("x.abc.com", 443).await.as_deref(),
+            Some("hit.example")
+        );
+        assert_eq!(
+            resolve("abc.com", 443).await.as_deref(),
+            Some("hit.example")
+        );
+        assert_eq!(resolve("notabc.com", 443).await, None);
+    }
+
+    #[tokio::test]
+    async fn regex_matches_hostname_without_port_and_honors_port_filter() {
+        init_inner(&DnsConfig {
+            exact: vec![],
+            suffix: vec![],
+            regex: vec![
+                regex("^api\\d+\\.abc\\.com$", Some(443), "https.example:443"),
+                regex("^api\\d+\\.abc\\.com$", None, "any.example"),
+            ],
+        })
+        .await;
+
+        assert_eq!(
+            resolve("api1.abc.com", 443).await.as_deref(),
+            Some("https.example:443")
+        );
+        assert_eq!(
+            resolve("api1.abc.com", 8443).await.as_deref(),
+            Some("any.example")
+        );
+        // the pattern sees only the hostname; a port in the pattern never matches
+        init_inner(&DnsConfig {
+            exact: vec![],
+            suffix: vec![],
+            regex: vec![regex("abc\\.com:443", None, "never.example")],
+        })
+        .await;
+        assert_eq!(resolve("x.abc.com", 443).await, None);
+    }
+
+    #[tokio::test]
+    async fn invalid_regex_is_skipped_not_fatal() {
+        let count = init_inner(&DnsConfig {
+            exact: vec![exact("ok.test", "target.test")],
+            suffix: vec![],
+            regex: vec![regex("(unclosed", None, "broken.example")],
+        })
+        .await;
+        assert_eq!(count, 1);
+        assert_eq!(
+            resolve("ok.test", 443).await.as_deref(),
+            Some("target.test")
+        );
+    }
 }

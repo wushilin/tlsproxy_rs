@@ -1,17 +1,103 @@
-use std::collections::HashMap;
-use std::error::Error;
 use regex::Regex;
-use tokio::fs;
+use serde_derive::{Deserialize, Serialize};
 use serde_yaml_ng;
-use serde_derive::{Serialize, Deserialize};
+use std::error::Error;
+use std::{collections::HashMap, path::Path};
+use tokio::fs;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     pub listeners: HashMap<String, Listener>,
-    pub options:Options,
-    pub dns: HashMap<String, String>,
-    pub disable_check_ip: Option<bool>,
+    pub options: Options,
+    #[serde(default)]
+    pub dns: DnsConfig,
+    /// Certificate authority used for every certificate the proxy manages
+    /// (admin server TLS and terminating listeners). When absent, a local CA
+    /// with default parameters is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<CaConfig>,
     pub admin_server: Option<AdminServerConfig>,
+}
+
+/// Local CA configuration. When absent, `localca` defaults are used.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub localca: Option<LocalCaConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
+pub struct LocalCaConfig {
+    #[serde(default = "default_ca_cert")]
+    pub ca_cert: String,
+    #[serde(default = "default_ca_key")]
+    pub ca_key: String,
+    #[serde(default = "default_ca_working_dir")]
+    pub working_dir: String,
+}
+
+impl Default for LocalCaConfig {
+    fn default() -> Self {
+        Self {
+            ca_cert: default_ca_cert(),
+            ca_key: default_ca_key(),
+            working_dir: default_ca_working_dir(),
+        }
+    }
+}
+
+fn default_ca_cert() -> String {
+    "local_ca/CA.pem".into()
+}
+
+fn default_ca_key() -> String {
+    "local_ca/CA.key".into()
+}
+
+fn default_ca_working_dir() -> String {
+    "local_ca".into()
+}
+
+/// DNS overrides, applied before connecting upstream. Resolution priority:
+/// exact host:port, then exact host (any port), then suffix rules with a
+/// port, then suffix rules without (longer suffixes win within each group),
+/// then regex rules in definition order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DnsConfig {
+    #[serde(default)]
+    pub exact: Vec<ExactDnsRule>,
+    #[serde(default)]
+    pub suffix: Vec<SuffixDnsRule>,
+    #[serde(default)]
+    pub regex: Vec<RegexDnsRule>,
+}
+
+/// `from` is `host` (any port) or `host:port`; `to` is `host` (keep original
+/// port) or `host:port`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExactDnsRule {
+    pub from: String,
+    pub to: String,
+}
+
+/// `from` is a domain suffix, conventionally written with a leading dot
+/// (`.internal.example.com`), optionally with `:port`. Matching respects
+/// label boundaries: `.abc.com` matches `x.abc.com` and `abc.com`, but never
+/// `notabc.com`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuffixDnsRule {
+    pub from: String,
+    pub to: String,
+}
+
+/// `hostname` is matched against the hostname only (the port is never part of
+/// the text the regex sees); `port` optionally restricts the rule to one port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegexDnsRule {
+    pub hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    pub to: String,
 }
 
 impl Listener {
@@ -19,14 +105,12 @@ impl Listener {
         match self.speed_limit.as_ref() {
             Some(inner) => {
                 if *inner == 0f64 {
-                    std::f64::INFINITY
+                    f64::INFINITY
                 } else {
                     *inner
                 }
-            },
-            None => {
-                std::f64::INFINITY
             }
+            None => f64::INFINITY,
         }
     }
     pub fn max_idle_time_ms(&self) -> u64 {
@@ -37,16 +121,16 @@ impl Listener {
                 } else {
                     return *inner;
                 }
-            },
+            }
             None => {
                 return 3600000;
             }
         }
     }
 
-    fn match_host(&self, host:&str) -> bool {
+    fn match_host(&self, host: &str) -> bool {
         for static_host in &self.rules.static_hosts {
-            if host.to_ascii_lowercase() == static_host.to_ascii_lowercase() {
+            if host.eq_ignore_ascii_case(static_host) {
                 return true;
             }
         }
@@ -58,26 +142,11 @@ impl Listener {
         }
         return false;
     }
-    pub fn is_allowed(&self, host:&str) -> bool {
+    pub fn is_allowed(&self, host: &str) -> bool {
         let matched = self.match_host(host);
         match self.policy {
-            Policy::ALLOW => {
-                matched
-            }, 
-            Policy::DENY => {
-                !matched
-            }
-        }
-    }
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            listeners: HashMap::new(),
-            options: Default::default(),
-            dns: HashMap::new(),
-            disable_check_ip: None,
-            admin_server: None
+            Policy::ALLOW => matched,
+            Policy::DENY => !matched,
         }
     }
 }
@@ -87,54 +156,50 @@ pub struct AdminServerConfig {
     pub bind_port: Option<u16>,
     pub username: Option<String>,
     pub password: Option<String>,
-    pub tls_cert: Option<String>,
-    pub tls_key: Option<String>,
-    pub tls_ca_cert: Option<String>,
-    pub mutual_tls: Option<bool>,
     pub tls: Option<bool>,
-    pub rocket_log_level: Option<String>,
+    /// Subject alternative names for the admin certificate; DNS names and
+    /// IP addresses are told apart automatically. The certificate itself
+    /// comes from the top-level `ca` source.
+    #[serde(default)]
+    pub san: Vec<String>,
 }
 
 impl Default for AdminServerConfig {
     fn default() -> Self {
-        AdminServerConfig { 
-            bind_address: Some("0.0.0.0".into()), 
-            bind_port: Some(48888), 
-            username: Some("admin".into()), 
+        AdminServerConfig {
+            bind_address: Some("0.0.0.0".into()),
+            bind_port: Some(48888),
+            username: Some("admin".into()),
             password: Some("admin".into()),
-            tls: Some(false), 
-            tls_cert: Some("".into()), 
-            tls_key: Some("".into()), 
-            tls_ca_cert: Some("".into()), 
-            mutual_tls: Some(false),
-            rocket_log_level: Some("normal".into()),
+            tls: Some(false),
+            san: vec!["localhost".into(), "127.0.0.1".into()],
         }
     }
 }
 impl Config {
-    pub async fn load_file(filename:&str) -> Result<Config, Box<dyn Error>> {
+    pub async fn load_file<P: AsRef<Path>>(filename: P) -> Result<Config, Box<dyn Error>> {
         let content = fs::read_to_string(filename).await?;
-    
-        let config:Config = serde_yaml_ng::from_str(&content)?;
+
+        let config: Config = serde_yaml_ng::from_str(&content)?;
         return Ok(config);
     }
 
-    pub fn load_string(content:&str) -> Result<Config, Box<dyn Error>> {
-        let config:Config = serde_yaml_ng::from_str(&content)?;
+    pub fn load_string(content: &str) -> Result<Config, Box<dyn Error>> {
+        let config: Config = serde_yaml_ng::from_str(content)?;
         return Ok(config);
     }
 
     pub fn init_logging(&self) {
         let log_conf_file = &self.options.log_config_file;
-        if log_conf_file == "" {
+        if log_conf_file.is_empty() {
             println!("not initing logging as no `log4rs.yaml` defined.");
         } else {
             let result = log4rs::init_file(log_conf_file, Default::default());
             match result {
                 Err(cause) => {
                     println!("failed to initialize logging from `{log_conf_file}`: {cause}");
-                },
-                Ok(_) =>{
+                }
+                Ok(_) => {
                     println!("initialized logging from `{log_conf_file}`");
                 }
             }
@@ -149,6 +214,20 @@ pub struct Listener {
     pub rules: Rules,
     pub max_idle_time_ms: Option<u64>,
     pub speed_limit: Option<f64>,
+    #[serde(default)]
+    pub mode: ListenerMode,
+    /// Encrypt the terminate-mode upstream leg without authenticating the
+    /// upstream certificate.
+    #[serde(default)]
+    pub upstream_tls: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerMode {
+    #[default]
+    Passthrough,
+    Terminate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,19 +240,105 @@ pub struct Rules {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Policy {
     ALLOW,
-    DENY
+    DENY,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
     pub log_config_file: String,
-    pub self_ips: Vec<String>,
+    /// Directory for runtime artifacts such as the local CA.
+    #[serde(default = "default_runtime_dir")]
+    pub runtime_dir: String,
+}
+
+fn default_runtime_dir() -> String {
+    "./runtime".into()
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             log_config_file: "".into(),
-            self_ips: Vec::new()
+            runtime_dir: default_runtime_dir(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use regex::Regex;
+
+    use super::{Config, Listener, ListenerMode, Policy, Rules};
+
+    #[test]
+    fn old_listener_config_defaults_to_passthrough() {
+        let yaml = r#"
+listeners:
+  web:
+    bind: 127.0.0.1:1443
+    target_port: 443
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns: []
+options:
+  log_config_file: ""
+  self_ips: []
+dns: {}
+"#;
+        let config = Config::load_string(yaml).expect("old configuration should deserialize");
+        assert_eq!(config.listeners["web"].mode, ListenerMode::Passthrough);
+        assert!(!config.listeners["web"].upstream_tls);
+    }
+
+    #[test]
+    fn listener_mode_is_lowercase_in_yaml() {
+        let yaml = r#"
+listeners:
+  web:
+    bind: 127.0.0.1:1443
+    target_port: 8080
+    policy: ALLOW
+    rules:
+      static_hosts: [example.test]
+      patterns: []
+    mode: terminate
+    upstream_tls: true
+options:
+  log_config_file: ""
+  self_ips: []
+dns: {}
+"#;
+        let config = Config::load_string(yaml).expect("termination configuration should parse");
+        assert_eq!(config.listeners["web"].mode, ListenerMode::Terminate);
+        assert!(config.listeners["web"].upstream_tls);
+    }
+
+    fn listener(policy: Policy) -> Listener {
+        Listener {
+            bind: "127.0.0.1:0".into(),
+            target_port: 443,
+            policy,
+            rules: Rules {
+                static_hosts: vec!["Example.COM".into()],
+                patterns: vec![Regex::new(r"^api\d+\.example$").unwrap()],
+            },
+            max_idle_time_ms: None,
+            speed_limit: None,
+            mode: ListenerMode::Passthrough,
+            upstream_tls: false,
+        }
+    }
+
+    #[test]
+    fn acl_static_hosts_ignore_case_and_regexes_are_applied() {
+        let allow = listener(Policy::ALLOW);
+        assert!(allow.is_allowed("example.com"));
+        assert!(allow.is_allowed("api42.example"));
+        assert!(!allow.is_allowed("other.example"));
+
+        let deny = listener(Policy::DENY);
+        assert!(!deny.is_allowed("EXAMPLE.COM"));
+        assert!(!deny.is_allowed("api7.example"));
+        assert!(deny.is_allowed("other.example"));
     }
 }
