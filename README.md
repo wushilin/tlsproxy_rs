@@ -37,13 +37,16 @@ $ sh build.sh
 
 The management console is dependency-free and embedded into the release binary
 at compile time. It does not require Node.js or runtime Internet access.
+By default, `build.sh` builds the musl release binary at
+`target/x86_64-unknown-linux-musl/release/tlsproxy`. Override with
+`TARGET=... sh build.sh` if you need a different Rust target.
 
 # Running
 ## Directory structure
 
-You should build your tls proxy using `$ cargo build --release`
+You should build your tls proxy using `$ sh build.sh`
 
-And copy `target/release/tlsproxy` to a separate folder.
+And copy `target/x86_64-unknown-linux-musl/release/tlsproxy` to a separate folder.
 
 In the same folder, you should also copy the following files:
 
