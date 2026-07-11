@@ -37,7 +37,7 @@ pub struct ManagerStatusSerde {
 pub async fn cancel() {
     info!("attempting to cancel all tasks");
     let mut w = CONTROLLER.write().await;
-    w.cancel().await;
+    w.cancel();
 }
 
 pub async fn get_stats(name: &str) -> Option<Arc<ListenerStats>> {
@@ -156,7 +156,10 @@ pub async fn start(config: Config) -> Result<HashMap<String, Result<bool>>> {
             return Err(cause);
         }
     };
-    ca.spawn_eviction_job();
+    {
+        let mut controller = CONTROLLER.write().await;
+        ca.spawn_eviction_job(&mut controller);
+    }
     let (tx, mut rx) = mpsc::channel(config.listeners.len());
     for (name, listener) in &config.listeners {
         let name = name.clone();
@@ -187,15 +190,27 @@ pub async fn start(config: Config) -> Result<HashMap<String, Result<bool>>> {
                 }
             }
             let _ = tx.send(()).await;
-        })
-        .await;
+        });
     }
     for _ in 0..config.listeners.len() {
         rx.recv().await;
     }
-    info!("starting manager: succeeded");
+    let listener_status = get_listener_status().await;
+    let started_count = listener_status
+        .values()
+        .filter(|result| matches!(result, Ok(true)))
+        .count();
+    if started_count == 0 {
+        warn!("starting manager: failed (all listeners failed)");
+        *status = Status::STOPPED;
+        *STARTED_AT.write().await = None;
+        LISTENERS.write().await.clear();
+        active_tracker::reset().await;
+        cancel().await;
+        return Err(anyhow!("failed to start, all listeners failed"));
+    }
+    info!("starting manager: succeeded ({started_count} listener(s) started)");
     *status = Status::STARTED;
     *STARTED_AT.write().await = Some(Instant::now());
-    //return get_listener_status();
-    return Ok(get_listener_status().await);
+    return Ok(listener_status);
 }

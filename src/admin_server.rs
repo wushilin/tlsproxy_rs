@@ -1,12 +1,20 @@
 use include_dir::{include_dir, Dir};
 use regex::Regex;
-use std::{collections::HashMap, error::Error, fmt::Display, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt::Display,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 static STATIC: Dir<'_> = include_dir!("static");
 
 use crate::{
     active_tracker, ca,
     config::{AdminServerConfig, Config as PFConfig, Listener},
+    controller::Controller,
     manager,
 };
 use axum::{
@@ -22,7 +30,7 @@ use base64::{engine::general_purpose, Engine as _};
 use lazy_static::lazy_static;
 use log::info;
 use serde::{Deserialize, Serialize};
-use tokio::{fs::File, io::AsyncWriteExt, sync::RwLock};
+use tokio::{fs, fs::File, io::AsyncWriteExt, sync::RwLock};
 
 lazy_static! {
     static ref LOCK: Arc<RwLock<bool>> = Arc::new(RwLock::new(false));
@@ -234,14 +242,16 @@ async fn index(headers: HeaderMap) -> Response {
 
 async fn get_listener_config() -> Result<Response, ISE> {
     let _guard = LOCK.read().await;
-    let conf: PFConfig = PFConfig::load_file(CONFIG_FILE).await.map_err(ISE::from)?;
+    let config_file = config_file().await;
+    let conf: PFConfig = PFConfig::load_file(&config_file).await.map_err(ISE::from)?;
     let result = serde_json::to_string(&conf.listeners).map_err(ISE::from)?;
     return Ok(json_response(result));
 }
 
 async fn get_dns_config() -> Result<Response, ISE> {
     let _guard = LOCK.read().await;
-    let conf: PFConfig = PFConfig::load_file(CONFIG_FILE).await.map_err(ISE::from)?;
+    let config_file = config_file().await;
+    let conf: PFConfig = PFConfig::load_file(&config_file).await.map_err(ISE::from)?;
     let result = serde_json::to_string(&conf.dns).map_err(ISE::from)?;
     return Ok(json_response(result));
 }
@@ -255,23 +265,21 @@ where
 
 async fn put_dns_config(data: String) -> Result<Response, ISE> {
     let _guard = LOCK.write().await;
+    let config_file = config_file().await;
     let dns: crate::config::DnsConfig = convert_error(serde_json::from_str(&data))?;
-    let mut conf: PFConfig = convert_error(PFConfig::load_file(CONFIG_FILE).await)?;
+    let mut conf: PFConfig = convert_error(PFConfig::load_file(&config_file).await)?;
     conf.dns = dns;
-    let yamlout = serde_yaml_ng::to_string(&conf).unwrap();
-    let mut file_out = convert_error(File::create(CONFIG_FILE).await)?;
-    convert_error(file_out.write_all(yamlout.as_bytes()).await)?;
+    write_config_file(&config_file, &conf).await?;
     Ok(json_response(data))
 }
 
 async fn put_listener_config(data: String) -> Result<Response, ISE> {
     let _guard = LOCK.write().await;
+    let config_file = config_file().await;
     let map: HashMap<String, Listener> = convert_error(serde_json::from_str(&data))?;
-    let mut conf: PFConfig = convert_error(PFConfig::load_file(CONFIG_FILE).await)?;
+    let mut conf: PFConfig = convert_error(PFConfig::load_file(&config_file).await)?;
     conf.listeners = map;
-    let yamlout = serde_yaml_ng::to_string(&conf).unwrap();
-    let mut file_out = convert_error(File::create(CONFIG_FILE).await)?;
-    convert_error(file_out.write_all(yamlout.as_bytes()).await)?;
+    write_config_file(&config_file, &conf).await?;
     Ok(json_response(data))
 }
 
@@ -381,7 +389,8 @@ async fn start() -> Result<Response, ISE> {
 async fn restart_and_apply_config() -> Result<Response, ISE> {
     let _guard = LOCK.write().await;
 
-    let conf: PFConfig = convert_error(PFConfig::load_file(CONFIG_FILE).await)?;
+    let config_file = config_file().await;
+    let conf: PFConfig = convert_error(PFConfig::load_file(&config_file).await)?;
     {
         let mut last_w = LAST_CONFIG.write().await;
         *last_w = conf.clone();
@@ -403,29 +412,65 @@ async fn restart_and_apply_config() -> Result<Response, ISE> {
 
 async fn reset_original_config() -> Result<Response, ISE> {
     let _guard = LOCK.write().await;
+    let config_file = config_file().await;
     let old = LAST_CONFIG.read().await;
     let old_dns = old.dns.clone();
     let old_listeners = old.listeners.clone();
 
-    let mut conf: PFConfig = convert_error(PFConfig::load_file(CONFIG_FILE).await)?;
+    let mut conf: PFConfig = convert_error(PFConfig::load_file(&config_file).await)?;
     conf.listeners = old_listeners;
     conf.dns = old_dns;
-    let yamlout = serde_yaml_ng::to_string(&conf).unwrap();
-    let mut file_out = convert_error(File::create(CONFIG_FILE).await)?;
-    convert_error(file_out.write_all(yamlout.as_bytes()).await)?;
+    write_config_file(&config_file, &conf).await?;
     let json_result = serde_json::to_string("OK").unwrap();
     Ok(json_response(json_result))
 }
 
-static CONFIG_FILE: &str = "config.yaml";
-
 lazy_static! {
     static ref CONFIG: Arc<RwLock<AdminServerConfig>> = Arc::new(RwLock::new(Default::default()));
+    static ref ADMIN_ENABLED: Arc<RwLock<bool>> = Arc::new(RwLock::new(false));
+    static ref CONFIG_FILE: Arc<RwLock<PathBuf>> =
+        Arc::new(RwLock::new(PathBuf::from("config.yaml")));
     static ref LAST_CONFIG: Arc<RwLock<PFConfig>> = Arc::new(RwLock::new(Default::default()));
 }
 
-pub async fn init(config: &PFConfig) -> Result<(), Box<dyn Error>> {
+async fn config_file() -> PathBuf {
+    CONFIG_FILE.read().await.clone()
+}
+
+async fn write_config_file(config_file: &Path, config: &PFConfig) -> Result<(), ISE> {
+    let yamlout = convert_error(serde_yaml_ng::to_string(config))?;
+    if let Some(parent) = config_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        convert_error(fs::create_dir_all(parent).await)?;
+    }
+    let temporary = config_file.with_extension(format!(
+        "{}.tmp",
+        config_file
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("yaml")
+    ));
+    let mut file_out = convert_error(File::create(&temporary).await)?;
+    convert_error(file_out.write_all(yamlout.as_bytes()).await)?;
+    convert_error(file_out.sync_all().await)?;
+    drop(file_out);
+    convert_error(fs::rename(&temporary, config_file).await)?;
+    info!("wrote config `{}` atomically", config_file.display());
+    Ok(())
+}
+
+pub async fn enabled() -> bool {
+    *ADMIN_ENABLED.read().await
+}
+
+pub async fn init(config_file: &Path, config: &PFConfig) -> Result<(), Box<dyn Error>> {
     info!("initializing adminserver...");
+    {
+        let mut w = CONFIG_FILE.write().await;
+        *w = config_file.to_path_buf();
+    }
     {
         let mut w = LAST_CONFIG.write().await;
         *w = config.clone();
@@ -433,10 +478,13 @@ pub async fn init(config: &PFConfig) -> Result<(), Box<dyn Error>> {
     let admin_config = config.admin_server.clone();
     match admin_config {
         Some(what) => {
+            *ADMIN_ENABLED.write().await = true;
             let mut w = CONFIG.write().await;
             *w = what;
         }
         None => {
+            *ADMIN_ENABLED.write().await = false;
+            info!("admin server disabled (admin_server section is absent)");
             return Ok(());
         }
     }
@@ -483,6 +531,10 @@ fn router() -> Router {
 }
 
 pub async fn run() -> Result<(), Box<dyn Error>> {
+    if !enabled().await {
+        info!("admin server disabled; not starting admin UI");
+        return Ok(());
+    }
     let config = CONFIG.read().await.clone();
     let bind_port = choose(&config.bind_port, 48888);
     let bind_address = choose(&config.bind_address, "0.0.0.0".into());
@@ -495,9 +547,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         "admin UI listening on {protocol}://localhost:{bind_port} (bound to {bind_address}, Basic Auth required)"
     );
     if enable_tls {
+        let mut admin_controller = Controller::new();
         let full_config = LAST_CONFIG.read().await.clone();
         let ca = ca::LocalCa::from_config(&full_config)?;
-        ca.spawn_eviction_job();
+        ca.spawn_eviction_job(&mut admin_controller);
         let rustls_config = RustlsConfig::from_config(ca.admin_server_config(config.san.clone()));
         axum_server::bind_rustls(addr, rustls_config)
             .serve(app.into_make_service())
@@ -509,4 +562,63 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     }
     info!("admin server over");
     return Ok(());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Options, Rules};
+    use regex::Regex;
+    use tempfile::tempdir;
+
+    fn config_with_listener(bind: &str) -> PFConfig {
+        let mut config = PFConfig {
+            options: Options::default(),
+            ..Default::default()
+        };
+        config.listeners.insert(
+            "test".into(),
+            Listener {
+                bind: bind.into(),
+                target_port: 443,
+                policy: crate::config::Policy::DENY,
+                rules: Rules {
+                    static_hosts: Vec::new(),
+                    patterns: vec![Regex::new("^blocked\\.example$").unwrap()],
+                },
+                max_idle_time_ms: None,
+                speed_limit: None,
+                mode: crate::config::ListenerMode::Passthrough,
+                upstream_tls: false,
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn write_config_file_replaces_existing_file_with_valid_yaml() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        fs::write(&path, b"not: valid: yaml").await.unwrap();
+
+        write_config_file(&path, &config_with_listener("127.0.0.1:9443"))
+            .await
+            .unwrap();
+
+        let loaded = PFConfig::load_file(&path).await.unwrap();
+        assert_eq!(loaded.listeners["test"].bind, "127.0.0.1:9443");
+        assert!(!path.with_extension("yaml.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn absent_admin_server_disables_admin_ui() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let mut config = config_with_listener("127.0.0.1:9444");
+        config.admin_server = None;
+
+        init(&path, &config).await.unwrap();
+
+        assert!(!enabled().await);
+    }
 }

@@ -42,6 +42,15 @@ By default, `build.sh` builds the musl release binary at
 `TARGET=... sh build.sh` if you need a different Rust target.
 
 # Running
+```bash
+$ tlsproxy run -c config.yaml
+```
+
+When no subcommand is supplied, `tlsproxy` defaults to `tlsproxy run -c
+config.yaml`. Use `tlsproxy genconfig -c config.yaml` to create a starter
+configuration; it refuses to overwrite an existing file. Use `tlsproxy validate
+-c config.yaml` to parse-check a configuration before running it.
+
 ## Directory structure
 
 You should build your tls proxy using `$ sh build.sh`

@@ -12,13 +12,13 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 log = "0.4"
 log4rs = { version="1", features = ["gzip", "background_rotation"] }
 axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 serde_json = "1"
-tokio-context = "0.1"
 regex = "1"
 serde_regex = "1"
 serde_derive = "1"
@@ -32,6 +32,7 @@ tokio-rustls = "0.26"
 time = "0.3"
 x509-parser = { version = "0.18", features = ["verify"] }
 lru = "0.18.1"
+tokio-tree-context = "0.1.6"
 
 [dev-dependencies]
 tempfile = "3"

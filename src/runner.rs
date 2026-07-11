@@ -120,55 +120,53 @@ impl Runner {
         let stats = ListenerStats::new(&self.name, idle_timeout_ms);
         let stats = Arc::new(stats);
         let root_context_clone = Arc::clone(&self.controller);
-        let controller_clone = Arc::clone(&self.controller);
         let stats_clone = Arc::clone(&stats);
         let (tx, mut rx) = mpsc::channel(1);
         let name_clone = name.clone();
-        let listener_task = root_context_clone
-            .write()
-            .await
-            .spawn(async move {
-                let mut listener = TcpListener::bind(&bind).await;
-                let max_retry = 3;
-                for i in 1..max_retry + 1 {
-                    if listener.is_ok() {
-                        break;
-                    }
-                    warn!(
-                        "Listener: `{}` unable to bind to `{}` yet. retrying({i} of {max_retry})",
-                        &name_clone, &bind
-                    );
-                    sleep(Duration::from_millis(100)).await;
-                    listener = TcpListener::bind(&bind).await;
+        let mut root_controller = root_context_clone.write().await;
+        let listener_controller = root_controller.child();
+        let listener_task = root_controller.spawn(async move {
+            let mut listener = TcpListener::bind(&bind).await;
+            let max_retry = 3;
+            for i in 1..max_retry + 1 {
+                if listener.is_ok() {
+                    break;
                 }
-                match listener {
-                    Ok(inner_listener) => {
-                        let _ = tx.send(None).await; // tell listener started successfully
-                        let name_clone_result = name_clone.clone();
-                        let result = Self::run_listener(
-                            name_clone,
-                            inner_listener,
-                            listener_config,
-                            stats_clone,
-                            controller_clone,
-                            ca,
-                        )
-                        .await;
-                        match result {
-                            Err(cause) => {
-                                error!("listener {name_clone_result} failed with {cause}");
-                            }
-                            _ => {
-                                // it was ok
-                            }
+                warn!(
+                    "Listener: `{}` unable to bind to `{}` yet. retrying({i} of {max_retry})",
+                    &name_clone, &bind
+                );
+                sleep(Duration::from_millis(100)).await;
+                listener = TcpListener::bind(&bind).await;
+            }
+            match listener {
+                Ok(inner_listener) => {
+                    let _ = tx.send(None).await; // tell listener started successfully
+                    let name_clone_result = name_clone.clone();
+                    let result = Self::run_listener(
+                        name_clone,
+                        inner_listener,
+                        listener_config,
+                        stats_clone,
+                        listener_controller,
+                        ca,
+                    )
+                    .await;
+                    match result {
+                        Err(cause) => {
+                            error!("listener {name_clone_result} failed with {cause}");
+                        }
+                        _ => {
+                            // it was ok
                         }
                     }
-                    Err(cause) => {
-                        let _ = tx.send(Some(format!("{cause}"))).await; // tell listener stopped successfully
-                    }
                 }
-            })
-            .await;
+                Err(cause) => {
+                    let _ = tx.send(Some(format!("{cause}"))).await; // tell listener stopped successfully
+                }
+            }
+        });
+        drop(root_controller);
         drop(listener_task);
         let fail_reason = tokio::select! {
             _ = sleep(Duration::from_secs(1)) => {
@@ -205,13 +203,13 @@ impl Runner {
         remote_address: SocketAddr,
         listener_config: Arc<Listener>,
         stats: Arc<ListenerStats>,
-        controller: Arc<RwLock<Controller>>,
+        listener_controller: &mut Controller,
+        connection_controller: Controller,
         ca: LocalCa,
     ) -> JoinHandle<Option<()>> {
-        let mut controller_inner = controller.write().await;
-        let controller_clone_inner = Arc::clone(&controller);
         let name = Arc::clone(&name);
-        let jh = controller_inner.spawn(async move {
+        let jh = listener_controller.spawn(async move {
+            let controller = Arc::new(RwLock::new(connection_controller));
             let stats_local = Arc::clone(&stats);
             let request_id = ext.get_extension::<RequestId>().await.unwrap();
             let mut new_active = stats_local.increase_conn_count();
@@ -225,7 +223,7 @@ impl Runner {
                 ext,
                 listener_config,
                 stats_local_clone,
-                controller_clone_inner,
+                controller,
                 ca,
             )
             .await;
@@ -238,7 +236,7 @@ impl Runner {
             new_total = stats_local.total_count();
             let elapsed = start.elapsed();
             info!("{request_id} closing connection: active {new_active} total {new_total} duration {elapsed:?}");
-        }).await;
+        });
 
         return jh;
     }
@@ -248,7 +246,7 @@ impl Runner {
         listener: TcpListener,
         listener_config: Arc<Listener>,
         stats: Arc<ListenerStats>,
-        controller: Arc<RwLock<Controller>>,
+        mut listener_controller: Controller,
         ca: LocalCa,
     ) -> Result<()> {
         let name = Arc::new(name);
@@ -259,13 +257,15 @@ impl Runner {
                     let conn_id = RequestId::new();
                     let ext = Extensible::of(socket);
                     ext.extend(conn_id).await;
+                    let connection_controller = listener_controller.child();
                     let join_handle = Self::handle_new_socket(
                         Arc::clone(&name),
                         ext,
                         addr,
                         Arc::clone(&listener_config),
                         Arc::clone(&stats),
-                        Arc::clone(&controller),
+                        &mut listener_controller,
+                        connection_controller,
                         ca.clone(),
                     )
                     .await;
@@ -564,36 +564,32 @@ impl Runner {
         idle_tracker: Arc<Mutex<IdleTracker>>,
         root_context: Arc<RwLock<Controller>>,
     ) -> JoinHandle<Option<()>> {
-        root_context
-            .write()
-            .await
-            .spawn(async move {
-                loop {
-                    if jh1.is_finished() || jh2.is_finished() {
-                        if !jh1.is_finished() {
-                            info!("{conn_id} abort upload as download stopped");
-                            jh1.abort();
-                        }
-                        if !jh2.is_finished() {
-                            info!("{conn_id} abort download as upload stopped");
-                            jh2.abort();
-                        }
-                        break;
+        root_context.write().await.spawn(async move {
+            loop {
+                if jh1.is_finished() || jh2.is_finished() {
+                    if !jh1.is_finished() {
+                        info!("{conn_id} abort upload as download stopped");
+                        jh1.abort();
                     }
-                    if idle_tracker.lock().await.is_expired() {
-                        info!("{conn_id} idle time out. aborting.");
-                        if !jh1.is_finished() {
-                            jh1.abort();
-                        }
-                        if !jh2.is_finished() {
-                            jh2.abort();
-                        }
-                        break;
+                    if !jh2.is_finished() {
+                        info!("{conn_id} abort download as upload stopped");
+                        jh2.abort();
                     }
-                    sleep(Duration::from_millis(500)).await;
+                    break;
                 }
-            })
-            .await
+                if idle_tracker.lock().await.is_expired() {
+                    info!("{conn_id} idle time out. aborting.");
+                    if !jh1.is_finished() {
+                        jh1.abort();
+                    }
+                    if !jh2.is_finished() {
+                        jh2.abort();
+                    }
+                    break;
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+        })
     }
     async fn pipe<R, W>(
         request_id: Arc<RequestId>,
@@ -616,45 +612,41 @@ impl Runner {
             true => "upload",
             false => "download",
         };
-        controller
-            .write()
-            .await
-            .spawn(async move {
-                let mut buf = vec![0; 4096];
+        controller.write().await.spawn(async move {
+            let mut buf = vec![0; 4096];
 
-                loop {
-                    let nr = reader.read(&mut buf).await;
-                    if nr.is_err() {
+            loop {
+                let nr = reader.read(&mut buf).await;
+                if nr.is_err() {
+                    break;
+                }
+
+                let n = nr.unwrap();
+                if n == 0 {
+                    break;
+                }
+
+                limiter.consume(n).await;
+                let write_result = writer.write_all(&buf[0..n]).await;
+                match write_result {
+                    Err(_) => {
                         break;
                     }
-
-                    let n = nr.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-
-                    limiter.consume(n).await;
-                    let write_result = writer.write_all(&buf[0..n]).await;
-                    match write_result {
-                        Err(_) => {
-                            break;
+                    Ok(_) => {
+                        counter.fetch_add(n as u64, Ordering::SeqCst);
+                        if is_upload {
+                            context.increase_uploaded_bytes(n);
+                            active_tracker::add_uploaded(&request_id, n as u64).await;
+                        } else {
+                            context.increase_downloaded_bytes(n);
+                            active_tracker::add_downloaded(&request_id, n as u64).await;
                         }
-                        Ok(_) => {
-                            counter.fetch_add(n as u64, Ordering::SeqCst);
-                            if is_upload {
-                                context.increase_uploaded_bytes(n);
-                                active_tracker::add_uploaded(&request_id, n as u64).await;
-                            } else {
-                                context.increase_downloaded_bytes(n);
-                                active_tracker::add_downloaded(&request_id, n as u64).await;
-                            }
-                            idle_tracker.lock().await.mark();
-                        }
+                        idle_tracker.lock().await.mark();
                     }
                 }
-                info!("{request_id} {direction} ended");
-            })
-            .await
+            }
+            info!("{request_id} {direction} ended");
+        })
     }
 }
 

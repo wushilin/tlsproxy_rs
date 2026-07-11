@@ -14,6 +14,7 @@ use time::OffsetDateTime;
 
 use crate::certificate::{self, CertificatePaths};
 use crate::config::{Config, LocalCaConfig};
+use crate::controller::Controller;
 
 pub const LEAF_VALIDITY_DAYS: u32 = 365;
 pub const EVICT_WITHIN_HOURS: i64 = 72;
@@ -119,14 +120,15 @@ impl LocalCa {
         }
     }
 
-    pub fn spawn_eviction_job(&self) {
+    pub fn spawn_eviction_job(&self, controller: &mut Controller) {
         let ca = self.clone();
-        tokio::spawn(async move {
+        drop(controller.spawn(async move {
+            ca.evict_expiring();
             loop {
                 tokio::time::sleep(EVICTION_INTERVAL).await;
                 ca.evict_expiring();
             }
-        });
+        }));
     }
 
     pub fn server_config_with_resolver(

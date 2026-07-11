@@ -18,6 +18,12 @@ if ! rustup target list --installed | grep -qx "$TARGET"; then
   exit 1
 fi
 
+if [ "$TARGET" = "x86_64-unknown-linux-musl" ] && ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
+  echo "Musl C compiler 'x86_64-linux-musl-gcc' is not installed." >&2
+  echo "Install it with: sudo apt-get install musl-tools" >&2
+  exit 1
+fi
+
 echo "Building release binary for $TARGET"
 cargo build --locked --release --target "$TARGET"
 echo "Done: target/$TARGET/release/tlsproxy"

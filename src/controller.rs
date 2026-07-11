@@ -1,10 +1,10 @@
-use std::{future::Future, sync::Arc};
+use std::future::Future;
 
-use tokio::{sync::RwLock, task::JoinHandle};
-use tokio_context::task::TaskController;
+use tokio::task::JoinHandle;
+use tokio_tree_context::Context;
 
 pub struct Controller {
-    inner: Arc<RwLock<Option<TaskController>>>,
+    inner: Context,
 }
 
 impl Default for Controller {
@@ -16,46 +16,27 @@ impl Default for Controller {
 impl Controller {
     pub fn new() -> Self {
         return Self {
-            inner: Arc::new(RwLock::new(Some(TaskController::new()))),
+            inner: Context::new(),
         };
     }
 
     /// Cancelled controller will be refreshed. It can be reused again since this point
-    pub async fn cancel(&mut self) {
-        let mut target = self.inner.write().await;
-        let ctrl = target.replace(TaskController::new());
-        match ctrl {
-            Some(inner) => {
-                inner.cancel();
-            }
-            None => {
-                panic!("controller has no inner controller!");
-            }
-        }
+    pub fn cancel(&mut self) {
+        let old = std::mem::replace(&mut self.inner, Context::new());
+        drop(old);
     }
 
-    pub async fn spawn<T>(&mut self, future: T) -> JoinHandle<Option<T::Output>>
+    pub fn spawn<T>(&mut self, future: T) -> JoinHandle<Option<T::Output>>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static,
     {
-        let mut controller_mut = self.inner.write().await;
-        match controller_mut.as_mut() {
-            Some(ctx) => {
-                let result = ctx.spawn(future);
-                return result;
-            }
-            None => {
-                panic!("can't spawn when context is not initialized!")
-            }
-        }
+        self.inner.spawn(future)
     }
-}
 
-impl Clone for Controller {
-    fn clone(&self) -> Self {
+    pub fn child(&mut self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
+            inner: self.inner.new_child_context(),
         }
     }
 }

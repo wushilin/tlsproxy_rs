@@ -1,8 +1,8 @@
 use regex::Regex;
 use serde_derive::{Deserialize, Serialize};
 use serde_yaml_ng;
-use std::collections::HashMap;
 use std::error::Error;
+use std::{collections::HashMap, path::Path};
 use tokio::fs;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -177,7 +177,7 @@ impl Default for AdminServerConfig {
     }
 }
 impl Config {
-    pub async fn load_file(filename: &str) -> Result<Config, Box<dyn Error>> {
+    pub async fn load_file<P: AsRef<Path>>(filename: P) -> Result<Config, Box<dyn Error>> {
         let content = fs::read_to_string(filename).await?;
 
         let config: Config = serde_yaml_ng::from_str(&content)?;
