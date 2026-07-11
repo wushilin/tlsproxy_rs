@@ -236,8 +236,39 @@ pub enum ListenerMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rules {
     pub static_hosts: Vec<String>,
-    #[serde(with = "serde_regex")]
+    #[serde(with = "ci_regex")]
     pub patterns: Vec<Regex>,
+}
+
+/// (De)serializes listener patterns as strings, compiling them
+/// case-insensitively so hostnames match regardless of case (SNI hostnames
+/// are matched the same way as `static_hosts`). The pattern string is stored
+/// unchanged, so configs round-trip without gaining an implicit `(?i)`.
+mod ci_regex {
+    use regex::{Regex, RegexBuilder};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(patterns: &[Regex], serializer: S) -> Result<S::Ok, S::Error> {
+        patterns
+            .iter()
+            .map(Regex::as_str)
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Regex>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .iter()
+            .map(|pattern| {
+                RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|cause| {
+                        serde::de::Error::custom(format!("invalid regex `{pattern}`: {cause}"))
+                    })
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -356,6 +387,32 @@ dns: {}
             mode: ListenerMode::Passthrough,
             upstream_tls: false,
         }
+    }
+
+    #[test]
+    fn listener_patterns_match_case_insensitively() {
+        let yaml = r#"
+listeners:
+  web:
+    bind: 127.0.0.1:1443
+    target_port: 443
+    policy: ALLOW
+    rules:
+      static_hosts: []
+      patterns: ['^api\d+\.example$', '(?i)^legacy\.example$']
+options:
+  log_config_file: ""
+dns: {}
+"#;
+        let config = Config::load_string(yaml).expect("pattern configuration should parse");
+        let web = &config.listeners["web"];
+        assert!(web.is_allowed("API7.EXAMPLE"));
+        assert!(web.is_allowed("Legacy.Example"));
+        assert!(!web.is_allowed("other.example"));
+
+        let yaml_out = serde_yaml_ng::to_string(&config).expect("configuration should serialize");
+        assert!(yaml_out.contains(r"^api\d+\.example$"));
+        assert!(!yaml_out.contains(r"(?i)^api"));
     }
 
     #[test]

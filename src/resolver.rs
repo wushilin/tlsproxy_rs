@@ -54,6 +54,12 @@ fn split_host_port(value: &str) -> (String, Option<u16>) {
     (value.to_lowercase(), None)
 }
 
+/// Compiles a DNS regex rule pattern. Hostnames are lowercased before
+/// matching, and patterns compile case-insensitively so casing never matters.
+pub fn compile_dns_pattern(pattern: &str) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern).case_insensitive(true).build()
+}
+
 pub async fn init(config: &Config) {
     info!("initializing DNS override");
     let count = init_inner(&config.dns).await;
@@ -101,10 +107,7 @@ async fn init_inner(dns: &DnsConfig) -> usize {
         .sort_by_key(|rule| (rule.port.is_none(), std::cmp::Reverse(rule.base.len())));
 
     for rule in &dns.regex {
-        let pattern = RegexBuilder::new(&rule.hostname)
-            .case_insensitive(true)
-            .build();
-        match pattern {
+        match compile_dns_pattern(&rule.hostname) {
             Ok(pattern) => {
                 info!(
                     "DNS rule: regex {} (port {:?}) -> {}",

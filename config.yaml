@@ -1,16 +1,4 @@
 listeners:
-  test80:
-    bind: 0.0.0.0:1080
-    target: www.google.com:443,www.baidu.com:443
-    target_port: 80
-    policy: DENY
-    rules:
-      static_hosts: []
-      patterns: []
-    max_idle_time_ms: 3600000
-    speed_limit: 0.0
-    mode: forward
-    upstream_tls: true
   '1443':
     bind: 0.0.0.0:1443
     target: ''
@@ -22,6 +10,18 @@ listeners:
     max_idle_time_ms: 3600000
     speed_limit: 0.0
     mode: terminate
+    upstream_tls: true
+  test80:
+    bind: 0.0.0.0:1080
+    target: www.google.com:443,www.baidu.com:443
+    target_port: 80
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns: []
+    max_idle_time_ms: 3600000
+    speed_limit: 0.0
+    mode: forward
     upstream_tls: true
 options:
   log_config_file: log4rs.yaml

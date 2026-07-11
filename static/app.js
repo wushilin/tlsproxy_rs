@@ -849,7 +849,6 @@ function validateConfiguration() {
   }
   for (const rule of state.dns.regex) {
     if (!rule.hostname?.trim()) return 'A regex DNS rule is missing its hostname pattern.';
-    try { new RegExp(rule.hostname); } catch (_) { return `Invalid DNS regex: ${rule.hostname}`; }
     if (rule.port != null && (!Number.isInteger(rule.port) || rule.port < 1 || rule.port > 65535)) {
       return `DNS regex rule ${rule.hostname} has an invalid port.`;
     }
@@ -872,9 +871,8 @@ function validateListener(name, listener) {
   }
   if (listener.mode !== 'forward') {
     if (!['ALLOW', 'DENY'].includes(listener.policy)) return `Listener ${name} has an invalid policy.`;
-    for (const pattern of listener.rules?.patterns || []) {
-      try { new RegExp(pattern); } catch (_) { return `Listener ${name} has an invalid regex: ${pattern}`; }
-    }
+    // Regex patterns are validated server-side: the backend uses Rust's regex
+    // dialect, which JavaScript's RegExp would falsely reject (e.g. `(?i)`).
   }
   return null;
 }
