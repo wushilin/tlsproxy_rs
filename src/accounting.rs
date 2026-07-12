@@ -1,9 +1,12 @@
-use crate::config::{Compression, ListenerMode, AccountingConfig};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, OnceLock},
+};
+
+use crate::config::{AccountingConfig, Compression, ListenerMode};
 use anyhow::anyhow;
 use log::{error, warn};
 use tokio::sync::{mpsc, oneshot};
@@ -323,6 +326,9 @@ pub async fn init(cfg: &AccountingConfig) -> anyhow::Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
+    if SENDER.get().is_some() {
+        return Err(anyhow!("accounting already initialized"));
+    }
     cfg.validate().map_err(|cause| anyhow!(cause))?;
     let rotate_size = cfg.rotate_size_bytes().map_err(|cause| anyhow!(cause))?;
     let log_path = PathBuf::from(&cfg.log_file);
@@ -330,25 +336,32 @@ pub async fn init(cfg: &AccountingConfig) -> anyhow::Result<()> {
     let compress_after = cfg.compress_after;
     let compression = cfg.compression;
     let gate = writer.compress_gate();
+    let handle = tokio::runtime::Handle::current();
     // startup scan
     prune(&log_path, cfg.max_keep)?;
     let leftovers = compression_candidates(&log_path, compress_after, compression);
     if !leftovers.is_empty() {
-        spawn_compression(leftovers, compression, Arc::clone(&gate));
+        spawn_compression(leftovers, compression, Arc::clone(&gate), &handle);
     }
     let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
     SENDER
         .set(tx)
         .map_err(|_| anyhow!("accounting already initialized"))?;
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+    let loop_handle = handle.clone();
+    tokio::task::spawn_blocking(move || {
+        while let Some(msg) = rx.blocking_recv() {
             match msg {
                 Msg::Record(record) => match writer.write_record(&record.to_csv_line()) {
                     Ok(true) => {
                         let candidates =
                             compression_candidates(&log_path, compress_after, compression);
                         if !candidates.is_empty() {
-                            spawn_compression(candidates, compression, writer.compress_gate());
+                            spawn_compression(
+                                candidates,
+                                compression,
+                                writer.compress_gate(),
+                                &loop_handle,
+                            );
                         }
                     }
                     Ok(false) => {}
@@ -358,6 +371,11 @@ pub async fn init(cfg: &AccountingConfig) -> anyhow::Result<()> {
                 },
                 Msg::Flush(ack) => {
                     let _ = ack.send(());
+                    // Flush only comes from `shutdown()`: exit so the blocking
+                    // task completes and runtime teardown does not wait on a
+                    // `blocking_recv` that can never return (the sender lives
+                    // in the global SENDER and is never dropped).
+                    break;
                 }
             }
         }
@@ -365,7 +383,8 @@ pub async fn init(cfg: &AccountingConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Waits until every record submitted so far has been written and flushed.
+/// Waits until every record submitted so far has been written and flushed,
+/// then stops the writer loop (records submitted afterwards are dropped).
 /// Uses the awaiting `send` (not `try_send`) so the flush marker queues even
 /// when the channel is momentarily full.
 pub async fn shutdown() {
@@ -379,11 +398,16 @@ pub async fn shutdown() {
 
 /// At most one compression batch runs at a time; the shared gate bars
 /// rotation for its whole duration.
-fn spawn_compression(candidates: Vec<PathBuf>, compression: Compression, gate: Arc<AtomicBool>) {
+fn spawn_compression(
+    candidates: Vec<PathBuf>,
+    compression: Compression,
+    gate: Arc<AtomicBool>,
+    handle: &tokio::runtime::Handle,
+) {
     if gate.swap(true, Ordering::SeqCst) {
         return;
     }
-    tokio::task::spawn_blocking(move || {
+    handle.spawn_blocking(move || {
         for path in candidates {
             if let Err(cause) = compress_file(&path, compression) {
                 warn!("accounting: failed to compress {}: {cause}", path.display());
@@ -623,9 +647,6 @@ mod tests {
             compress_after: 3,
             compression: Compression::None,
         };
-        assert!(!enabled());
-        init(&cfg).await.unwrap();
-        assert!(enabled());
         let record = CdrRecord {
             listener_type: ListenerType::TlsTerminate,
             connection_id: "abc(7)".into(),
@@ -640,6 +661,10 @@ mod tests {
             start_unix_ms: 0,
             end_unix_ms: 1,
         };
+        assert!(!enabled());
+        submit(record.clone()); // never-initialized: silently dropped
+        init(&cfg).await.unwrap();
+        assert!(enabled());
         submit(record.clone());
         submit(record);
         shutdown().await;
