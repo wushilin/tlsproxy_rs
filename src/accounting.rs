@@ -1,6 +1,6 @@
-use crate::config::ListenerMode;
+use crate::config::{Compression, ListenerMode};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -244,11 +244,57 @@ fn prune(log_path: &Path, keep_upto: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// Compresses `path` to `<path>.zst` / `<path>.gz` and removes the raw file.
+/// Overwrites a partial output left by an earlier crash. No-op for `None`.
+pub fn compress_file(path: &Path, compression: Compression) -> io::Result<()> {
+    let Some(extension) = compression.extension() else {
+        return Ok(());
+    };
+    let mut output_name = path.file_name().unwrap_or_default().to_os_string();
+    output_name.push(format!(".{extension}"));
+    let output_path = path.with_file_name(output_name);
+    let input = io::BufReader::new(File::open(path)?);
+    match compression {
+        Compression::Gzip => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(File::create(&output_path)?, flate2::Compression::default());
+            let mut input = input;
+            io::copy(&mut input, &mut encoder)?;
+            encoder.finish()?;
+        }
+        Compression::Zstd => {
+            zstd::stream::copy_encode(input, File::create(&output_path)?, 0)?;
+        }
+        Compression::None => unreachable!("extension() returned Some"),
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+/// Uncompressed rotated files that sit past the `compress_after` boundary,
+/// in ascending index order. Compressed files are never revisited.
+pub fn compression_candidates(
+    log_path: &Path,
+    compress_after: usize,
+    compression: Compression,
+) -> Vec<PathBuf> {
+    if compression == Compression::None {
+        return Vec::new();
+    }
+    let mut candidates: Vec<RotatedFile> = rotated_files(log_path)
+        .into_iter()
+        .filter(|file| file.suffix.is_none() && file.index > compress_after)
+        .collect();
+    candidates.sort_by_key(|file| file.index);
+    candidates.into_iter().map(|file| file.path).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ListenerMode;
+    use crate::config::{Compression, ListenerMode};
     use std::fs;
+    use std::io::Read;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -404,5 +450,60 @@ mod tests {
         let rotated = fs::read_to_string(dir.path().join("cdr.log.1")).unwrap();
         assert_eq!(rotated, format!("{CSV_HEADER}\nrow-a\nrow-b\nrow-c\n"));
         assert_eq!(fs::read_to_string(&log_path).unwrap(), format!("{CSV_HEADER}\n"));
+    }
+
+    #[test]
+    fn compress_file_zstd_roundtrips_and_removes_raw() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path().join("cdr.log.4");
+        fs::write(&raw, "some,cdr,content\n").unwrap();
+        compress_file(&raw, Compression::Zstd).unwrap();
+        assert!(!raw.exists());
+        let compressed = dir.path().join("cdr.log.4.zst");
+        let decoded = zstd::stream::decode_all(fs::File::open(&compressed).unwrap()).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "some,cdr,content\n");
+    }
+
+    #[test]
+    fn compress_file_gzip_roundtrips_and_removes_raw() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path().join("cdr.log.4");
+        fs::write(&raw, "gzip,cdr,content\n").unwrap();
+        compress_file(&raw, Compression::Gzip).unwrap();
+        assert!(!raw.exists());
+        let compressed = dir.path().join("cdr.log.4.gz");
+        let mut decoder = flate2::read::GzDecoder::new(fs::File::open(&compressed).unwrap());
+        let mut decoded = String::new();
+        decoder.read_to_string(&mut decoded).unwrap();
+        assert_eq!(decoded, "gzip,cdr,content\n");
+    }
+
+    #[test]
+    fn compress_file_none_is_a_noop() {
+        let dir = tempdir().unwrap();
+        let raw = dir.path().join("cdr.log.4");
+        fs::write(&raw, "content").unwrap();
+        compress_file(&raw, Compression::None).unwrap();
+        assert!(raw.exists());
+    }
+
+    #[test]
+    fn compression_candidates_picks_uncompressed_past_boundary_only() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("cdr.log");
+        fs::write(dir.path().join("cdr.log.1"), "x").unwrap();
+        fs::write(dir.path().join("cdr.log.3"), "x").unwrap();
+        fs::write(dir.path().join("cdr.log.4"), "x").unwrap();
+        fs::write(dir.path().join("cdr.log.5.zst"), "x").unwrap();
+        fs::write(dir.path().join("cdr.log.6.gz"), "x").unwrap();
+        fs::write(dir.path().join("cdr.log.7"), "x").unwrap();
+        let candidates = compression_candidates(&log_path, 3, Compression::Zstd);
+        assert_eq!(
+            candidates,
+            vec![dir.path().join("cdr.log.4"), dir.path().join("cdr.log.7")],
+            "only uncompressed files past the boundary, ascending; compressed never touched"
+        );
+        assert!(compression_candidates(&log_path, 3, Compression::None).is_empty());
+        assert!(compression_candidates(&log_path, 10, Compression::Zstd).is_empty());
     }
 }
