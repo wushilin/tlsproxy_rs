@@ -70,9 +70,11 @@ writer drains its queue and flushes.
 New module `src/accounting.rs`, following the global-module style of
 `active_tracker`:
 
-- Connection tasks build a `CdrRecord` and send it over an unbounded mpsc
-  channel. The send is non-blocking; if the channel is closed or accounting
-  is disabled, the record is dropped (with a warning for the closed case).
+- Connection tasks build a `CdrRecord` and send it over a bounded mpsc
+  channel with a capacity of 100,000 records (tokio allocates the buffer
+  lazily, so an idle queue costs no memory). The send is non-blocking
+  (`try_send`); if the channel is full or closed, or accounting is disabled,
+  the record is dropped (with a warning for the full/closed cases).
   Accounting must never stall proxying.
 - A single writer task owns the active file. Writes are therefore serialized
   without any lock on the data path.
