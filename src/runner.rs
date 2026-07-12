@@ -1,3 +1,4 @@
+use crate::accounting::{self, CdrRecord, ConnStatus, ListenerType};
 use crate::active_tracker;
 use crate::ca::LocalCa;
 use crate::controller::Controller;
@@ -10,7 +11,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -292,8 +293,9 @@ impl Runner {
             let start = Instant::now();
             active_tracker::put(&request_id, &name, remote_address).await;
             let stats_local_clone = Arc::clone(&stats_local);
+            let listener_mode = listener_config.mode;
             let rr = Self::worker(
-                name,
+                Arc::clone(&name),
                 ext,
                 listener_config,
                 stats_local_clone,
@@ -305,7 +307,29 @@ impl Runner {
                 let err = rr.err().unwrap();
                 warn!("{request_id} connection error: {err}");
             }
-            active_tracker::remove(&request_id).await;
+            let closed = active_tracker::remove(&request_id).await;
+            if let Some(closed) = closed {
+                if accounting::enabled() {
+                    let end_unix_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_millis())
+                        .unwrap_or_default();
+                    accounting::submit(CdrRecord {
+                        listener_type: ListenerType::from_mode(listener_mode),
+                        connection_id: request_id.to_string(),
+                        listener_name: (*name).clone(),
+                        sni: closed.sni,
+                        target_host: closed.target_host,
+                        target_endpoint: closed.target_endpoint,
+                        remote_address: closed.remote_address.to_string(),
+                        status: closed.status,
+                        uploaded_bytes: closed.uploaded_bytes,
+                        downloaded_bytes: closed.downloaded_bytes,
+                        start_unix_ms: closed.started_at_unix_ms,
+                        end_unix_ms,
+                    });
+                }
+            }
             new_active = stats_local.decrease_conn_count();
             new_total = stats_local.total_count();
             let elapsed = start.elapsed();
@@ -413,9 +437,13 @@ impl Runner {
         let header_len = client_hello.buffered.len();
         let sni_target = client_hello.sni_host;
         info!("{conn_id} sni target is {sni_target}");
+        active_tracker::set_sni(&conn_id, &sni_target).await;
+        context.increase_uploaded_bytes(header_len);
+        active_tracker::add_uploaded(&conn_id, header_len as u64).await;
         let selected =
             Self::resolve_target(&listener_config, &sni_target, true, &sni_target, &conn_id)
                 .await?;
+        active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint).await;
         // Record the random before connecting: in a direct loop the hello can
         // arrive back on our listener before the connect call returns.
         hello_cache::insert(client_hello.random);
@@ -425,11 +453,10 @@ impl Runner {
         )
         .await??;
         info!("{conn_id} connected to TLS upstream {}", selected.endpoint);
+        active_tracker::set_status(&conn_id, ConnStatus::Ok).await;
         let (client_read, client_write) = tokio::io::split(ext);
         let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
         upstream_write.write_all(&client_hello.buffered).await?;
-        context.increase_uploaded_bytes(header_len);
-        active_tracker::add_uploaded(&conn_id, header_len as u64).await;
         Self::relay(
             conn_id,
             client_read,
@@ -465,6 +492,7 @@ impl Runner {
             .ok_or_else(|| anyhow!("TLS client did not provide SNI"))?
             .to_string();
         info!("{conn_id} received TLS ClientHello for SNI target {sni_target}");
+        active_tracker::set_sni(&conn_id, &sni_target).await;
         let selected = Self::resolve_target(
             &listener_config,
             &sni_target,
@@ -473,6 +501,7 @@ impl Runner {
             &conn_id,
         )
         .await?;
+        active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint).await;
         let certified_key = ca.resolve_or_mint(&sni_target)?;
         let server_config = Arc::new(
             rustls::ServerConfig::builder()
@@ -495,6 +524,7 @@ impl Runner {
         )
         .await??;
         info!("{conn_id} connected to upstream {}", selected.endpoint);
+        active_tracker::set_status(&conn_id, ConnStatus::Ok).await;
         let (client_read, client_write) = tokio::io::split(tls_stream);
         if listener_config.upstream_tls {
             let upstream = connect_trust_all_tls(upstream, &sni_target).await?;
@@ -544,6 +574,7 @@ impl Runner {
         let resolved = crate::forward::choose_online(&name)
             .await
             .ok_or_else(|| anyhow!("no online forward backends"))?;
+        active_tracker::set_target(&conn_id, &resolved.tls_server_name, &resolved.endpoint).await;
         let upstream = tokio::time::timeout(
             Duration::from_secs(5),
             TcpStream::connect(&resolved.endpoint),
@@ -553,6 +584,7 @@ impl Runner {
             "{conn_id} connected to forward upstream {}",
             resolved.endpoint
         );
+        active_tracker::set_status(&conn_id, ConnStatus::Ok).await;
         let (client_read, client_write) = tokio::io::split(ext);
         if listener_config.upstream_tls {
             let upstream = connect_trust_all_tls(upstream, &resolved.tls_server_name).await?;
@@ -630,6 +662,7 @@ impl Runner {
             }
             false => {
                 info!("{conn_id} {sni_target} denied by ACL");
+                active_tracker::set_status(conn_id, ConnStatus::Denied).await;
                 return Err(anyhow!("{sni_target} denied by ACL"));
             }
         }
@@ -784,6 +817,14 @@ impl Runner {
                     break;
                 }
 
+                counter.fetch_add(n as u64, Ordering::SeqCst);
+                if is_upload {
+                    context.increase_uploaded_bytes(n);
+                    active_tracker::add_uploaded(&request_id, n as u64).await;
+                } else {
+                    context.increase_downloaded_bytes(n);
+                    active_tracker::add_downloaded(&request_id, n as u64).await;
+                }
                 limiter.consume(n).await;
                 let write_result = writer.write_all(&buf[0..n]).await;
                 match write_result {
@@ -791,14 +832,6 @@ impl Runner {
                         break;
                     }
                     Ok(_) => {
-                        counter.fetch_add(n as u64, Ordering::SeqCst);
-                        if is_upload {
-                            context.increase_uploaded_bytes(n);
-                            active_tracker::add_uploaded(&request_id, n as u64).await;
-                        } else {
-                            context.increase_downloaded_bytes(n);
-                            active_tracker::add_downloaded(&request_id, n as u64).await;
-                        }
                         idle_tracker.lock().await.mark();
                     }
                 }
@@ -1151,5 +1184,75 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(error.to_string().contains("self-connection loop"));
+    }
+
+    #[tokio::test]
+    async fn denied_connection_tracks_sni_status_and_client_hello_bytes() {
+        let config = RustlsClientConfig::builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut connection = ClientConnection::new(Arc::new(config), server_name).unwrap();
+        let mut hello_bytes = Vec::new();
+        connection
+            .write_tls(&mut Cursor::new(&mut hello_bytes))
+            .unwrap();
+
+        let listener = Arc::new(Listener {
+            bind: "127.0.0.1:0".into(),
+            target: None,
+            target_port: 443,
+            policy: Policy::ALLOW,
+            rules: Rules {
+                static_hosts: vec![],
+                patterns: vec![],
+            },
+            max_idle_time_ms: Some(5_000),
+            speed_limit: Some(0.0),
+            mode: ListenerMode::Passthrough,
+            upstream_tls: false,
+        });
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let request_id = RequestId::new();
+        let request_id_for_task = request_id.clone();
+        let stats = Arc::new(ListenerStats::new("deny-test", 5_000));
+        let proxy_task = tokio::spawn(async move {
+            let (socket, addr) = proxy.accept().await.unwrap();
+            active_tracker::put(&request_id_for_task, "deny-test", addr).await;
+            let ext = Extensible::of(socket);
+            ext.extend(request_id_for_task).await;
+            Runner::worker_passthrough(
+                Arc::new("deny-test".into()),
+                ext,
+                listener,
+                stats,
+                Arc::new(RwLock::new(Controller::new())),
+            )
+            .await
+        });
+
+        let mut socket = TcpStream::connect(proxy_address).await.unwrap();
+        socket.write_all(&hello_bytes).await.unwrap();
+
+        let error = timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("denied by ACL"));
+        let closed = active_tracker::remove(&request_id)
+            .await
+            .expect("denied connection should still be tracked");
+        assert_eq!(closed.status, crate::accounting::ConnStatus::Denied);
+        assert_eq!(closed.sni, "localhost");
+        assert!(
+            closed.uploaded_bytes > 0,
+            "client hello bytes must be billed even when denied"
+        );
+        assert_eq!(
+            closed.target_endpoint, "",
+            "denied before any target was chosen"
+        );
     }
 }

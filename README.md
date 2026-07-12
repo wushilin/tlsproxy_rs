@@ -142,6 +142,30 @@ admin_server:
 
 ```
 
+## Accounting (CDR log)
+
+When enabled, every client connection writes one CSV line on close, suitable
+for usage accounting by SNI, listener, or target:
+
+```yaml
+accounting:
+  enabled: true
+  log_file: cdr.log
+  rotate_size: 18MiB   # bytes, or KiB/MiB/GiB
+  max_keep: 10         # rotated files kept
+  compress_after: 3    # cdr.log.1..3 stay raw; cdr.log.4+ are compressed
+  compression: zstd    # zstd (default) | gzip | none
+```
+
+Columns: `listener_type, connection_id, listener_name, sni, target_host,
+target_endpoint, remote_address, status, uploaded_bytes, downloaded_bytes,
+connection_start, connection_end`. `uploaded_bytes` counts bytes received from
+the client, and `downloaded_bytes` counts bytes received from upstream.
+`status` is `OK`, `DENIED` (ACL), or `CONNECT_FAILED`. Rotation is
+logrotate-style (`.1` is newest); rotated files past `compress_after` are
+compressed in-process. Records are written when a connection ends; connections
+open when the process is killed are lost.
+
 Terminating listeners mint a leaf certificate on demand for the exact SNI in
 the client ClientHello, after the listener ACL allows that SNI. These ad-hoc
 certificates are cached in memory and are not written to disk. With

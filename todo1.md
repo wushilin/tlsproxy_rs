@@ -1,8 +1,8 @@
-# Resume: Accounting CDR Log (paused 2026-07-12 after Task 5 of 8)
+# Resume: Accounting CDR Log (resumed 2026-07-12; Tasks 6-8 complete)
 
 Feature: per-connection CSV accounting records (CDR) with size-rotated,
-compressed log files. Paused at a clean boundary — Tasks 1–5 done, reviewed,
-approved; Tasks 6–8 + final review remain.
+compressed log files. Tasks 1–5 were already done; this resume completed Tasks
+6–8 in the working tree. Final review/commit packaging remains.
 
 ## Where everything lives
 
@@ -12,20 +12,15 @@ approved; Tasks 6–8 + final review remain.
 - **Progress ledger:** `.superpowers/sdd/progress.md` (git-ignored scratch — Tasks 1–5 marked complete with commit ranges; do NOT re-dispatch those)
 - **Task briefs/reports so far:** `.superpowers/sdd/task-{1..5}-{brief,report}.md`
 
-## How to resume
+## Current verification
 
-Use the `superpowers:subagent-driven-development` skill, resuming at **Task 6**
-(active_tracker extension). Per-task flow: `scripts/task-brief PLAN 6` →
-dispatch implementer subagent → `scripts/review-package BASE HEAD` → dispatch
-task reviewer → fix loop if needed → append to ledger. Then Task 7, Task 8,
-then the final whole-branch review (`scripts/review-package $(git merge-base
-main HEAD) HEAD`, most capable model), then `superpowers:finishing-a-development-branch`.
+- `cargo test` — 58/58 passed.
+- `cargo build` — clean dev build.
+- `cargo build --release` — clean release build.
+- Smoke test with `/tmp/tlsproxy-accounting-smoke.yaml` produced one CDR row:
+  `TLS_PASSTHROUGH,...,smoke,localhost,,,127.0.0.1:...,DENIED,1557,0,...`.
 
-Focused test command in this crate: `cargo test accounting` (no lib target —
-plain `cargo test <filter>`). Full suite currently 54/54 green, `cargo check`
-clean.
-
-## State: Tasks 1–5 complete (commits f6765b4..04427dc)
+## State: Tasks 1–8 complete in working tree
 
 1. **Config** — `accounting` block in `src/config.rs`: `AccountingConfig`
    (enabled/log_file/rotate_size/max_keep/compress_after/compression),
@@ -41,6 +36,15 @@ clean.
    success), `compression_candidates` (uncompressed, index > compress_after).
 5. **Global writer** — `init`/`enabled`/`submit`/`shutdown`; bounded channel
    `QUEUE_CAPACITY = 100_000`, non-blocking `try_send`.
+6. **Active tracker dimensions** — `src/active_tracker.rs` tracks `sni`,
+   `target_host`, `target_endpoint`, and `status`; setters are no-op for
+   unknown ids; `remove` returns `Option<ClosedConnection>`.
+7. **Runner integration** — `src/runner.rs` fills SNI/target/status, marks ACL
+   denials as `DENIED`, marks connected upstreams as `OK`, counts bytes on read,
+   and emits a CDR from `handle_new_socket` after removing the active entry.
+8. **Startup/docs** — `src/main.rs` initializes accounting after config load and
+   shuts it down before graceful exit; `README.md` documents the accounting
+   block and CSV semantics.
 
 ## Deviations from the plan discovered in Task 5 (plan text NOT updated)
 
@@ -61,18 +65,10 @@ trust the code on the branch, not the plan's Task 5 listing:
   `global_init_submit_shutdown_writes_records` (process-wide OnceLock) — Task 7/8
   must NOT call `accounting::init` in tests.
 
-## Remaining tasks (details + full code in the plan)
+## Remaining tasks
 
-- **Task 6:** extend `src/active_tracker.rs` — sni/target_host/target_endpoint/
-  status fields, `set_sni`/`set_target`/`set_status`, `remove` returns
-  `Option<ClosedConnection>`.
-- **Task 7:** `src/runner.rs` integration — workers fill dimensions, ACL denial
-  sets `Denied`, upstream-connect success sets `Ok`, byte counting moves to the
-  read side of `pipe`, `handle_new_socket` builds+submits the CDR after
-  `active_tracker::remove`; new denied-connection test.
-- **Task 8:** `src/main.rs` wiring (init after config load, shutdown before
-  Ok(())), README section, end-to-end smoke test with a scratch config in /tmp
-  (do NOT modify repo config.yaml).
+- Final whole-branch review/triage.
+- Commit packaging if desired.
 
 ## Minor findings deferred to final review triage
 

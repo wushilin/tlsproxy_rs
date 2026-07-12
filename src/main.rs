@@ -91,6 +91,11 @@ async fn run(config_path: PathBuf) -> Result<()> {
         .install_default()
         .ok();
     let config = load_config(&config_path).await?;
+    if let Some(accounting_config) = &config.accounting {
+        accounting::init(accounting_config)
+            .await
+            .context("failed to initialize accounting")?;
+    }
     admin_server::init(&config_path, &config)
         .await
         .map_err(|cause| anyhow::anyhow!("{cause}"))?;
@@ -132,6 +137,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
         info!("Ctrl-C received; stopping listeners");
         manager::stop().await;
     }
+    accounting::shutdown().await;
     Ok(())
 }
 
