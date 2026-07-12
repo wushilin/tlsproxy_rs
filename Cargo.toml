@@ -28,7 +28,7 @@ rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
-time = "0.3"
+time = { version = "0.3", features = ["formatting", "macros"] }
 x509-parser = { version = "0.18", features = ["verify"] }
 lru = "0.18.1"
 tokio-tree-context = "0.1.6"
