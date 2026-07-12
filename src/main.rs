@@ -2,6 +2,7 @@
 #![allow(clippy::option_map_unit_fn)]
 #![allow(clippy::too_many_arguments)]
 
+pub mod accounting;
 pub mod active_tracker;
 pub mod admin_server;
 pub mod ca;
