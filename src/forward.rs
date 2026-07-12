@@ -15,7 +15,8 @@ use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::{mpsc, RwLock};
 use tokio_rustls::TlsConnector;
 
-const RUNTIME_TTL_MS: u128 = 300_000;
+const RUNTIME_TTL_MS: u128 = 600_000;
+const RUNTIME_GROUP_MAX: usize = 1000;
 
 lazy_static! {
     static ref LISTENER_BACKENDS: Arc<RwLock<HashMap<String, Vec<BackendStatusSerde>>>> =
@@ -121,16 +122,21 @@ impl MonitorGroup {
             .collect();
         let candidates = if !online.is_empty() {
             online
-        } else if !unknown.is_empty() {
-            let ipv4_unknown: Vec<_> = unknown
+        } else if !unknown.is_empty() || !endpoints.is_empty() {
+            let fallback = if !unknown.is_empty() {
+                unknown
+            } else {
+                endpoints.iter().collect()
+            };
+            let ipv4: Vec<_> = fallback
                 .iter()
                 .copied()
                 .filter(|endpoint| endpoint_is_ipv4(&endpoint.endpoint))
                 .collect();
-            if !ipv4_unknown.is_empty() {
-                ipv4_unknown
+            if !ipv4.is_empty() {
+                ipv4
             } else {
-                unknown
+                fallback
             }
         } else {
             return None;
@@ -359,6 +365,7 @@ pub fn spawn_global_health_checks(controller: &mut Controller) {
 
 pub async fn check_all_once(check_controller: &mut Controller) {
     evict_expired_runtime_groups().await;
+    evict_excess_runtime_groups().await;
     let groups: Vec<_> = GROUPS.read().await.values().cloned().collect();
     let mut jobs = Vec::new();
     for group in groups {
@@ -428,6 +435,34 @@ async fn evict_expired_runtime_groups() {
         return;
     }
     GROUPS.write().await.retain(|key, _| !expired.contains(key));
+}
+
+async fn evict_excess_runtime_groups() {
+    let groups: Vec<_> = GROUPS.read().await.values().cloned().collect();
+    let mut runtime_groups = Vec::new();
+    for group in groups {
+        if group.owner == Owner::Runtime {
+            runtime_groups.push((group.key.clone(), *group.last_activity_ms.read().await));
+        }
+    }
+    let remove = excess_runtime_groups_to_evict(runtime_groups);
+    if remove.is_empty() {
+        return;
+    }
+    GROUPS.write().await.retain(|key, _| !remove.contains(key));
+}
+
+fn excess_runtime_groups_to_evict(mut runtime_groups: Vec<(GroupKey, u128)>) -> HashSet<GroupKey> {
+    if runtime_groups.len() <= RUNTIME_GROUP_MAX {
+        return HashSet::new();
+    }
+    runtime_groups.sort_by_key(|(_, last_activity_ms)| *last_activity_ms);
+    let remove_count = runtime_groups.len() - RUNTIME_GROUP_MAX;
+    runtime_groups
+        .into_iter()
+        .take(remove_count)
+        .map(|(key, _)| key)
+        .collect()
 }
 
 async fn prune_unreferenced_configured_groups() {
@@ -648,5 +683,114 @@ fn state_name(online: Option<bool>) -> &'static str {
         Some(true) => "up",
         Some(false) => "down",
         None => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_group(owner: Owner, target: &str, endpoints: Vec<EndpointState>) -> MonitorGroup {
+        MonitorGroup {
+            key: GroupKey {
+                target: target.into(),
+                upstream_tls: false,
+            },
+            requested_target: target.into(),
+            effective_host: target
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(target)
+                .into(),
+            effective_port: 443,
+            tls_server_name: target
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(target)
+                .into(),
+            owner,
+            endpoints: RwLock::new(endpoints),
+            last_activity_ms: RwLock::new(now_ms()),
+            rng_state: AtomicU64::new(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn choose_endpoint_falls_back_to_down_endpoints_when_status_is_stale() {
+        let group = test_group(
+            Owner::Runtime,
+            "example.com:443",
+            vec![
+                EndpointState {
+                    endpoint: "[2606:4700:4700::1111]:443".into(),
+                    online: Some(false),
+                    since_ms: now_ms(),
+                },
+                EndpointState {
+                    endpoint: "104.16.248.249:443".into(),
+                    online: Some(false),
+                    since_ms: now_ms(),
+                },
+            ],
+        );
+
+        let selected = group
+            .choose_endpoint()
+            .await
+            .expect("stale down status should not block all candidates");
+
+        assert_eq!(selected.endpoint, "104.16.248.249:443");
+        assert_eq!(selected.tls_server_name, "example.com");
+    }
+
+    #[tokio::test]
+    async fn choose_endpoint_returns_none_only_when_no_endpoints_exist() {
+        let group = test_group(Owner::Runtime, "example.com:443", Vec::new());
+        assert!(group.choose_endpoint().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_forward_endpoint_falls_back_to_down_endpoint_when_status_is_stale() {
+        let group = test_group(
+            Owner::Configured,
+            "example.com:443",
+            vec![EndpointState {
+                endpoint: "127.0.0.1:443".into(),
+                online: Some(false),
+                since_ms: now_ms(),
+            }],
+        );
+
+        let selected = group
+            .choose_endpoint()
+            .await
+            .expect("stale down status should not block configured forward candidates");
+
+        assert_eq!(selected.endpoint, "127.0.0.1:443");
+    }
+
+    #[test]
+    fn runtime_group_cap_evicts_oldest_last_used_entries() {
+        let runtime_groups: Vec<_> = (0..(RUNTIME_GROUP_MAX + 5))
+            .map(|index| {
+                let key = GroupKey {
+                    target: format!("runtime-{index}.example:443"),
+                    upstream_tls: false,
+                };
+                (key, index as u128)
+            })
+            .collect();
+
+        let evicted = excess_runtime_groups_to_evict(runtime_groups);
+
+        assert_eq!(evicted.len(), 5);
+        assert!(evicted.contains(&GroupKey {
+            target: "runtime-0.example:443".into(),
+            upstream_tls: false,
+        }));
+        assert!(!evicted.contains(&GroupKey {
+            target: "runtime-204.example:443".into(),
+            upstream_tls: false,
+        }));
     }
 }

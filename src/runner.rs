@@ -1052,7 +1052,7 @@ mod tests {
         crate::forward::check_all_once(&mut check_controller).await;
         assert!(crate::forward::choose_online("forward-tls-mismatch")
             .await
-            .is_none());
+            .is_some());
         timeout(Duration::from_secs(2), plaintext_as_tls_task)
             .await
             .unwrap()
