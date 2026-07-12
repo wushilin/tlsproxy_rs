@@ -17,6 +17,8 @@ use tokio_rustls::TlsConnector;
 
 const RUNTIME_TTL_MS: u128 = 600_000;
 const RUNTIME_GROUP_MAX: usize = 1000;
+const DNS_CACHE_TTL_MS: u128 = 60_000;
+const DNS_NEGATIVE_CACHE_TTL_MS: u128 = 5_000;
 
 lazy_static! {
     static ref LISTENER_BACKENDS: Arc<RwLock<HashMap<String, Vec<BackendStatusSerde>>>> =
@@ -25,6 +27,14 @@ lazy_static! {
         Arc::new(RwLock::new(HashMap::new()));
     static ref GROUPS: Arc<RwLock<HashMap<GroupKey, Arc<MonitorGroup>>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    static ref DNS_CACHE: Arc<RwLock<HashMap<(String, u16), CachedDns>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+}
+
+#[derive(Debug, Clone)]
+struct CachedDns {
+    endpoints: Vec<String>,
+    expires_at_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -585,14 +595,34 @@ async fn resolve_effective_endpoints(host: &str, port: u16) -> Vec<String> {
     if let Some(ip) = parse_ip_literal(host) {
         return vec![SocketAddr::new(ip, port).to_string()];
     }
-    match lookup_host(format!("{host}:{port}")).await {
+    let key = (host.to_ascii_lowercase(), port);
+    let now = now_ms();
+    if let Some(cached) = DNS_CACHE.read().await.get(&key).cloned() {
+        if cached.expires_at_ms > now {
+            return cached.endpoints;
+        }
+    }
+    let endpoints = match lookup_host(format!("{host}:{port}")).await {
         Ok(addrs) => {
             let mut addrs: Vec<_> = addrs.collect();
             addrs.sort_by_key(|addr| if addr.ip().is_ipv4() { 0 } else { 1 });
             addrs.into_iter().map(|addr| addr.to_string()).collect()
         }
         Err(_) => Vec::new(),
-    }
+    };
+    let ttl = if endpoints.is_empty() {
+        DNS_NEGATIVE_CACHE_TTL_MS
+    } else {
+        DNS_CACHE_TTL_MS
+    };
+    DNS_CACHE.write().await.insert(
+        key,
+        CachedDns {
+            endpoints: endpoints.clone(),
+            expires_at_ms: now_ms().saturating_add(ttl),
+        },
+    );
+    endpoints
 }
 
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
@@ -792,5 +822,22 @@ mod tests {
             target: "runtime-204.example:443".into(),
             upstream_tls: false,
         }));
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_endpoints_uses_fresh_dns_cache_entry() {
+        DNS_CACHE.write().await.clear();
+        DNS_CACHE.write().await.insert(
+            ("cached.example".into(), 443),
+            CachedDns {
+                endpoints: vec!["203.0.113.10:443".into()],
+                expires_at_ms: now_ms() + 60_000,
+            },
+        );
+
+        let endpoints = resolve_effective_endpoints("cached.example", 443).await;
+
+        assert_eq!(endpoints, vec!["203.0.113.10:443"]);
+        DNS_CACHE.write().await.clear();
     }
 }
