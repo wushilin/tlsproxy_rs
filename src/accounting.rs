@@ -1,9 +1,12 @@
-use crate::config::{Compression, ListenerMode};
+use crate::config::{Compression, ListenerMode, AccountingConfig};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use anyhow::anyhow;
+use log::{error, warn};
+use tokio::sync::{mpsc, oneshot};
 
 pub const CSV_HEADER: &str = "listener_type,connection_id,listener_name,sni,target_host,target_endpoint,remote_address,status,uploaded_bytes,downloaded_bytes,connection_start,connection_end";
 
@@ -288,6 +291,108 @@ pub fn compression_candidates(
     candidates.into_iter().map(|file| file.path).collect()
 }
 
+enum Msg {
+    Record(CdrRecord),
+    Flush(oneshot::Sender<()>),
+}
+
+/// Bounded so a stalled disk caps memory instead of growing without limit;
+/// tokio allocates the buffer lazily, so an idle queue costs nothing.
+const QUEUE_CAPACITY: usize = 100_000;
+
+static SENDER: OnceLock<mpsc::Sender<Msg>> = OnceLock::new();
+
+pub fn enabled() -> bool {
+    SENDER.get().is_some()
+}
+
+/// Non-blocking; drops the record (with a warning) if the queue is full or
+/// the writer is gone, and silently when accounting was never enabled.
+pub fn submit(record: CdrRecord) {
+    if let Some(sender) = SENDER.get() {
+        if sender.try_send(Msg::Record(record)).is_err() {
+            warn!("accounting queue full or writer gone; dropping CDR record");
+        }
+    }
+}
+
+/// Starts the writer task. Prunes and compresses leftovers from previous
+/// runs first (never decompressing existing archives), then appends to the
+/// existing active file.
+pub async fn init(cfg: &AccountingConfig) -> anyhow::Result<()> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    cfg.validate().map_err(|cause| anyhow!(cause))?;
+    let rotate_size = cfg.rotate_size_bytes().map_err(|cause| anyhow!(cause))?;
+    let log_path = PathBuf::from(&cfg.log_file);
+    let mut writer = RotatingWriter::open(&log_path, rotate_size, cfg.max_keep)?;
+    let compress_after = cfg.compress_after;
+    let compression = cfg.compression;
+    let gate = writer.compress_gate();
+    // startup scan
+    prune(&log_path, cfg.max_keep)?;
+    let leftovers = compression_candidates(&log_path, compress_after, compression);
+    if !leftovers.is_empty() {
+        spawn_compression(leftovers, compression, Arc::clone(&gate));
+    }
+    let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+    SENDER
+        .set(tx)
+        .map_err(|_| anyhow!("accounting already initialized"))?;
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                Msg::Record(record) => match writer.write_record(&record.to_csv_line()) {
+                    Ok(true) => {
+                        let candidates =
+                            compression_candidates(&log_path, compress_after, compression);
+                        if !candidates.is_empty() {
+                            spawn_compression(candidates, compression, writer.compress_gate());
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(cause) => {
+                        error!("accounting: failed to write CDR record: {cause}");
+                    }
+                },
+                Msg::Flush(ack) => {
+                    let _ = ack.send(());
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Waits until every record submitted so far has been written and flushed.
+/// Uses the awaiting `send` (not `try_send`) so the flush marker queues even
+/// when the channel is momentarily full.
+pub async fn shutdown() {
+    if let Some(sender) = SENDER.get() {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if sender.send(Msg::Flush(ack_tx)).await.is_ok() {
+            let _ = ack_rx.await;
+        }
+    }
+}
+
+/// At most one compression batch runs at a time; the shared gate bars
+/// rotation for its whole duration.
+fn spawn_compression(candidates: Vec<PathBuf>, compression: Compression, gate: Arc<AtomicBool>) {
+    if gate.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        for path in candidates {
+            if let Err(cause) = compress_file(&path, compression) {
+                warn!("accounting: failed to compress {}: {cause}", path.display());
+            }
+        }
+        gate.store(false, Ordering::SeqCst);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +609,47 @@ mod tests {
         );
         assert!(compression_candidates(&log_path, 3, Compression::None).is_empty());
         assert!(compression_candidates(&log_path, 10, Compression::Zstd).is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_init_submit_shutdown_writes_records() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("cdr.log");
+        let cfg = crate::config::AccountingConfig {
+            enabled: true,
+            log_file: log_path.to_string_lossy().into_owned(),
+            rotate_size: "1MiB".into(),
+            max_keep: 3,
+            compress_after: 3,
+            compression: Compression::None,
+        };
+        assert!(!enabled());
+        init(&cfg).await.unwrap();
+        assert!(enabled());
+        let record = CdrRecord {
+            listener_type: ListenerType::TlsTerminate,
+            connection_id: "abc(7)".into(),
+            listener_name: "HTTPS".into(),
+            sni: "example.com".into(),
+            target_host: "example.com".into(),
+            target_endpoint: "1.2.3.4:443".into(),
+            remote_address: "5.6.7.8:50000".into(),
+            status: ConnStatus::Ok,
+            uploaded_bytes: 10,
+            downloaded_bytes: 20,
+            start_unix_ms: 0,
+            end_unix_ms: 1,
+        };
+        submit(record.clone());
+        submit(record);
+        shutdown().await;
+        let content = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3, "header plus two records");
+        assert_eq!(lines[0], CSV_HEADER);
+        assert!(lines[1].starts_with("TLS_TERMINATE,abc(7),HTTPS,example.com,"));
+        assert_eq!(lines[1], lines[2]);
+        // double init must fail
+        assert!(init(&cfg).await.is_err());
     }
 }
