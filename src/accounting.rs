@@ -1,6 +1,6 @@
 use crate::config::{Compression, ListenerMode};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -253,12 +253,11 @@ pub fn compress_file(path: &Path, compression: Compression) -> io::Result<()> {
     let mut output_name = path.file_name().unwrap_or_default().to_os_string();
     output_name.push(format!(".{extension}"));
     let output_path = path.with_file_name(output_name);
-    let input = io::BufReader::new(File::open(path)?);
+    let mut input = io::BufReader::new(File::open(path)?);
     match compression {
         Compression::Gzip => {
             let mut encoder =
                 flate2::write::GzEncoder::new(File::create(&output_path)?, flate2::Compression::default());
-            let mut input = input;
             io::copy(&mut input, &mut encoder)?;
             encoder.finish()?;
         }
