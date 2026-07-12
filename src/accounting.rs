@@ -336,19 +336,22 @@ pub async fn init(cfg: &AccountingConfig) -> anyhow::Result<()> {
     let compress_after = cfg.compress_after;
     let compression = cfg.compression;
     let gate = writer.compress_gate();
-    let handle = tokio::runtime::Handle::current();
     // startup scan
     prune(&log_path, cfg.max_keep)?;
     let leftovers = compression_candidates(&log_path, compress_after, compression);
     if !leftovers.is_empty() {
-        spawn_compression(leftovers, compression, Arc::clone(&gate), &handle);
+        spawn_compression(leftovers, compression, Arc::clone(&gate));
     }
     let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
     SENDER
         .set(tx)
         .map_err(|_| anyhow!("accounting already initialized"))?;
-    let loop_handle = handle.clone();
-    tokio::task::spawn_blocking(move || {
+    // Detached OS thread, not spawn_blocking: a spawn_blocking task parked in
+    // `blocking_recv` would make tokio runtime shutdown wait forever, since
+    // the sender lives in the global SENDER and is never dropped. A detached
+    // thread can never stall the runtime or block process exit; records are
+    // flushed per-write, and `shutdown()` is the graceful drain path.
+    std::thread::spawn(move || {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
                 Msg::Record(record) => match writer.write_record(&record.to_csv_line()) {
@@ -356,12 +359,7 @@ pub async fn init(cfg: &AccountingConfig) -> anyhow::Result<()> {
                         let candidates =
                             compression_candidates(&log_path, compress_after, compression);
                         if !candidates.is_empty() {
-                            spawn_compression(
-                                candidates,
-                                compression,
-                                writer.compress_gate(),
-                                &loop_handle,
-                            );
+                            spawn_compression(candidates, compression, writer.compress_gate());
                         }
                     }
                     Ok(false) => {}
@@ -371,10 +369,8 @@ pub async fn init(cfg: &AccountingConfig) -> anyhow::Result<()> {
                 },
                 Msg::Flush(ack) => {
                     let _ = ack.send(());
-                    // Flush only comes from `shutdown()`: exit so the blocking
-                    // task completes and runtime teardown does not wait on a
-                    // `blocking_recv` that can never return (the sender lives
-                    // in the global SENDER and is never dropped).
+                    // Flush only comes from `shutdown()`, which is terminal:
+                    // exit the loop once the drain is acknowledged.
                     break;
                 }
             }
@@ -397,17 +393,15 @@ pub async fn shutdown() {
 }
 
 /// At most one compression batch runs at a time; the shared gate bars
-/// rotation for its whole duration.
-fn spawn_compression(
-    candidates: Vec<PathBuf>,
-    compression: Compression,
-    gate: Arc<AtomicBool>,
-    handle: &tokio::runtime::Handle,
-) {
+/// rotation for its whole duration. Runs on a detached OS thread so it can
+/// never stall the tokio runtime or block process exit: if the process dies
+/// mid-batch, the raw file is still there (it is only removed after success)
+/// and the next startup scan overwrites any partial output.
+fn spawn_compression(candidates: Vec<PathBuf>, compression: Compression, gate: Arc<AtomicBool>) {
     if gate.swap(true, Ordering::SeqCst) {
         return;
     }
-    handle.spawn_blocking(move || {
+    std::thread::spawn(move || {
         for path in candidates {
             if let Err(cause) = compress_file(&path, compression) {
                 warn!("accounting: failed to compress {}: {cause}", path.display());
