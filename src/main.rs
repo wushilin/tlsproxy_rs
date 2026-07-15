@@ -5,6 +5,7 @@
 pub mod accounting;
 pub mod active_tracker;
 pub mod admin_server;
+pub mod bindaddr;
 pub mod ca;
 pub mod certificate;
 pub mod config;
