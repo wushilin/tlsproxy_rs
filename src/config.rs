@@ -282,6 +282,18 @@ impl Config {
         if let Some(accounting) = &config.accounting {
             accounting.validate()?;
         }
+        for (name, listener) in &config.listeners {
+            if let Err(cause) = crate::bindaddr::parse_bind_pattern(&listener.bind) {
+                return Err(format!("listener `{name}`: {cause}").into());
+            }
+        }
+        if let Some(admin) = &config.admin_server {
+            if let Some(address) = &admin.bind_address {
+                if let Err(cause) = crate::bindaddr::parse_bind_pattern(address) {
+                    return Err(format!("admin_server.bind_address: {cause}").into());
+                }
+            }
+        }
         return Ok(config);
     }
 
@@ -398,6 +410,59 @@ dns: {}
         let config = Config::load_string(yaml).expect("old configuration should deserialize");
         assert_eq!(config.listeners["web"].mode, ListenerMode::Passthrough);
         assert!(!config.listeners["web"].upstream_tls);
+    }
+
+    #[test]
+    fn interface_bind_pattern_loads() {
+        let yaml = r#"
+listeners:
+  web:
+    bind: "%eth0%:1443"
+    target_port: 443
+    policy: ALLOW
+    rules:
+      static_hosts: []
+      patterns: []
+options: {}
+dns: {}
+"#;
+        let config = Config::load_string(yaml).expect("interface bind pattern should load");
+        assert_eq!(config.listeners["web"].bind, "%eth0%:1443");
+    }
+
+    #[test]
+    fn malformed_interface_bind_pattern_fails_load() {
+        let yaml = r#"
+listeners:
+  web:
+    bind: "%eth0:1443"
+    target_port: 443
+    policy: ALLOW
+    rules:
+      static_hosts: []
+      patterns: []
+options: {}
+dns: {}
+"#;
+        let error = Config::load_string(yaml).unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("web"), "got: {message}");
+        assert!(message.contains("missing closing"), "got: {message}");
+    }
+
+    #[test]
+    fn malformed_admin_bind_address_fails_load() {
+        let yaml = r#"
+listeners: {}
+admin_server:
+  bind_address: "%eth0/v5%"
+options: {}
+dns: {}
+"#;
+        let error = Config::load_string(yaml).unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("admin_server"), "got: {message}");
+        assert!(message.contains("unknown family suffix"), "got: {message}");
     }
 
     #[test]

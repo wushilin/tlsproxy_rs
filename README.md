@@ -68,6 +68,22 @@ generated certificates.
 
 ## Prepare configuration
 
+The `bind` address may name a network interface instead of a literal IP —
+useful on cloud instances where the private IP changes between launches:
+
+```yaml
+listeners:
+  web:
+    bind: "%eth0%:442"      # first IPv4 address of eth0 (same as %eth0/v4%)
+    # bind: "%eth0/v6%:442" # first global (non-link-local) IPv6 address
+```
+
+The interface's IP is resolved when the listener binds, not when the config
+loads. If the interface is missing or has no address of the requested
+family, the listener fails to start with an error listing the available
+interfaces. `admin_server.bind_address` accepts the same `%eth0%` /
+`%eth0/v6%` patterns (without a port).
+
 Example config.yaml
 ```yaml
 listeners:
