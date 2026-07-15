@@ -590,6 +590,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let config = CONFIG.read().await.clone();
     let bind_port = choose(&config.bind_port, 48888);
     let bind_address = choose(&config.bind_address, "0.0.0.0".into());
+    let bind_address = crate::bindaddr::resolve_bind_addr(&bind_address)?;
     let addr: SocketAddr = format!("{bind_address}:{bind_port}").parse()?;
     let app = router();
 

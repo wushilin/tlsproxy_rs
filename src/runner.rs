@@ -1,5 +1,6 @@
 use crate::accounting::{self, CdrRecord, ConnStatus, ListenerType};
 use crate::active_tracker;
+use crate::bindaddr;
 use crate::ca::LocalCa;
 use crate::controller::Controller;
 use crate::idle_tracker::IdleTracker;
@@ -185,6 +186,15 @@ impl Runner {
         self.start_managed(&mut listener_controller).await
     }
 
+    /// Resolves `%ifname%` bind patterns just before binding, so each retry
+    /// sees the interface's current address.
+    async fn bind_listener(bind: &str) -> IoResult<TcpListener> {
+        match bindaddr::resolve_bind_addr(bind) {
+            Ok(address) => TcpListener::bind(address).await,
+            Err(cause) => Err(std::io::Error::other(cause.to_string())),
+        }
+    }
+
     pub async fn start_managed(
         self,
         listener_controller: &mut Controller,
@@ -202,7 +212,7 @@ impl Runner {
         let name_clone = name.clone();
         let task_controller = listener_controller.child();
         let listener_task = listener_controller.spawn(async move {
-            let mut listener = TcpListener::bind(&bind).await;
+            let mut listener = Self::bind_listener(&bind).await;
             let max_retry = 3;
             for i in 1..max_retry + 1 {
                 if listener.is_ok() {
@@ -213,7 +223,7 @@ impl Runner {
                     &name_clone, &bind
                 );
                 sleep(Duration::from_millis(100)).await;
-                listener = TcpListener::bind(&bind).await;
+                listener = Self::bind_listener(&bind).await;
             }
             match listener {
                 Ok(inner_listener) => {
@@ -627,7 +637,10 @@ impl Runner {
         resolved: &str,
         conn_id: &RequestId,
     ) -> Result<()> {
-        let Ok(bind_addr) = listener_config.bind.parse::<SocketAddr>() else {
+        let Ok(resolved_bind) = bindaddr::resolve_bind_addr(&listener_config.bind) else {
+            return Ok(());
+        };
+        let Ok(bind_addr) = resolved_bind.parse::<SocketAddr>() else {
             return Ok(());
         };
         let Ok(upstream_addrs) = tokio::net::lookup_host(resolved).await else {
@@ -906,6 +919,18 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         TlsConnector::from(Arc::new(config))
+    }
+
+    #[tokio::test]
+    async fn bind_listener_resolves_interface_pattern() {
+        let listener = Runner::bind_listener("%lo%:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(addr.ip().is_loopback());
+
+        let error = Runner::bind_listener("%no_such_iface_xyz%:0")
+            .await
+            .unwrap_err();
+        assert!(format!("{error}").contains("no_such_iface_xyz"));
     }
 
     #[tokio::test]
