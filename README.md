@@ -89,7 +89,7 @@ Example config.yaml
 listeners:
   HTTPS:
     bind: 0.0.0.0:1443  # TLS proxy binds to 0.0.0.0:1443
-    mode: passthrough # passthrough forwards TLS unchanged; terminate decrypts TLS
+    mode: passthrough # passthrough forwards TLS unchanged; terminate decrypts TLS; forward is a plain L4 port forward; http routes plaintext HTTP by Host header
     upstream_tls: false # terminate mode only; encrypt upstream without authenticating it
     target_port: 443  # Proxy all requests to port 443
     policy: DENY  # If rules matched, they will be denied (possible values: ALLOW|DENY). basically the rules is blacklist. If it is ALLOW, it would act as a whitelist

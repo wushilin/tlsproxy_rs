@@ -14,6 +14,7 @@ pub mod extensible;
 pub mod forward;
 pub mod hello_cache;
 pub mod hostutil;
+pub mod http_header;
 pub mod idle_tracker;
 pub mod listener_stats;
 pub mod manager;

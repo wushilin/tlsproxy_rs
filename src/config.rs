@@ -286,6 +286,15 @@ impl Config {
             if let Err(cause) = crate::bindaddr::parse_bind_pattern(&listener.bind) {
                 return Err(format!("listener `{name}`: {cause}").into());
             }
+            if listener.mode == ListenerMode::Http {
+                if let Some(targets) = listener.target.as_deref() {
+                    if !targets.trim().is_empty() {
+                        if let Err(cause) = crate::forward::parse_http_targets(targets) {
+                            return Err(format!("listener `{name}`: {cause}").into());
+                        }
+                    }
+                }
+            }
         }
         if let Some(admin) = &config.admin_server {
             if let Some(address) = &admin.bind_address {
@@ -323,6 +332,7 @@ pub enum ListenerMode {
     Passthrough,
     Terminate,
     Forward,
+    Http,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -508,6 +518,64 @@ dns: {}
             config.listeners["plain"].target.as_deref(),
             Some("target1.host.com:80; target2.host.com:1080")
         );
+    }
+
+    #[test]
+    fn http_listener_parses_with_and_without_backends() {
+        let yaml = r#"
+listeners:
+  dynamic:
+    bind: 127.0.0.1:1080
+    target_port: 80
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns: []
+    mode: http
+  backed:
+    bind: 127.0.0.1:1081
+    target: http://backend1.host.com; http://backend2.host.com:8080
+    target_port: 80
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns: []
+    mode: http
+options: {}
+dns: {}
+"#;
+        let config = Config::load_string(yaml).expect("http configuration should parse");
+        assert_eq!(config.listeners["dynamic"].mode, ListenerMode::Http);
+        assert!(config.listeners["dynamic"].target.is_none());
+        assert_eq!(config.listeners["backed"].mode, ListenerMode::Http);
+    }
+
+    #[test]
+    fn http_listener_rejects_bad_backends_at_load() {
+        let base = |target: &str| {
+            format!(
+                r#"
+listeners:
+  web:
+    bind: 127.0.0.1:1080
+    target: "{target}"
+    target_port: 80
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns: []
+    mode: http
+options: {{}}
+dns: {{}}
+"#
+            )
+        };
+        let error = Config::load_string(&base("https://secure.example")).unwrap_err();
+        assert!(format!("{error}").contains("plaintext"), "got: {error}");
+        let error = Config::load_string(&base("backend.example:80")).unwrap_err();
+        assert!(format!("{error}").contains("http://"), "got: {error}");
+        let error = Config::load_string(&base("http://backend.example/path")).unwrap_err();
+        assert!(format!("{error}").contains("no path"), "got: {error}");
     }
 
     fn listener(policy: Policy) -> Listener {

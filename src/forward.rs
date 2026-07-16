@@ -302,10 +302,73 @@ pub async fn reconcile_configured_listeners(listeners: &HashMap<String, Listener
                 register_forward_listener(name.clone(), targets, listener.upstream_tls).await?;
             }
         }
+        if listener.mode == ListenerMode::Http {
+            if let Some(targets) = http_listener_targets(listener) {
+                let normalized = parse_http_targets(&targets)?;
+                register_forward_listener(name.clone(), &normalized, false).await?;
+            }
+        }
     }
     prune_unreferenced_configured_groups().await;
     publish_configured_statuses().await;
     Ok(())
+}
+
+/// Explicit backends of an http listener, or None when it routes dynamically
+/// by Host header.
+pub fn http_listener_targets(listener: &Listener) -> Option<String> {
+    listener
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|targets| !targets.is_empty())
+        .map(str::to_string)
+}
+
+/// Parses http-mode backend targets (`http://host` or `http://host:port`,
+/// separated by `,` or `;`; the port defaults to 80) into the `host:port`
+/// list format `register_forward_listener` accepts.
+pub fn parse_http_targets(targets: &str) -> Result<String> {
+    let mut parsed = Vec::new();
+    for target in targets.split([',', ';']) {
+        let target = target.trim();
+        if target.is_empty() {
+            continue;
+        }
+        let lower = target.to_ascii_lowercase();
+        if lower.starts_with("https://") {
+            return Err(anyhow!(
+                "http backend `{target}` must be plaintext http://, https backends are not supported"
+            ));
+        }
+        let Some(rest) = lower
+            .starts_with("http://")
+            .then(|| &target["http://".len()..])
+        else {
+            return Err(anyhow!("http backend `{target}` must start with http://"));
+        };
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+        if rest.is_empty() || rest.contains(['/', '?', '#']) || rest.contains(char::is_whitespace) {
+            return Err(anyhow!(
+                "http backend `{target}` must be http://host or http://host:port with no path"
+            ));
+        }
+        let host_and_port = if let Ok(parsed) = rest.parse::<HostAndPort>() {
+            parsed
+        } else if !rest.contains(':') {
+            HostAndPort::new(rest.to_string(), 80)
+        } else {
+            return Err(anyhow!("http backend `{target}` has an invalid host:port"));
+        };
+        if host_and_port.port() == 0 {
+            return Err(anyhow!("http backend `{target}` has an invalid port"));
+        }
+        parsed.push(host_and_port.to_string());
+    }
+    if parsed.is_empty() {
+        return Err(anyhow!("http backend list requires at least one target"));
+    }
+    Ok(parsed.join(";"))
 }
 
 pub async fn clear_listener(listener_name: &str) {
@@ -822,6 +885,20 @@ mod tests {
             target: "runtime-204.example:443".into(),
             upstream_tls: false,
         }));
+    }
+
+    #[test]
+    fn parse_http_targets_normalizes_and_defaults_port() {
+        assert_eq!(
+            parse_http_targets("http://a.example; http://b.example:8080, HTTP://c.example/").unwrap(),
+            "a.example:80;b.example:8080;c.example:80"
+        );
+        assert!(parse_http_targets("https://a.example").is_err());
+        assert!(parse_http_targets("a.example:80").is_err());
+        assert!(parse_http_targets("http://a.example/path").is_err());
+        assert!(parse_http_targets("http://a.example:notaport").is_err());
+        assert!(parse_http_targets("http://a.example:0").is_err());
+        assert!(parse_http_targets(" ; , ").is_err());
     }
 
     #[tokio::test]

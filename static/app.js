@@ -322,13 +322,17 @@ function renderListeners() {
       : running
       ? '<span class="status-pill success">Online</span>'
       : '<span class="status-pill neutral">Stopped</span>';
+    const targetCount = splitTargets(listener.target).length;
     const upstream = listener.mode === 'forward'
       ? renderForwardUpstream(listener, listenerBackends(name))
+      : listener.mode === 'http'
+      ? (targetCount
+        ? `<div class="forward-upstream"><span class="badge">Plaintext</span>${renderBackendBadges(listenerBackends(name), listener.target)}</div>`
+        : '<span class="muted">By Host header</span>')
       : listener.mode === 'terminate'
       ? (listener.upstream_tls ? '<span class="badge accent">TLS</span>' : '<span class="badge">Plaintext</span>')
       : '<span class="muted">Same TLS stream</span>';
-    const targetCount = splitTargets(listener.target).length;
-    const target = listener.mode === 'forward'
+    const target = listener.mode === 'forward' || (listener.mode === 'http' && targetCount)
       ? `<span class="muted">${fmt(targetCount)} backend${targetCount === 1 ? '' : 's'}</span>`
       : `<span class="num">${Number(listener.target_port) || ''}</span>`;
     const policy = listener.mode === 'forward' ? '<span class="muted">n/a</span>' : escapeHtml(listener.policy);
@@ -373,7 +377,7 @@ function renderListeners() {
           <div class="empty"><strong>No listeners configured</strong>Add a listener to start proxying traffic.</div>`}
       </div>
     </section>
-    <div class="note info">Forward mode accepts plaintext clients and randomly selects an online backend; targets that have not been health-checked yet still count as eligible. Upstream TLS encrypts the proxy-to-upstream leg without authenticating the upstream certificate.</div>`;
+    <div class="note info">Forward mode accepts plaintext clients and randomly selects an online backend; targets that have not been health-checked yet still count as eligible. Upstream TLS encrypts the proxy-to-upstream leg without authenticating the upstream certificate. HTTP passthrough routes plaintext HTTP by its Host header (subject to the ACL), either to explicit health-checked http:// backends or dynamically to the requested host, and injects X-Forwarded-For/Host/Proto and Forwarded headers into the first request.</div>`;
 }
 
 function renderForwardUpstream(listener, backends) {
@@ -611,10 +615,16 @@ function syncListenerDialogMode() {
   const targetSection = document.querySelector('#listener-target-section');
   const targetPort = document.querySelector('#listener-target-port');
   const aclSection = document.querySelector('#listener-acl-section');
+  const targetHelper = document.querySelector('#listener-target-helper');
   if (section) section.hidden = !['terminate', 'forward'].includes(mode);
-  if (targetSection) targetSection.hidden = mode !== 'forward';
+  if (targetSection) targetSection.hidden = !['forward', 'http'].includes(mode);
   if (targetPort) targetPort.required = mode !== 'forward';
   if (aclSection) aclSection.hidden = mode === 'forward';
+  if (targetHelper) {
+    targetHelper.textContent = mode === 'http'
+      ? 'Optional http://host:port backends (comma or semicolon separated). Leave empty to route dynamically by Host header.'
+      : 'Comma or semicolon separated host:port backends.';
+  }
 }
 
 function saveListenerDialog() {
@@ -866,12 +876,24 @@ function validateListener(name, listener) {
   if (listener.mode !== 'forward' && (!Number.isInteger(listener.target_port) || listener.target_port < 1 || listener.target_port > 65535)) {
     return `Listener ${name} requires a target port from 1 to 65535.`;
   }
-  if (!['passthrough', 'terminate', 'forward'].includes(listener.mode)) return `Listener ${name} has an invalid mode.`;
+  if (!['passthrough', 'terminate', 'forward', 'http'].includes(listener.mode)) return `Listener ${name} has an invalid mode.`;
   if (listener.mode === 'forward' && !splitTargets(listener.target).length) return `Listener ${name} requires at least one forward target.`;
-  for (const target of splitTargets(listener.target)) {
-    if (!/^[^\s:]+:\d+$/.test(target)) return `Listener ${name} has an invalid forward target: ${target}`;
-    const port = Number(target.slice(target.lastIndexOf(':') + 1));
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return `Listener ${name} has an invalid forward target port: ${target}`;
+  if (listener.mode === 'forward') {
+    for (const target of splitTargets(listener.target)) {
+      if (!/^[^\s:]+:\d+$/.test(target)) return `Listener ${name} has an invalid forward target: ${target}`;
+      const port = Number(target.slice(target.lastIndexOf(':') + 1));
+      if (!Number.isInteger(port) || port < 1 || port > 65535) return `Listener ${name} has an invalid forward target port: ${target}`;
+    }
+  }
+  if (listener.mode === 'http') {
+    for (const target of splitTargets(listener.target)) {
+      if (!/^http:\/\/[^\s/]+\/?$/.test(target)) return `Listener ${name} has an invalid http backend (expected http://host or http://host:port): ${target}`;
+      const portMatch = target.match(/:(\d+)\/?$/);
+      if (portMatch) {
+        const port = Number(portMatch[1]);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return `Listener ${name} has an invalid http backend port: ${target}`;
+      }
+    }
   }
   if (listener.mode !== 'forward') {
     if (!['ALLOW', 'DENY'].includes(listener.policy)) return `Listener ${name} has an invalid policy.`;
@@ -916,6 +938,7 @@ function cleanListener(listener) {
 function modeLabel(mode) {
   if (mode === 'terminate') return 'TLS termination';
   if (mode === 'forward') return 'Port forward';
+  if (mode === 'http') return 'HTTP passthrough';
   return 'TLS passthrough';
 }
 

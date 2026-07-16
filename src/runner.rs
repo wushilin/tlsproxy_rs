@@ -32,6 +32,7 @@ use crate::hello_cache;
 use crate::request_id::RequestId;
 use crate::{
     config::{Listener, ListenerMode},
+    http_header,
     listener_stats::ListenerStats,
     tls_header,
 };
@@ -307,6 +308,7 @@ impl Runner {
             let rr = Self::worker(
                 Arc::clone(&name),
                 ext,
+                remote_address,
                 listener_config,
                 stats_local_clone,
                 controller,
@@ -370,6 +372,13 @@ impl Runner {
             )
             .await?;
         }
+        if listener_config.mode == ListenerMode::Http {
+            if let Some(targets) = crate::forward::http_listener_targets(&listener_config) {
+                let normalized = crate::forward::parse_http_targets(&targets)?;
+                crate::forward::register_forward_listener((*name).clone(), &normalized, false)
+                    .await?;
+            }
+        }
         loop {
             let accept_result = listener.accept().await;
             match accept_result {
@@ -404,6 +413,7 @@ impl Runner {
     async fn worker(
         name: Arc<String>,
         ext: Extensible<TcpStream>,
+        remote_address: SocketAddr,
         listener_config: Arc<Listener>,
         context: Arc<ListenerStats>,
         controller: Arc<RwLock<Controller>>,
@@ -418,6 +428,17 @@ impl Runner {
             }
             ListenerMode::Forward => {
                 Self::worker_forward(name, ext, listener_config, context, controller).await
+            }
+            ListenerMode::Http => {
+                Self::worker_http(
+                    name,
+                    ext,
+                    remote_address,
+                    listener_config,
+                    context,
+                    controller,
+                )
+                .await
             }
         }
     }
@@ -632,6 +653,70 @@ impl Runner {
         }
     }
 
+    async fn worker_http(
+        name: Arc<String>,
+        ext: Extensible<TcpStream>,
+        remote_address: SocketAddr,
+        listener_config: Arc<Listener>,
+        context: Arc<ListenerStats>,
+        controller: Arc<RwLock<Controller>>,
+    ) -> Result<()> {
+        let conn_id = ext.get_extension::<RequestId>().await.unwrap();
+        info!("{conn_id} {name} http worker started");
+        let mut ext = ext;
+        let head = http_header::read_http_head(
+            &mut ext,
+            Duration::from_secs(10),
+            http_header::DEFAULT_MAX_HTTP_HEADER_SIZE,
+        )
+        .await?;
+        let header_len = head.buffered.len();
+        info!("{conn_id} http host is {}", head.host_raw);
+        active_tracker::set_sni(&conn_id, &head.host).await;
+        context.increase_uploaded_bytes(header_len);
+        active_tracker::add_uploaded(&conn_id, header_len as u64).await;
+        Self::check_acl(&listener_config, &head.host, &conn_id).await?;
+        let selected = if crate::forward::http_listener_targets(&listener_config).is_some() {
+            crate::forward::choose_online(&name)
+                .await
+                .ok_or_else(|| anyhow!("no online http backends"))?
+        } else {
+            // Dynamic routing by Host header; an explicit Host port wins over
+            // the configured target_port.
+            let port = head.port.unwrap_or(listener_config.target_port);
+            crate::forward::select_runtime_target(&head.host, port, false, &head.host).await?
+        };
+        active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint).await;
+        // Plaintext bytes cannot be marked the way a ClientHello random can,
+        // so loop protection has to rely on the endpoint check.
+        Self::reject_obvious_self_connect(&listener_config, &selected.endpoint, &conn_id).await?;
+        let upstream = tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(&selected.endpoint),
+        )
+        .await??;
+        info!("{conn_id} connected to http upstream {}", selected.endpoint);
+        active_tracker::set_status(&conn_id, ConnStatus::Ok).await;
+        let (client_read, client_write) = tokio::io::split(ext);
+        let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
+        // Only the first request head gets forwarding headers; later requests
+        // on a kept-alive connection are relayed untouched.
+        let rewritten = head.with_forwarded_headers(remote_address.ip());
+        upstream_write.write_all(&rewritten).await?;
+        Self::relay(
+            conn_id,
+            client_read,
+            client_write,
+            upstream_read,
+            upstream_write,
+            listener_config,
+            context,
+            controller,
+            header_len as u64,
+        )
+        .await
+    }
+
     async fn reject_obvious_self_connect(
         listener_config: &Listener,
         resolved: &str,
@@ -661,6 +746,21 @@ impl Runner {
         Ok(())
     }
 
+    async fn check_acl(
+        listener_config: &Listener,
+        host: &str,
+        conn_id: &RequestId,
+    ) -> Result<()> {
+        if listener_config.is_allowed(host) {
+            info!("{conn_id} {host} allowed by ACL");
+            Ok(())
+        } else {
+            info!("{conn_id} {host} denied by ACL");
+            active_tracker::set_status(conn_id, ConnStatus::Denied).await;
+            Err(anyhow!("{host} denied by ACL"))
+        }
+    }
+
     async fn resolve_target(
         listener_config: &Listener,
         sni_target: &str,
@@ -668,17 +768,7 @@ impl Runner {
         tls_server_name: &str,
         conn_id: &RequestId,
     ) -> Result<crate::forward::SelectedTarget> {
-        let check_result = listener_config.is_allowed(sni_target);
-        match check_result {
-            true => {
-                info!("{conn_id} {sni_target} allowed by ACL");
-            }
-            false => {
-                info!("{conn_id} {sni_target} denied by ACL");
-                active_tracker::set_status(conn_id, ConnStatus::Denied).await;
-                return Err(anyhow!("{sni_target} denied by ACL"));
-            }
-        }
+        Self::check_acl(listener_config, sni_target, conn_id).await?;
         let selected = crate::forward::select_runtime_target(
             sni_target,
             listener_config.target_port,
@@ -888,6 +978,11 @@ mod tests {
         (directory, paths, roots)
     }
 
+    /// Serializes tests that touch the process-wide forward registry
+    /// (`forward::reset`, listener registration, health checks) so they don't
+    /// clobber each other when the test harness runs them in parallel.
+    static FORWARD_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn test_listener(mode: ListenerMode, port: u16) -> Arc<Listener> {
         Arc::new(Listener {
             bind: "127.0.0.1:0".into(),
@@ -1059,6 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_mode_relays_plaintext_to_online_backend() {
+        let _forward_guard = FORWARD_STATE_LOCK.lock().await;
         crate::forward::reset().await;
         let plaintext_as_tls = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let plaintext_as_tls_addr = plaintext_as_tls.local_addr().unwrap();
@@ -1157,6 +1253,251 @@ mod tests {
         assert_eq!(stats.uploaded_bytes_count(), payload.len());
         assert_eq!(stats.downloaded_bytes_count(), payload.len());
         crate::forward::reset().await;
+    }
+
+    async fn read_http_head_text(socket: &mut TcpStream) -> String {
+        let mut received = vec![0u8; 8192];
+        let mut total = 0;
+        loop {
+            let n = socket.read(&mut received[total..]).await.unwrap();
+            assert!(n > 0, "connection closed before request head completed");
+            total += n;
+            if received[..total].windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&received[..total]).to_string()
+    }
+
+    #[tokio::test]
+    async fn http_mode_with_backends_relays_and_injects_forwarding_headers() {
+        let _forward_guard = FORWARD_STATE_LOCK.lock().await;
+        crate::forward::reset().await;
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+
+        let upstream_task = tokio::spawn(async move {
+            let (_health_socket, _) = upstream.accept().await.unwrap();
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let text = read_http_head_text(&mut socket).await;
+            assert!(text.starts_with("GET /hello HTTP/1.1\r\n"), "got: {text}");
+            assert!(text.contains("Host: app.example\r\n"), "got: {text}");
+            assert!(text.contains("X-Forwarded-For: 127.0.0.1\r\n"), "got: {text}");
+            assert!(text.contains("X-Forwarded-Host: app.example\r\n"), "got: {text}");
+            assert!(text.contains("X-Forwarded-Proto: http\r\n"), "got: {text}");
+            assert!(
+                text.contains("Forwarded: for=127.0.0.1;host=app.example;proto=http\r\n"),
+                "got: {text}"
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let listener = Arc::new(Listener {
+            bind: "127.0.0.1:0".into(),
+            target: Some(format!("http://{upstream_addr}")),
+            target_port: 80,
+            policy: Policy::DENY,
+            rules: Rules {
+                static_hosts: vec![],
+                patterns: vec![],
+            },
+            max_idle_time_ms: Some(5_000),
+            speed_limit: Some(0.0),
+            mode: ListenerMode::Http,
+            upstream_tls: false,
+        });
+        let normalized =
+            crate::forward::parse_http_targets(listener.target.as_deref().unwrap()).unwrap();
+        crate::forward::register_forward_listener("http-backend-test".into(), &normalized, false)
+            .await
+            .unwrap();
+        let mut check_controller = Controller::new();
+        crate::forward::check_all_once(&mut check_controller).await;
+
+        let stats = Arc::new(ListenerStats::new("http-backend-test", 5_000));
+        let stats_for_worker = Arc::clone(&stats);
+        let proxy_task = tokio::spawn(async move {
+            let (socket, addr) = proxy.accept().await.unwrap();
+            let ext = Extensible::of(socket);
+            ext.extend(RequestId::new()).await;
+            Runner::worker_http(
+                Arc::new("http-backend-test".into()),
+                ext,
+                addr,
+                listener,
+                stats_for_worker,
+                Arc::new(RwLock::new(Controller::new())),
+            )
+            .await
+            .unwrap();
+        });
+
+        let request = b"GET /hello HTTP/1.1\r\nHost: app.example\r\n\r\n";
+        let mut client = TcpStream::connect(proxy_address).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(response.ends_with("ok"), "got: {response}");
+        drop(client);
+
+        timeout(Duration::from_secs(2), upstream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.uploaded_bytes_count(), request.len());
+        crate::forward::reset().await;
+    }
+
+    #[tokio::test]
+    async fn http_mode_dynamic_routes_by_host_header() {
+        let _forward_guard = FORWARD_STATE_LOCK.lock().await;
+        crate::forward::reset().await;
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+
+        let host_header = format!("127.0.0.1:{}", upstream_addr.port());
+        let expected_host = host_header.clone();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let text = read_http_head_text(&mut socket).await;
+            assert!(text.contains(&format!("Host: {expected_host}\r\n")), "got: {text}");
+            assert!(
+                text.contains(&format!("X-Forwarded-Host: {expected_host}\r\n")),
+                "got: {text}"
+            );
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        // target_port is deliberately wrong: the explicit Host port must win
+        let listener = Arc::new(Listener {
+            bind: "127.0.0.1:0".into(),
+            target: None,
+            target_port: 9,
+            policy: Policy::DENY,
+            rules: Rules {
+                static_hosts: vec![],
+                patterns: vec![],
+            },
+            max_idle_time_ms: Some(5_000),
+            speed_limit: Some(0.0),
+            mode: ListenerMode::Http,
+            upstream_tls: false,
+        });
+        let stats = Arc::new(ListenerStats::new("http-dynamic-test", 5_000));
+        let proxy_task = tokio::spawn(async move {
+            let (socket, addr) = proxy.accept().await.unwrap();
+            let ext = Extensible::of(socket);
+            ext.extend(RequestId::new()).await;
+            Runner::worker_http(
+                Arc::new("http-dynamic-test".into()),
+                ext,
+                addr,
+                listener,
+                stats,
+                Arc::new(RwLock::new(Controller::new())),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(proxy_address).await.unwrap();
+        client
+            .write_all(format!("GET / HTTP/1.1\r\nHost: {host_header}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8(response).unwrap().starts_with("HTTP/1.1 204"));
+        drop(client);
+
+        timeout(Duration::from_secs(2), upstream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::forward::reset().await;
+    }
+
+    #[tokio::test]
+    async fn http_mode_denies_by_acl_and_tracks_host() {
+        let listener = Arc::new(Listener {
+            bind: "127.0.0.1:0".into(),
+            target: None,
+            target_port: 80,
+            policy: Policy::ALLOW,
+            rules: Rules {
+                static_hosts: vec!["allowed.example".into()],
+                patterns: vec![],
+            },
+            max_idle_time_ms: Some(5_000),
+            speed_limit: Some(0.0),
+            mode: ListenerMode::Http,
+            upstream_tls: false,
+        });
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let request_id = RequestId::new();
+        let request_id_for_task = request_id.clone();
+        let stats = Arc::new(ListenerStats::new("http-deny-test", 5_000));
+        let proxy_task = tokio::spawn(async move {
+            let (socket, addr) = proxy.accept().await.unwrap();
+            active_tracker::put(&request_id_for_task, "http-deny-test", addr).await;
+            let ext = Extensible::of(socket);
+            ext.extend(request_id_for_task).await;
+            Runner::worker_http(
+                Arc::new("http-deny-test".into()),
+                ext,
+                addr,
+                listener,
+                stats,
+                Arc::new(RwLock::new(Controller::new())),
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(proxy_address).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: other.example\r\n\r\n")
+            .await
+            .unwrap();
+
+        let error = timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("denied by ACL"));
+        let closed = active_tracker::remove(&request_id)
+            .await
+            .expect("denied connection should still be tracked");
+        assert_eq!(closed.status, crate::accounting::ConnStatus::Denied);
+        assert_eq!(closed.sni, "other.example");
+        assert!(closed.uploaded_bytes > 0);
     }
 
     #[tokio::test]

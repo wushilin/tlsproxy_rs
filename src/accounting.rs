@@ -18,6 +18,7 @@ pub enum ListenerType {
     TlsPassthrough,
     TlsTerminate,
     PortForward,
+    HttpPassthrough,
 }
 
 impl ListenerType {
@@ -26,6 +27,7 @@ impl ListenerType {
             ListenerMode::Passthrough => ListenerType::TlsPassthrough,
             ListenerMode::Terminate => ListenerType::TlsTerminate,
             ListenerMode::Forward => ListenerType::PortForward,
+            ListenerMode::Http => ListenerType::HttpPassthrough,
         }
     }
 
@@ -34,6 +36,7 @@ impl ListenerType {
             ListenerType::TlsPassthrough => "TLS_PASSTHROUGH",
             ListenerType::TlsTerminate => "TLS_TERMINATE",
             ListenerType::PortForward => "PORT_FORWARD",
+            ListenerType::HttpPassthrough => "HTTP_PASSTHROUGH",
         }
     }
 }

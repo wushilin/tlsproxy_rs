@@ -127,7 +127,7 @@
           <div class="field full" id="listener-target-section" hidden>
             <label for="listener-target">Targets</label>
             <textarea id="listener-target" rows="3" placeholder="target1.host.com:80, target2.host.com:1080"></textarea>
-            <p class="helper">Comma or semicolon separated host:port backends.</p>
+            <p class="helper" id="listener-target-helper">Comma or semicolon separated host:port backends.</p>
           </div>
           <div class="field">
             <label for="listener-mode">Mode</label>
@@ -135,6 +135,7 @@
               <option value="passthrough">TLS passthrough</option>
               <option value="terminate">TLS termination</option>
               <option value="forward">Port forward</option>
+              <option value="http">HTTP passthrough</option>
             </select>
           </div>
         </div>
