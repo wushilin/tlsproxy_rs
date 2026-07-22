@@ -16,3 +16,4 @@ admin-server.key
 *.log
 runtime/
 .claude/worktrees/
+*.local.*

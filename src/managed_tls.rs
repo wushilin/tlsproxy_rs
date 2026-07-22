@@ -27,6 +27,20 @@ struct CachedCertificate {
 }
 
 impl ManagedCertificateCache {
+    /// Atomically activates a persisted generation and makes it available to
+    /// all new TLS handshakes before returning.
+    pub async fn activate_and_reload(
+        &self,
+        store: &Store,
+        generation: CertificateGeneration,
+        renewal: crate::acme_types::RenewalState,
+    ) -> Result<usize> {
+        store
+            .activate_generation_async(generation, renewal)
+            .await?;
+        self.reload(store).await
+    }
+
     pub async fn reload(&self, store: &Store) -> Result<usize> {
         let store = store.clone();
         let entries = tokio::task::spawn_blocking(move || load_entries(&store))
@@ -221,6 +235,43 @@ mod tests {
             .resolve_with_fallback("unknown.example", &ca, CertificateFallbackPolicy::Reject)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn activation_hot_swaps_the_generation_for_new_handshakes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let managed = ManagedCertificate {
+            id: "site".into(),
+            domains: vec!["www.example".into()],
+            ..Default::default()
+        };
+        store.save_managed_certificate(&managed).unwrap();
+        let cache = ManagedCertificateCache::default();
+
+        let mut first = generation("site", &["www.example"]);
+        first.id = "generation-1".into();
+        cache
+            .activate_and_reload(
+                &store,
+                first,
+                crate::acme_types::RenewalState { certificate_id: "site".into(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cache.identity("www.example").await.unwrap().1, "generation-1");
+
+        let mut second = generation("site", &["www.example"]);
+        second.id = "generation-2".into();
+        cache
+            .activate_and_reload(
+                &store,
+                second,
+                crate::acme_types::RenewalState { certificate_id: "site".into(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cache.identity("www.example").await.unwrap().1, "generation-2");
     }
 
     #[test]

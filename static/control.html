@@ -1,25 +1,255 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>TLS Proxy Control</title>
-<style>body{font:15px system-ui;max-width:1200px;margin:auto;padding:2rem;background:#fafafa;color:#17202a}nav{position:sticky;top:0;background:#fafafa;padding:.7rem 0}section{background:white;border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}textarea{width:100%;min-height:17rem;font:13px monospace}input{margin:.25rem;padding:.4rem}button{margin:.25rem;padding:.45rem .7rem}pre{white-space:pre-wrap;overflow:auto;background:#f3f5f7;padding:1rem;border-radius:5px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem}.danger{color:#a00}</style></head>
-<body><main><h1>TLS Proxy Control Plane</h1><nav><a href="#status">Status</a> · <a href="#settings">Listeners & settings</a> · <a href="#auto-certs">Auto Certs</a> · <a href="#publishing">Publishing</a> · <a href="#history">Revisions</a> · <a href="#audit">Diagnostics</a></nav>
-<section id="status"><h2>Runtime status</h2><button onclick="load()">Refresh</button><pre id="statusData"></pre></section>
-<section id="settings"><h2>Listeners and runtime configuration</h2><p>The mandatory 443 listener cannot be removed. Host routing and additional listeners are edited in this stored JSON revision.</p><textarea id="config"></textarea><button onclick="saveConfig()">Save and apply</button></section>
-<section id="auto-certs"><h2>Auto Certs</h2><button onclick="renew()">Scan / renew now</button><div class="grid"><div><h3>Providers</h3><pre id="providers"></pre></div><div><h3>Managed certificates</h3><pre id="certs"></pre></div></div>
-<h3>Add or update provider</h3><input id="providerId" placeholder="provider id"><input id="providerName" placeholder="display name"><input id="directoryUrl" placeholder="ACME directory URL"><input id="contacts" placeholder="mailto:admin@example"><input id="eabKid" placeholder="EAB key ID"><input id="eabHmac" type="password" placeholder="EAB HMAC (blank preserves)"><label><input id="staging" type="checkbox">Staging</label><button onclick="saveProvider()">Save provider</button>
-<h3>Add or update certificate</h3><input id="certId" placeholder="certificate id"><input id="domains" placeholder="domain1,domain2"><input id="provider" placeholder="provider id"><label><input id="publish" type="checkbox">Publish cert</label><label><input id="publishKey" type="checkbox">Allow key export</label><button onclick="saveCert()">Save certificate</button></section>
-<section id="publishing"><h2>Certificate retrieval tokens</h2><p>The bearer is displayed once. Empty certificate IDs grants access to every certificate whose publication policy is enabled.</p><pre id="tokens"></pre><input id="tokenLabel" placeholder="token label"><input id="tokenCerts" placeholder="certificate IDs, or blank"><input id="tokenExpiry" type="datetime-local"><label><input id="tokenKey" type="checkbox">May export keys</label><button onclick="createToken()">Create token</button><pre id="newToken"></pre></section>
-<section id="history"><h2>Configuration revisions</h2><pre id="historyData"></pre><input id="rollbackRevision" type="number" min="1" placeholder="revision"><button class="danger" onclick="rollback()">Rollback as new revision</button></section>
-<section id="audit"><h2>DNS diagnostics</h2><pre id="dnsData"></pre><h2>Recent audit</h2><pre id="auditData"></pre></section>
-<section><h2>Session</h2><button onclick="logout()">Logout</button></section><pre id="message"></pre>
-<script>
-let session,revision;const $=id=>document.getElementById(id);
-async function api(url,options={}){options.headers={...(options.headers||{}),'x-csrf-token':session?.csrf_token||''};let r=await fetch(url,options);if(!r.ok&&r.status!==204)throw new Error(await r.text());return r}
-async function json(url){return await(await api(url)).json()}
-async function load(){try{session=await(await fetch('/tlsproxy_api/session')).json();let stored=await json('/tlsproxy_api/config');revision=stored.revision;$('config').value=JSON.stringify(stored.config,null,2);let [s,p,c,t,h,d,a]=await Promise.all(['/tlsproxy_api/status','/tlsproxy_api/providers','/tlsproxy_api/managed_certs','/tlsproxy_api/retrieval_tokens','/tlsproxy_api/config/history','/tlsproxy_api/dns_diagnostics','/tlsproxy_api/audit'].map(json));[['statusData',s],['providers',p],['certs',c],['tokens',t],['historyData',h],['dnsData',d],['auditData',a]].forEach(([id,v])=>$(id).textContent=JSON.stringify(v,null,2))}catch(e){$('message').textContent=e}}
-async function saveConfig(){try{await api('/tlsproxy_api/config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({revision,config:JSON.parse($('config').value)})});$('message').textContent='Saved; runtime is reloading'}catch(e){$('message').textContent=e}}
-async function saveCert(){try{await api('/tlsproxy_api/managed_certs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:$('certId').value,domains:$('domains').value.split(',').map(x=>x.trim()).filter(Boolean),provider_id:$('provider').value,enabled:true,publish:{enabled:$('publish').checked,allow_private_key:$('publishKey').checked}})});await load()}catch(e){$('message').textContent=e}}
-async function saveProvider(){try{await api('/tlsproxy_api/providers',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({id:$('providerId').value,name:$('providerName').value,directory_url:$('directoryUrl').value,contacts:$('contacts').value.split(',').map(x=>x.trim()).filter(Boolean),eab_key_id:$('eabKid').value||null,eab_hmac_key:$('eabHmac').value||null,staging:$('staging').checked})});$('eabHmac').value='';await load()}catch(e){$('message').textContent=e}}
-async function createToken(){try{let expiry=$('tokenExpiry').value;let result=await(await api('/tlsproxy_api/retrieval_tokens',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({label:$('tokenLabel').value,certificate_ids:$('tokenCerts').value.split(',').map(x=>x.trim()).filter(Boolean),allow_private_key:$('tokenKey').checked,expires_at:expiry?new Date(expiry).toISOString():null})})).json();$('newToken').textContent='Copy now; it will not be shown again:\n'+result.bearer_token;await load()}catch(e){$('message').textContent=e}}
-async function rollback(){if(!confirm('Apply this historical configuration as a new revision?'))return;try{await api('/tlsproxy_api/config/rollback/'+$('rollbackRevision').value,{method:'POST'});$('message').textContent='Rollback saved; runtime is reloading'}catch(e){$('message').textContent=e}}
-async function renew(){try{await api('/tlsproxy_api/renew',{method:'POST'});$('message').textContent='Renewal scan requested'}catch(e){$('message').textContent=e}}
-async function logout(){await api('/logout',{method:'POST'});location='/login'}load();
-</script></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>TLS Proxy Console</title>
+  <link rel="stylesheet" href="/styles.css">
+  <style>
+    .control-section { display: none; }
+    .control-section.active { display: grid; gap: 16px; }
+    .json-editor { min-height: 32rem; }
+    .json-output { margin: 0; max-height: 34rem; overflow: auto; padding: 16px 20px; background: var(--surface-2); font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .panel-body.form-stack { display: grid; gap: 16px; }
+    .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .section-heading p { margin-top: 2px; color: var(--muted); font-size: 12.5px; }
+    .message-bar { position: fixed; right: 16px; bottom: 16px; z-index: 50; width: min(420px, calc(100vw - 32px)); padding: 11px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow-lg); font-size: 13px; white-space: pre-wrap; }
+    .session-user { color: var(--muted); font-size: 12px; }
+    .checkbox-field { display: flex; align-items: center; gap: 9px; min-height: 38px; padding-top: 20px; }
+    .checkbox-field input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+    .checkbox-field label { margin: 0; cursor: pointer; }
+    .listener-stack { display: grid; gap: 14px; }
+    .route-summary { display: flex; gap: 6px; flex-wrap: wrap; }
+    .route-summary .badge { text-transform: none; }
+    .settings-actions { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+    .advanced-editor summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+    .advanced-editor[open] summary { margin-bottom: 12px; }
+    .route-actions { white-space: nowrap; text-align: right; }
+    @media (max-width: 1000px) { .sidebar nav { overflow-y: auto; } }
+    @media (max-width: 680px) {
+      .sidebar nav { display: flex; overflow-x: auto; }
+      .sidebar .nav-item { min-width: 48px; }
+      .message-bar { bottom: 76px; }
+      .json-editor { min-height: 24rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 7.9 7.7 9.4a1 1 0 0 0 .6 0C16.6 18.9 20 16 20 11V5l-8-3z"/><path d="M9.5 11.5 11.5 13.5 15 10"/></svg>
+        </div>
+        <div class="brand-text"><strong>TLS Proxy</strong><span>Admin console</span></div>
+      </div>
+      <nav aria-label="Primary">
+        <button class="nav-item" data-view="status"><span class="nav-icon">◫</span><span class="nav-label">Overview</span></button>
+        <button class="nav-item active" data-view="settings"><span class="nav-icon">⇄</span><span class="nav-label">Settings</span></button>
+        <button class="nav-item" data-view="auto-certs"><span class="nav-icon">✓</span><span class="nav-label">Auto Certs</span></button>
+        <button class="nav-item" data-view="publishing"><span class="nav-icon">↗</span><span class="nav-label">Publishing</span></button>
+        <button class="nav-item" data-view="history"><span class="nav-icon">↶</span><span class="nav-label">Revisions</span></button>
+        <button class="nav-item" data-view="audit"><span class="nav-icon">⌕</span><span class="nav-label">Diagnostics</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <button class="theme-toggle" id="theme-toggle" title="Toggle color theme"><span aria-hidden="true">◐</span><span class="nav-label">Theme</span></button>
+        <p class="sidebar-note nav-label">Configuration and certificates are stored in the proxy runtime database.</p>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div class="page-heading"><h1 id="page-title">Settings</h1><p id="page-subtitle">Listeners and runtime configuration</p></div>
+        <div class="topbar-actions">
+          <span class="session-user" id="session-user"></span>
+          <button class="button" onclick="load()">Refresh</button>
+          <button class="button outline-danger" onclick="logout()">Logout</button>
+        </div>
+      </header>
+
+      <div class="content">
+        <section id="status" class="control-section">
+          <div class="panel"><div class="panel-header"><div class="panel-title"><h2>Runtime status</h2><p>Current listeners, certificate state, and active revision</p></div></div><pre class="json-output" id="statusData"></pre></div>
+        </section>
+
+        <section id="settings" class="control-section active">
+          <div class="section-heading"><div><h2>Listeners</h2><p>Route each hostname independently. Routes are evaluated from top to bottom.</p></div><button class="button primary" onclick="openListenerEditor()">Add listener</button></div>
+          <div class="note info"><strong>Host-specific behavior:</strong> TLS routes can pass through, terminate TLS, or reject. HTTP routes select their own target. The unmatched-host rule is applied only after no configured route matches.</div>
+          <div class="listener-stack" id="listener-list"></div>
+          <div class="panel">
+            <div class="panel-header"><div class="panel-title"><h2>Control plane</h2><p>Service identity, DNS validation, and certificate fallback</p></div></div>
+            <div class="panel-body form-stack"><div class="form-grid three">
+              <div class="field"><label for="control-hostname">Control hostname</label><input id="control-hostname" onchange="updateGeneralConfig()"></div>
+              <div class="field"><label for="self-ips">Self IP addresses</label><input id="self-ips" placeholder="192.0.2.10, 2001:db8::10" onchange="updateGeneralConfig()"></div>
+              <div class="field"><label for="public-resolvers">Public DNS resolvers</label><input id="public-resolvers" placeholder="1.1.1.1, 8.8.8.8" onchange="updateGeneralConfig()"></div>
+              <div class="field"><label for="cert-fallback">Certificate fallback</label><select id="cert-fallback" onchange="updateGeneralConfig()"><option value="local_ca">Issue from local CA</option><option value="reject">Reject connection</option></select></div>
+            </div></div>
+          </div>
+          <div class="panel"><div class="panel-body form-stack">
+            <details class="advanced-editor" id="advanced-config"><summary>Advanced: edit complete configuration JSON</summary><div class="field"><textarea class="json-editor" id="config" spellcheck="false"></textarea><p class="helper">Applying JSON replaces the form state. Use this for DNS overrides, accounting, ACME tuning, or fields not represented above.</p></div><button class="button" onclick="applyAdvancedJson()">Apply JSON to form</button></details>
+            <div class="settings-actions"><button class="button" onclick="load()">Discard changes</button><button class="button primary" onclick="saveConfig()">Save and apply</button></div>
+          </div></div>
+        </section>
+
+        <section id="auto-certs" class="control-section">
+          <div class="section-heading"><div><h2>Automatic certificates</h2><p>Manage ACME providers and certificate renewal.</p></div><button class="button primary" onclick="renew()">Scan / renew now</button></div>
+          <div class="split">
+            <div class="panel"><div class="panel-header"><div class="panel-title"><h2>Providers</h2><p>Configured ACME directory services</p></div></div><pre class="json-output" id="providers"></pre></div>
+            <div class="panel"><div class="panel-header"><div class="panel-title"><h2>Managed certificates</h2><p>Issuance and publication state</p></div></div><pre class="json-output" id="certs"></pre></div>
+          </div>
+          <div class="panel"><div class="panel-header"><div class="panel-title"><h2>Add or update provider</h2><p>Blank EAB HMAC preserves the existing secret.</p></div></div><div class="panel-body form-stack"><div class="form-grid">
+            <div class="field"><label for="providerId">Provider ID</label><input id="providerId" placeholder="letsencrypt-production"></div>
+            <div class="field"><label for="providerName">Display name</label><input id="providerName" placeholder="Let's Encrypt"></div>
+            <div class="field full"><label for="directoryUrl">ACME directory URL</label><input id="directoryUrl" placeholder="https://acme.example/directory"></div>
+            <div class="field"><label for="contacts">Contacts</label><input id="contacts" placeholder="mailto:admin@example.com"></div>
+            <div class="field"><label for="eabKid">EAB key ID</label><input id="eabKid"></div>
+            <div class="field"><label for="eabHmac">EAB HMAC</label><input id="eabHmac" type="password" placeholder="Leave blank to preserve"></div>
+            <div class="checkbox-field"><input id="staging" type="checkbox"><label for="staging">Staging provider</label></div>
+          </div><div class="action-row"><button class="button primary" onclick="saveProvider()">Save provider</button></div></div></div>
+          <div class="panel"><div class="panel-header"><div class="panel-title"><h2>Add or update certificate</h2><p>Domains are comma separated.</p></div></div><div class="panel-body form-stack"><div class="form-grid">
+            <div class="field"><label for="certId">Certificate ID</label><input id="certId" placeholder="example-com"></div>
+            <div class="field"><label for="provider">Provider ID</label><input id="provider" placeholder="letsencrypt-production"></div>
+            <div class="field full"><label for="domains">Domains</label><input id="domains" placeholder="example.com, www.example.com"></div>
+            <div class="checkbox-field"><input id="publish" type="checkbox"><label for="publish">Publish certificate</label></div>
+            <div class="checkbox-field"><input id="publishKey" type="checkbox"><label for="publishKey">Allow private-key export</label></div>
+          </div><div class="action-row"><button class="button primary" onclick="saveCert()">Save certificate</button></div></div></div>
+        </section>
+
+        <section id="publishing" class="control-section">
+          <div class="panel"><div class="panel-header"><div class="panel-title"><h2>Certificate retrieval tokens</h2><p>The bearer is displayed once. Empty certificate IDs grant access to every certificate enabled for publication.</p></div></div><pre class="json-output" id="tokens"></pre></div>
+          <div class="panel"><div class="panel-header"><div class="panel-title"><h2>Create retrieval token</h2><p>Limit access by certificate, expiry, and key-export permission.</p></div></div><div class="panel-body form-stack"><div class="form-grid">
+            <div class="field"><label for="tokenLabel">Token label</label><input id="tokenLabel" placeholder="deployment-agent"></div>
+            <div class="field"><label for="tokenExpiry">Expires at</label><input id="tokenExpiry" type="datetime-local"></div>
+            <div class="field full"><label for="tokenCerts">Certificate IDs</label><input id="tokenCerts" placeholder="Blank for all published certificates"></div>
+            <div class="checkbox-field"><input id="tokenKey" type="checkbox"><label for="tokenKey">May export private keys</label></div>
+          </div><div class="action-row"><button class="button primary" onclick="createToken()">Create token</button></div><pre class="json-output" id="newToken" hidden></pre></div></div>
+        </section>
+
+        <section id="history" class="control-section">
+          <div class="panel"><div class="panel-header"><div class="panel-title"><h2>Configuration revisions</h2><p>Every rollback creates a new revision and preserves history.</p></div></div><pre class="json-output" id="historyData"></pre></div>
+          <div class="panel"><div class="panel-body"><div class="form-grid"><div class="field"><label for="rollbackRevision">Revision to restore</label><input id="rollbackRevision" type="number" min="1" placeholder="Revision number"></div><div class="form-footer"><button class="button outline-danger" onclick="rollback()">Rollback as new revision</button></div></div></div></div>
+        </section>
+
+        <section id="audit" class="control-section">
+          <div class="panel"><div class="panel-header"><div class="panel-title"><h2>DNS diagnostics</h2><p>Recent DNS observations used for validation and issuance</p></div></div><pre class="json-output" id="dnsData"></pre></div>
+          <div class="panel"><div class="panel-header"><div class="panel-title"><h2>Recent audit</h2><p>Administrative and certificate publication events</p></div></div><pre class="json-output" id="auditData"></pre></div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <dialog class="editor-dialog" id="listener-dialog"><form id="listener-form">
+    <div class="dialog-header"><h2 id="listener-dialog-title">Listener</h2><p>Choose the protocol and bind address. Host routing is configured after the listener is created.</p></div>
+    <div class="dialog-section"><div class="form-grid three">
+      <div class="field"><label for="listener-name">Name</label><input id="listener-name" required></div>
+      <div class="field"><label for="listener-protocol">Protocol</label><select id="listener-protocol"><option value="tls">TLS / SNI</option><option value="http">HTTP / Host</option><option value="forward">Raw forwarding</option></select></div>
+      <div class="field"><label for="listener-bind">Bind address</label><input id="listener-bind" required placeholder="0.0.0.0:8443"></div>
+      <div class="field full" id="forward-target-field" hidden><label for="forward-targets">Forward targets</label><input id="forward-targets" placeholder="server1:443,server2:443"></div>
+    </div></div><div class="dialog-actions"><button type="button" class="button" onclick="$('listener-dialog').close()">Cancel</button><button class="button primary">Save listener</button></div>
+  </form></dialog>
+  <dialog class="editor-dialog" id="route-dialog"><form id="route-form">
+    <div class="dialog-header"><h2 id="route-dialog-title">Hostname route</h2><p>A route matches if any exact name, suffix, or regular expression matches. First matching route wins.</p></div>
+    <div class="dialog-section"><div class="form-grid">
+      <div class="field"><label for="route-name">Route name</label><input id="route-name" required placeholder="internal applications"></div>
+      <div class="field"><label for="route-mode">Behavior</label><select id="route-mode"><option value="passthrough">TLS passthrough</option><option value="terminate_plaintext">Terminate → plaintext</option><option value="terminate_tls">Terminate → TLS</option><option value="reject">Reject</option></select></div>
+      <div class="field full"><label for="route-exact">Exact hostnames</label><textarea id="route-exact" placeholder="app.example.com&#10;api.example.com"></textarea></div>
+      <div class="field"><label for="route-suffix">Domain suffixes</label><textarea id="route-suffix" placeholder="internal.example.com"></textarea></div>
+      <div class="field"><label for="route-patterns">Regular expressions</label><textarea id="route-patterns" placeholder="^app[0-9]+\\.example\\.com$"></textarea></div>
+      <div class="field"><label for="route-target">Override target (optional)</label><input id="route-target" placeholder="backend.internal"></div>
+      <div class="field"><label for="route-port">Target port</label><input id="route-port" type="number" min="1" max="65535" required></div>
+    </div></div><div class="dialog-actions"><button type="button" class="button" onclick="$('route-dialog').close()">Cancel</button><button class="button primary">Save route</button></div>
+  </form></dialog>
+  <div class="message-bar" id="message" role="status" hidden></div>
+  <script>
+    let session, revision, runtimeConfig;
+    let editingListener = null;
+    let editingRoute = null;
+    const $ = id => document.getElementById(id);
+    const views = {
+      status: ['Overview', 'Live status of the proxy service'],
+      settings: ['Settings', 'Listeners and runtime configuration'],
+      'auto-certs': ['Auto Certs', 'Providers, certificates, and renewal'],
+      publishing: ['Publishing', 'Certificate retrieval access'],
+      history: ['Revisions', 'Configuration history and rollback'],
+      audit: ['Diagnostics', 'DNS observations and recent audit events']
+    };
+    function showMessage(value) { const node = $('message'); node.textContent = value instanceof Error ? value.message : value; node.hidden = !node.textContent; if (node.textContent) setTimeout(() => node.hidden = true, 7000); }
+    function setView(view) { document.querySelectorAll('.control-section').forEach(node => node.classList.toggle('active', node.id === view)); document.querySelectorAll('[data-view]').forEach(node => node.classList.toggle('active', node.dataset.view === view)); [$('page-title').textContent, $('page-subtitle').textContent] = views[view]; history.replaceState(null, '', '#' + view); }
+    document.querySelectorAll('[data-view]').forEach(node => node.addEventListener('click', () => setView(node.dataset.view)));
+    const savedTheme = localStorage.getItem('tlsproxy-theme'); if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+    $('theme-toggle').addEventListener('click', () => { const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = next; localStorage.setItem('tlsproxy-theme', next); });
+    async function api(url, options = {}) { options.headers = {...(options.headers || {}), 'x-csrf-token': session?.csrf_token || ''}; const response = await fetch(url, options); if (!response.ok && response.status !== 204) throw new Error(await response.text()); return response; }
+    async function json(url) { return await (await api(url)).json(); }
+    const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[character]));
+    const lines = value => String(value || '').split(/[\n,]+/).map(item => item.trim()).filter(Boolean);
+    const routeLabel = action => !action.mode ? `Forward → ${action.upstream === 'tls' ? 'TLS' : 'plaintext'}` : action.mode === 'passthrough' ? 'TLS passthrough' : action.mode === 'terminate' ? `Terminate → ${action.upstream === 'tls' ? 'TLS' : 'plaintext'}` : 'Reject';
+    const targetLabel = action => action.mode === 'reject' ? 'No upstream' : `${action.target || 'original hostname'}:${action.target_port}`;
+    function routingFor(key) {
+      return key === '__default__' ? runtimeConfig.default_listener.ordinary_traffic : (runtimeConfig.additional_listeners[key].routing || runtimeConfig.additional_listeners[key]);
+    }
+    function normalizeRouting(routing, protocol) {
+      routing.routes ||= [];
+      routing.unknown_host_policy ||= 'ALLOW';
+      routing.unknown_host_rules ||= {static_hosts: [], patterns: []};
+      routing.unknown_host_rules.static_hosts ||= [];
+      routing.unknown_host_rules.patterns ||= [];
+      routing.default_route ||= protocol === 'http' ? {target_port:80, upstream:'plaintext'} : {mode:'passthrough', target_port:443};
+      return routing;
+    }
+    function listenerCard(key, listener, mandatory = false) {
+      const keyToken = encodeURIComponent(key).replace(/'/g, '%27');
+      const protocol = mandatory ? 'tls' : listener.protocol;
+      const bind = listener.bind;
+      if (protocol === 'forward') return `<article class="listener-card"><header><div class="listener-title"><h3>${escapeHtml(key)}</h3><span class="badge">Raw forwarding</span><code>${escapeHtml(bind)}</code></div><div class="action-row"><button class="button small" onclick="openListenerEditor('${keyToken}')">Edit</button><button class="button small outline-danger" onclick="removeListener('${keyToken}')">Remove</button></div></header><div class="card-section"><strong>${escapeHtml(listener.targets)}</strong><p class="helper">Hostname rules are unavailable for raw byte forwarding.</p></div></article>`;
+      const routing = normalizeRouting(mandatory ? listener.ordinary_traffic : (protocol === 'tls' ? listener.routing : listener), protocol);
+      const rows = routing.routes.map((route, index) => `<tr><td><strong>${escapeHtml(route.name || `Route ${index + 1}`)}</strong></td><td><div class="route-summary">${(route.matcher.exact || []).map(v=>`<span class="badge">=${escapeHtml(v)}</span>`).join('')}${(route.matcher.suffix || []).map(v=>`<span class="badge">*.${escapeHtml(v.replace(/^\./,''))}</span>`).join('')}${(route.matcher.patterns || []).map(v=>`<span class="badge">/${escapeHtml(v)}/</span>`).join('')}</div></td><td>${escapeHtml(routeLabel(route.action))}<br><small class="muted">${escapeHtml(targetLabel(route.action))}</small></td><td class="route-actions"><button class="button small" onclick="moveRoute('${keyToken}',${index},-1)" ${index===0?'disabled':''}>↑</button><button class="button small" onclick="moveRoute('${keyToken}',${index},1)" ${index===routing.routes.length-1?'disabled':''}>↓</button><button class="button small" onclick="openRouteEditor('${keyToken}',${index})">Edit</button><button class="button small outline-danger" onclick="removeRoute('${keyToken}',${index})">Remove</button></td></tr>`).join('');
+      const fallback = routing.default_route;
+      return `<article class="listener-card"><header><div class="listener-title"><h3>${escapeHtml(mandatory ? 'Public HTTPS' : key)}</h3><span class="badge accent">${mandatory ? 'Mandatory' : protocol.toUpperCase()}</span><code>${escapeHtml(bind)}</code></div><div class="action-row"><button class="button small" onclick="openListenerEditor('${keyToken}')">Edit</button>${mandatory?'':`<button class="button small outline-danger" onclick="removeListener('${keyToken}')">Remove</button>`}</div></header>
+        <div class="card-section"><div class="section-heading"><div><h4>Hostname routes</h4><p>First match wins</p></div><button class="button small primary" onclick="openRouteEditor('${keyToken}')">Add host route</button></div>${rows?`<div class="table-wrap"><table><thead><tr><th>Name</th><th>Host match</th><th>Behavior</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty"><strong>No hostname routes</strong>Unmatched-host behavior applies to every host.</div>'}</div>
+        <div class="card-section"><h4>Unmatched hosts</h4><div class="form-grid three"><div class="field"><label>Rule</label><select onchange="setFallback('${keyToken}','policy',this.value)"><option value="ALLOW" ${routing.unknown_host_policy==='ALLOW'?'selected':''}>Allow only listed hosts</option><option value="DENY" ${routing.unknown_host_policy==='DENY'?'selected':''}>Deny listed hosts</option></select></div><div class="field"><label>Host list</label><input value="${escapeHtml(routing.unknown_host_rules.static_hosts.join(', '))}" onchange="setFallback('${keyToken}','hosts',this.value)" placeholder="host1.example, host2.example"></div><div class="field"><label>Fallback behavior</label><select onchange="setFallback('${keyToken}','mode',this.value)">${protocol==='tls'?`<option value="passthrough" ${fallback.mode==='passthrough'?'selected':''}>TLS passthrough</option><option value="terminate_plaintext" ${fallback.mode==='terminate'&&fallback.upstream!=='tls'?'selected':''}>Terminate → plaintext</option><option value="terminate_tls" ${fallback.mode==='terminate'&&fallback.upstream==='tls'?'selected':''}>Terminate → TLS</option><option value="reject" ${fallback.mode==='reject'?'selected':''}>Reject</option>`:`<option value="http_plaintext" ${fallback.upstream!=='tls'?'selected':''}>Forward → plaintext</option><option value="http_tls" ${fallback.upstream==='tls'?'selected':''}>Forward → TLS</option>`}</select></div><div class="field"><label>Fallback target</label><input value="${escapeHtml(fallback.target || '')}" onchange="setFallback('${keyToken}','target',this.value)" placeholder="Original hostname"></div><div class="field"><label>Fallback port</label><input type="number" min="1" max="65535" value="${fallback.target_port || (protocol==='http'?80:443)}" onchange="setFallback('${keyToken}','port',this.value)"></div></div></div></article>`;
+    }
+    function renderConfig() {
+      if (!runtimeConfig) return;
+      runtimeConfig.additional_listeners ||= {};
+      $('listener-list').innerHTML = listenerCard('__default__', runtimeConfig.default_listener, true) + Object.entries(runtimeConfig.additional_listeners).sort(([a],[b])=>a.localeCompare(b)).map(([name,value])=>listenerCard(name,value)).join('');
+      runtimeConfig.control_plane ||= {};
+      $('control-hostname').value = runtimeConfig.control_plane.hostname || '';
+      $('self-ips').value = (runtimeConfig.control_plane.self_ips || []).join(', ');
+      $('public-resolvers').value = (runtimeConfig.control_plane.public_resolvers || []).join(', ');
+      $('cert-fallback').value = runtimeConfig.certificate_fallback || 'local_ca';
+      $('config').value = JSON.stringify(runtimeConfig, null, 2);
+    }
+    async function load() { try { session = await (await fetch('/tlsproxy_api/session')).json(); $('session-user').textContent = session.username; const stored = await json('/tlsproxy_api/config'); revision = stored.revision; runtimeConfig = stored.config; renderConfig(); const [s,p,c,t,h,d,a] = await Promise.all(['/tlsproxy_api/status','/tlsproxy_api/providers','/tlsproxy_api/managed_certs','/tlsproxy_api/retrieval_tokens','/tlsproxy_api/config/history','/tlsproxy_api/dns_diagnostics','/tlsproxy_api/audit'].map(json)); [['statusData',s],['providers',p],['certs',c],['tokens',t],['historyData',h],['dnsData',d],['auditData',a]].forEach(([id,v]) => $(id).textContent = JSON.stringify(v,null,2)); } catch (error) { showMessage(error); } }
+    async function saveConfig() { try { updateGeneralConfig(); await api('/tlsproxy_api/config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({revision,config:runtimeConfig})}); showMessage('Saved; runtime is reloading'); await load(); } catch(error) { showMessage(error); } }
+    function updateGeneralConfig() { if (!runtimeConfig) return; runtimeConfig.control_plane ||= {}; runtimeConfig.control_plane.hostname=$('control-hostname').value.trim(); runtimeConfig.control_plane.self_ips=lines($('self-ips').value); runtimeConfig.control_plane.public_resolvers=lines($('public-resolvers').value); runtimeConfig.certificate_fallback=$('cert-fallback').value; $('config').value=JSON.stringify(runtimeConfig,null,2); }
+    function applyAdvancedJson() { try { runtimeConfig=JSON.parse($('config').value); renderConfig(); showMessage('JSON applied to the form; save to activate it.'); } catch(error) { showMessage(error); } }
+    function openListenerEditor(key = null) { editingListener=key; const mandatory=key==='__default__'; const current=mandatory?runtimeConfig.default_listener:(key?runtimeConfig.additional_listeners[key]:null); $('listener-dialog-title').textContent=mandatory?'Edit mandatory HTTPS listener':key?'Edit listener':'Add listener'; $('listener-name').value=mandatory?'Public HTTPS':key||''; $('listener-name').disabled=mandatory; $('listener-protocol').value=mandatory?'tls':current?.protocol||'tls'; $('listener-protocol').disabled=mandatory; $('listener-bind').value=current?.bind||(mandatory?'0.0.0.0:443':'0.0.0.0:8443'); $('forward-targets').value=current?.targets||''; syncListenerProtocol(); $('listener-dialog').showModal(); }
+    function syncListenerProtocol(){ $('forward-target-field').hidden=$('listener-protocol').value!=='forward'; }
+    $('listener-protocol').addEventListener('change',syncListenerProtocol);
+    $('listener-form').addEventListener('submit',event=>{ event.preventDefault(); const mandatory=editingListener==='__default__'; const name=mandatory?'__default__':$('listener-name').value.trim(); if(!name) return; if(!mandatory && name!==editingListener && runtimeConfig.additional_listeners[name]) return showMessage('A listener with that name already exists.'); const protocol=$('listener-protocol').value, bind=$('listener-bind').value.trim(); if(mandatory){ runtimeConfig.default_listener.bind=bind; } else { let value=editingListener?runtimeConfig.additional_listeners[editingListener]:null; if(!value||value.protocol!==protocol){ value=protocol==='tls'?{protocol:'tls',bind,routing:{routes:[],unknown_host_policy:'ALLOW',unknown_host_rules:{static_hosts:[],patterns:[]},default_route:{mode:'passthrough',target_port:443}}}:protocol==='http'?{protocol:'http',bind,routes:[],unknown_host_policy:'ALLOW',unknown_host_rules:{static_hosts:[],patterns:[]},default_route:{target_port:80,upstream:'plaintext'}}:{protocol:'forward',bind,targets:'',upstream_tls:false}; } value.bind=bind; if(protocol==='forward') value.targets=$('forward-targets').value.trim(); if(editingListener&&editingListener!==name) delete runtimeConfig.additional_listeners[editingListener]; runtimeConfig.additional_listeners[name]=value; } $('listener-dialog').close(); renderConfig(); });
+    function removeListener(key){ if(confirm(`Remove listener “${key}”?`)){ delete runtimeConfig.additional_listeners[key]; renderConfig(); } }
+    function openRouteEditor(key,index=null){ editingRoute={key,index}; const listener=key==='__default__'?runtimeConfig.default_listener:runtimeConfig.additional_listeners[key]; const protocol=key==='__default__'?'tls':listener.protocol; const routing=normalizeRouting(routingFor(key),protocol); const route=index===null?null:routing.routes[index]; $('route-dialog-title').textContent=route?'Edit hostname route':'Add hostname route'; $('route-name').value=route?.name||''; $('route-exact').value=(route?.matcher?.exact||[]).join('\n'); $('route-suffix').value=(route?.matcher?.suffix||[]).join('\n'); $('route-patterns').value=(route?.matcher?.patterns||[]).join('\n'); const action=route?.action; $('route-mode').innerHTML=protocol==='tls'?'<option value="passthrough">TLS passthrough</option><option value="terminate_plaintext">Terminate → plaintext</option><option value="terminate_tls">Terminate → TLS</option><option value="reject">Reject</option>':'<option value="http_plaintext">Forward → plaintext</option><option value="http_tls">Forward → TLS</option>'; $('route-mode').value=!action?(protocol==='tls'?'passthrough':'http_plaintext'):action.mode==='terminate'?`terminate_${action.upstream==='tls'?'tls':'plaintext'}`:protocol==='http'?`http_${action.upstream==='tls'?'tls':'plaintext'}`:action.mode; $('route-target').value=action?.target||''; $('route-port').value=action?.target_port||(protocol==='http'?80:443); syncRouteMode(); $('route-dialog').showModal(); }
+    function syncRouteMode(){ const reject=$('route-mode').value==='reject'; $('route-target').disabled=reject; $('route-port').disabled=reject; $('route-port').required=!reject; }
+    $('route-mode').addEventListener('change',syncRouteMode);
+    $('route-form').addEventListener('submit',event=>{ event.preventDefault(); const {key,index}=editingRoute; const listener=key==='__default__'?runtimeConfig.default_listener:runtimeConfig.additional_listeners[key]; const protocol=key==='__default__'?'tls':listener.protocol; const routing=normalizeRouting(routingFor(key),protocol); const mode=$('route-mode').value; let action; if(mode==='reject') action={mode:'reject'}; else if(protocol==='http') action={target_port:Number($('route-port').value),upstream:mode==='http_tls'?'tls':'plaintext'}; else if(mode==='passthrough') action={mode:'passthrough',target_port:Number($('route-port').value)}; else action={mode:'terminate',target_port:Number($('route-port').value),upstream:mode==='terminate_tls'?'tls':'plaintext'}; const target=$('route-target').value.trim(); if(target&&mode!=='reject') action.target=target; const patternLines=value=>String(value||'').split('\n').map(item=>item.trim()).filter(Boolean); const route={name:$('route-name').value.trim(),matcher:{exact:lines($('route-exact').value),suffix:lines($('route-suffix').value),patterns:patternLines($('route-patterns').value)},action}; if(!route.matcher.exact.length&&!route.matcher.suffix.length&&!route.matcher.patterns.length) return showMessage('Add at least one hostname matcher.'); if(index===null) routing.routes.push(route); else routing.routes[index]=route; $('route-dialog').close(); renderConfig(); });
+    function removeRoute(key,index){ if(confirm('Remove this hostname route?')){ routingFor(key).routes.splice(index,1); renderConfig(); } }
+    function moveRoute(key,index,offset){ const routes=routingFor(key).routes, target=index+offset; if(target<0||target>=routes.length)return; [routes[index],routes[target]]=[routes[target],routes[index]]; renderConfig(); }
+    function setFallback(key,field,value){ const listener=key==='__default__'?runtimeConfig.default_listener:runtimeConfig.additional_listeners[key]; const protocol=key==='__default__'?'tls':listener.protocol; const routing=normalizeRouting(routingFor(key),protocol); if(field==='policy') routing.unknown_host_policy=value; if(field==='hosts') routing.unknown_host_rules.static_hosts=lines(value); if(field==='target'){ if(value.trim()) routing.default_route.target=value.trim(); else delete routing.default_route.target; } if(field==='port') routing.default_route.target_port=Number(value); if(field==='mode'){ const old=routing.default_route, port=old.target_port||(protocol==='http'?80:443), target=old.target; if(protocol==='http') routing.default_route={target_port:port,upstream:value==='http_tls'?'tls':'plaintext'}; else if(value==='reject') routing.default_route={mode:'reject'}; else if(value==='passthrough') routing.default_route={mode:'passthrough',target_port:port}; else routing.default_route={mode:'terminate',target_port:port,upstream:value==='terminate_tls'?'tls':'plaintext'}; if(target&&value!=='reject') routing.default_route.target=target; } $('config').value=JSON.stringify(runtimeConfig,null,2); if(field==='mode') renderConfig(); }
+    const decodedKey = key => key == null ? key : decodeURIComponent(key);
+    const openListenerEditorImpl=openListenerEditor, removeListenerImpl=removeListener, openRouteEditorImpl=openRouteEditor, removeRouteImpl=removeRoute, moveRouteImpl=moveRoute, setFallbackImpl=setFallback;
+    openListenerEditor=key=>openListenerEditorImpl(decodedKey(key));
+    removeListener=key=>removeListenerImpl(decodedKey(key));
+    openRouteEditor=(key,index=null)=>openRouteEditorImpl(decodedKey(key),index);
+    removeRoute=(key,index)=>removeRouteImpl(decodedKey(key),index);
+    moveRoute=(key,index,offset)=>moveRouteImpl(decodedKey(key),index,offset);
+    setFallback=(key,field,value)=>setFallbackImpl(decodedKey(key),field,value);
+    async function saveCert() { try { await api('/tlsproxy_api/managed_certs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:$('certId').value,domains:$('domains').value.split(',').map(x=>x.trim()).filter(Boolean),provider_id:$('provider').value,enabled:true,publish:{enabled:$('publish').checked,allow_private_key:$('publishKey').checked}})}); showMessage('Certificate saved'); await load(); } catch(error) { showMessage(error); } }
+    async function saveProvider() { try { await api('/tlsproxy_api/providers',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({id:$('providerId').value,name:$('providerName').value,directory_url:$('directoryUrl').value,contacts:$('contacts').value.split(',').map(x=>x.trim()).filter(Boolean),eab_key_id:$('eabKid').value||null,eab_hmac_key:$('eabHmac').value||null,staging:$('staging').checked})}); $('eabHmac').value=''; showMessage('Provider saved'); await load(); } catch(error) { showMessage(error); } }
+    async function createToken() { try { const expiry=$('tokenExpiry').value; const result=await(await api('/tlsproxy_api/retrieval_tokens',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({label:$('tokenLabel').value,certificate_ids:$('tokenCerts').value.split(',').map(x=>x.trim()).filter(Boolean),allow_private_key:$('tokenKey').checked,expires_at:expiry?new Date(expiry).toISOString():null})})).json(); $('newToken').hidden=false; $('newToken').textContent='Copy now; it will not be shown again:\n'+result.bearer_token; await load(); } catch(error) { showMessage(error); } }
+    async function rollback() { if(!confirm('Apply this historical configuration as a new revision?')) return; try { await api('/tlsproxy_api/config/rollback/'+$('rollbackRevision').value,{method:'POST'}); showMessage('Rollback saved; runtime is reloading'); await load(); } catch(error) { showMessage(error); } }
+    async function renew() { try { await api('/tlsproxy_api/renew',{method:'POST'}); showMessage('Renewal scan requested'); } catch(error) { showMessage(error); } }
+    async function logout() { await api('/logout',{method:'POST'}); location='/login'; }
+    const initialView = location.hash.slice(1); if (views[initialView]) setView(initialView); load();
+  </script>
+</body>
+</html>

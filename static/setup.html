@@ -23,6 +23,7 @@
     <label>Password <input name="password" type="password" minlength="12" required autocomplete="new-password"></label>
     <label>Control hostname <input name="control_hostname" placeholder="tls.example.com" required></label>
     <label>Public IPs, comma separated <input name="self_ips" placeholder="203.0.113.10, 2001:db8::10"></label>
+    <label>Public DNS resolvers, comma separated <input name="public_resolvers" value="1.1.1.1, 8.8.8.8" required><small>Used to verify that certificate hostnames resolve to this server. IPv4, IPv6, and optional ports are accepted.</small></label>
     <label>Initial ACME provider <select name="provider_id">
       <option value="letsencrypt-production">Let's Encrypt Production</option>
       <option value="letsencrypt-staging">Let's Encrypt Staging</option>
@@ -38,6 +39,7 @@
       const values = new FormData(event.currentTarget);
       const body = Object.fromEntries(values);
       body.self_ips = body.self_ips.split(',').map(value => value.trim()).filter(Boolean);
+      body.public_resolvers = body.public_resolvers.split(',').map(value => value.trim()).filter(Boolean);
       const response = await fetch('/tlsproxy_api/setup', {
         method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body)
       });

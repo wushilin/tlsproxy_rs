@@ -72,6 +72,7 @@ pub fn router(state: ControlState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_session));
     Router::new()
         .route("/login", get(login_page).post(login))
+        .route("/styles.css", get(stylesheet))
         .route("/tlsproxy_api/certs/{domain}", get(publish_certificate))
         .merge(protected)
         .with_state(state)
@@ -247,6 +248,10 @@ async fn runtime_status(State(state): State<ControlState>) -> Response {
 
 async fn login_page() -> Html<&'static str> {
     Html(include_str!("../static/login.html"))
+}
+
+async fn stylesheet() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../static/styles.css"))
 }
 
 async fn index() -> Html<&'static str> {

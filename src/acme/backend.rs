@@ -172,25 +172,22 @@ impl<D: DnsPrerequisite> StoreRenewalBackend<D> {
             Ok(None) => (None, None, None),
             Err(cause) => { log::warn!("ACME ARI lookup failed after issuance: cert={}, error={cause:#}", managed.id); (None, None, None) }
         };
-        self.store
-            .activate_generation_async(
-                generation,
-                RenewalState {
-                    certificate_id: managed.id,
-                    last_attempt: Some(now),
-                    last_success: Some(now),
-                    next_attempt: None,
-                    consecutive_failures: 0,
-                    last_error: None,
-                    ari_suggested_at,
-                    ari_explanation_url,
-                    ari_checked_at: Some(now),
-                    ari_next_check,
-                },
-            )
-            .await?;
+        let renewal = RenewalState {
+            certificate_id: managed.id,
+            last_attempt: Some(now),
+            last_success: Some(now),
+            next_attempt: None,
+            consecutive_failures: 0,
+            last_error: None,
+            ari_suggested_at,
+            ari_explanation_url,
+            ari_checked_at: Some(now),
+            ari_next_check,
+        };
         if let Some(cache) = &self.certificate_cache {
-            cache.reload(&self.store).await?;
+            cache.activate_and_reload(&self.store, generation, renewal).await?;
+        } else {
+            self.store.activate_generation_async(generation, renewal).await?;
         }
         Ok(())
     }

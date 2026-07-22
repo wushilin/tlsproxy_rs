@@ -54,12 +54,18 @@ pub struct SetupRequest {
     pub control_hostname: String,
     #[serde(default)]
     pub self_ips: Vec<String>,
+    #[serde(default = "default_public_resolvers")]
+    pub public_resolvers: Vec<String>,
     #[serde(default = "default_provider")]
     pub provider_id: String,
 }
 
 fn default_provider() -> String {
     "letsencrypt-production".into()
+}
+
+fn default_public_resolvers() -> Vec<String> {
+    vec!["1.1.1.1".into(), "8.8.8.8".into()]
 }
 
 #[derive(Debug, Serialize)]
@@ -264,9 +270,16 @@ fn complete_setup_inner(state: &SetupState, request: SetupRequest) -> Result<()>
         .iter()
         .map(|value| value.parse().map(|ip: IpAddr| ip.to_string()))
         .collect::<std::result::Result<_, _>>()?;
+    if request.public_resolvers.is_empty() {
+        bail!("at least one public DNS resolver must be configured");
+    }
+    for resolver in &request.public_resolvers {
+        crate::acme::dns::parse_resolver(resolver)?;
+    }
     let mut config = RuntimeConfig::default();
     config.control_plane.hostname = control_hostname;
     config.control_plane.self_ips = self_ips;
+    config.control_plane.public_resolvers = request.public_resolvers;
     config.control_plane.provider_id = request.provider_id;
     let administrator = UserRecord {
         username: username.into(),
@@ -319,6 +332,7 @@ mod tests {
                 password: "correct horse battery staple".into(),
                 control_hostname: "TLS.Example.".into(),
                 self_ips: vec!["192.0.2.1".into()],
+                public_resolvers: vec!["9.9.9.9".into(), "[2620:fe::fe]:53".into()],
                 provider_id: default_provider(),
             },
         )
@@ -332,6 +346,11 @@ mod tests {
         let control = store.certificate_for_domain("tls.example").unwrap().unwrap();
         assert_eq!(control.id, "control-plane");
         assert_eq!(control.provider_id, "letsencrypt-production");
+        let stored = store.load_config().unwrap().unwrap();
+        assert_eq!(
+            stored.config.control_plane.public_resolvers,
+            vec!["9.9.9.9", "[2620:fe::fe]:53"]
+        );
         assert!(store.active_generation(&control.id).unwrap().is_none());
         assert!(SetupServer::prepare(store, SetupOptions::default()).is_err());
     }
