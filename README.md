@@ -1,222 +1,178 @@
-# TLS Proxy with a UI
+# TLS Proxy
 
-# Configuration UI
-Online edit via Admin server
-![image](https://github.com/wushilin/tlsproxy_rs/assets/7019828/b2b1ae48-685b-4ee1-a820-3515cefb1b64)
+TLS Proxy is a hostname-routed TLS, HTTP, and layer-4 proxy with a RocksDB
+control plane and automatic ACME TLS-ALPN-01 certificate management.
 
-
-# Online configuration change
-![image](https://github.com/wushilin/tlsproxy_rs/assets/7019828/63af4d86-2f45-4ad7-99c1-ca2935a1dd5a)
-
-# DNS Override
-![image](https://github.com/wushilin/tlsproxy_rs/assets/7019828/9046871b-b38c-46e8-aadc-ea2aa1816da1)
-
-
-You may update the server config via web UI and trigger restart.
-
-# Realtime monitoring and statistics
-Visualize the listener and tls proxy status
-
-![image](https://github.com/wushilin/tlsproxy_rs/assets/7019828/264a1008-c13c-48bc-aba5-3a26ef88f0d4)
-
-
-Supports
-
-- Total connection
-- Active connection
-- Uploaded bytes
-- Downloaded bytes
-
-
-
-# Building
+## Build
 
 ```bash
-$ sh build.sh
+cargo build --release
 ```
 
-The management console is dependency-free and embedded into the release binary
-at compile time. It does not require Node.js or runtime Internet access.
-By default, `build.sh` builds the musl release binary at
-`target/x86_64-unknown-linux-musl/release/tlsproxy`. Override with
-`TARGET=... sh build.sh` if you need a different Rust target.
+Rust 1.88 or newer is required by the locked dependency set. A reproducible
+multi-stage [Dockerfile](Dockerfile) installs Clang/libclang only in the build
+stage. Deployment examples live under `deploy/`.
 
-# Running
+RocksDB's native build currently requires Clang/libclang development files.
+On Debian or Ubuntu, install `libclang-dev`. The management pages are embedded
+in the binary and require no Node.js or runtime Internet access.
+
+## First start
+
 ```bash
-$ tlsproxy run -c config.yaml
+tlsproxy run --runtime-dir /var/lib/tlsproxy
 ```
 
-When no subcommand is supplied, `tlsproxy` defaults to `tlsproxy run -c
-config.yaml`. Use `tlsproxy genconfig -c config.yaml` to create a starter
-configuration; it refuses to overwrite an existing file. Use `tlsproxy validate
--c config.yaml` to parse-check a configuration before running it.
+An uninitialized runtime starts a temporary HTTPS setup service on a random
+loopback port in `40000..=50000`. The log prints its URL, one-time 256-bit
+token, and ephemeral certificate SHA-256 fingerprint. To select the setup
+address or port explicitly:
 
-## Directory structure
-
-You should build your tls proxy using `$ sh build.sh`
-
-And copy `target/x86_64-unknown-linux-musl/release/tlsproxy` to a separate folder.
-
-In the same folder, you should also copy the following files:
-
-- config.yaml
-
-When admin TLS or listener TLS termination is enabled, tlsproxy creates or
-reuses a local CA under `runtime_dir`, then signs certificates with that CA.
-Keep the CA key private and install `CA.pem` in clients that should trust the
-generated certificates.
-
-## Prepare configuration
-
-The `bind` address may name a network interface instead of a literal IP —
-useful on cloud instances where the private IP changes between launches:
-
-```yaml
-listeners:
-  web:
-    bind: "%eth0%:442"      # first IPv4 address of eth0 (same as %eth0/v4%)
-    # bind: "%eth0/v6%:442" # first global (non-link-local) IPv6 address
+```bash
+tlsproxy run \
+  --runtime-dir /var/lib/tlsproxy \
+  --setup-bind 0.0.0.0 \
+  --port 44448
 ```
 
-The interface's IP is resolved when the listener binds, not when the config
-loads. If the interface is missing or has no address of the requested
-family, the listener fails to start with an error listing the available
-interfaces. `admin_server.bind_address` accepts the same `%eth0%` /
-`%eth0/v6%` patterns (without a port).
+`--port` is an alias for `--setup-port`; it is not the proxy listener port.
+After setup it, setup-token, and setup-bind options are ignored. Operational
+configuration comes from RocksDB. The mandatory public TLS listener always
+uses port 443 and cannot be deleted or stopped.
 
-Example config.yaml
-```yaml
-listeners:
-  HTTPS:
-    bind: 0.0.0.0:1443  # TLS proxy binds to 0.0.0.0:1443
-    mode: passthrough # passthrough forwards TLS unchanged; terminate decrypts TLS; forward is a plain L4 port forward; http routes plaintext HTTP by Host header
-    upstream_tls: false # terminate mode only; encrypt upstream without authenticating it
-    target_port: 443  # Proxy all requests to port 443
-    policy: DENY  # If rules matched, they will be denied (possible values: ALLOW|DENY). basically the rules is blacklist. If it is ALLOW, it would act as a whitelist
-    rules:
-      static_hosts: []  # Static host matching, ignore case
-      patterns:
-      - ^www.g.*$  # Regex checking, case sensitive. You probably want to add (?i) if you want to ignore case...
-    max_idle_time_ms: 3600000
-    speed_limit: 0.0 # Speed limit for each connection. 0 is no limit. unit is bytes/second, shared by upload/download together
-options:
-  runtime_dir: ./runtime  # runtime artifacts; local CA data lives under this directory
-dns:
-  # DNS overrides, applied to the SNI hostname before connecting upstream.
-  # Three rule kinds, each in its own section. Resolution priority (first hit
-  # wins):
-  #   1. exact host:port
-  #   2. exact host (any port)
-  #   3. suffix rules with a port (longest suffix first)
-  #   4. suffix rules without a port (longest suffix first)
-  #   5. regex rules, in definition order
-  # If nothing matches, normal DNS applies. In every rule, a `to` without a
-  # port keeps the port that would have been used.
-  exact:
-  - from: home.wushilin.net        # no port = matches any port
-    to: 192.168.44.100
-  # - from: github.com:443         # host:port = that port only
-  #   to: my.local.host:443
-  suffix:
-  # Matches the domain and all its subdomains at label boundaries:
-  # `.abc.com` matches `x.abc.com` and `abc.com`, but never `notabc.com`.
-  # - from: .internal.abc.com:443
-  #   to: 127.0.0.1:443
-  regex:
-  # Case-insensitive, matched against the HOSTNAME ONLY — the port is never
-  # part of the text the pattern sees. Use `port` to restrict the rule.
-  # - hostname: '^api\d+\.abc\.com$'
-  #   port: 443                     # optional; omit to match any port
-  #   to: 127.0.0.1:443
-# Self-connection loops (the proxy connecting back to itself, directly or
-# through NAT/port-forwarding) are detected automatically: the proxy remembers
-# the TLS ClientHello randoms it forwarded in the last 10 seconds and closes
-# any inbound connection presenting one of them. No configuration is needed.
-# Local CA for every certificate the proxy manages: the admin server
-# certificate and on-demand terminating-listener certificates. When the
-# section is absent, these defaults are used.
-#
-# Paths are always resolved under {runtime_dir}. Ad-hoc SNI certificates are
-# cached in memory only. The admin certificate is cached in memory, loaded from
-# disk on restart, immediately evicted if within 72 hours of expiry, and saved
-# after lazy renewal. All generated leaf certificates are valid for 365 days.
-ca:
-  localca:
-    ca_cert: local_ca/CA.pem
-    ca_key: local_ca/CA.key
-    working_dir: local_ca
-admin_server:
-  bind_address: 0.0.0.0  # Admin server bind to this address
-  bind_port: 48888 # Admin server bind to this port
-  username: admin # Admin server requires the basic user
-  password: pass1234 # Admin server require the basic password
-  tls: false # Enable TLS or not
-  san: # Subject alternative names for the admin certificate (DNS names and IPs)
-  - localhost
-  - 127.0.0.1
-  - ::1
+Setup asks for:
 
+- the first administrator and a password of at least 12 characters;
+- a dedicated control hostname such as `tls.example.com`;
+- public IPv4/IPv6 addresses expected in public DNS; and
+- an initial ACME provider.
+
+The control hostname is reserved for the form-login administration service and
+is never proxied. Its managed certificate is created automatically and the
+startup renewal scan attempts issuance immediately. Until issuance succeeds,
+the default `local_ca` fallback presents the internal CA certificate.
+
+## Runtime behavior
+
+Every TLS listener supports ordered per-host routes. A route can:
+
+- pass TLS through unchanged;
+- terminate TLS and forward plaintext;
+- terminate TLS and establish TLS to the upstream; or
+- reject the connection.
+
+The mandatory listener additionally intercepts only exact `acme-tls/1`
+connections with an active exact-SNI challenge. Unmatched ACME ALPN is closed
+and never reaches an upstream. Plain HTTP listeners route by `Host`; raw
+forward listeners do not have hostname routing.
+
+DNS overrides are applied after route selection to both inferred and explicit
+targets. ACME prerequisites deliberately bypass those overrides and query A
+and AAAA records through the configured public resolvers.
+
+## Automatic certificates
+
+The Auto Certs page manages providers and exact-domain or multi-SAN
+certificates. Built-in presets are provided for:
+
+- Let's Encrypt production and staging;
+- Google Trust Services production and staging.
+
+GTS requires an EAB key ID and base64url HMAC. The HMAC is never returned by
+the admin API and is erased from provider metadata after account binding.
+Wildcard certificates are rejected because TLS-ALPN-01 cannot validate them.
+
+The scheduler:
+
+- performs one immediate startup scan;
+- scans on a fixed 12-hour cadence by default;
+- never overlaps scans or certificate operations;
+- renews sequentially, normally 15 days before expiry;
+- gives each certificate operation a five-minute deadline; and
+- atomically activates a validated generation while retaining the previous
+  active certificate when renewal fails.
+
+Failed operations use exponential backoff with 20% jitter, capped at 12 hours.
+When a CA advertises RFC 9773 ACME Renewal Information, the suggested window is
+sampled and persisted; the configured 15-day threshold remains the fallback.
+Downloaded chains are checked for issuer ordering and signatures. Per-resolver
+DNS results and timestamps are available in the control plane.
+
+Active generations are parsed into an atomically replaced exact-SNI cache.
+TLS termination and the control hostname prefer this cache, then apply the
+configured `local_ca` or `reject` fallback.
+
+## Administration security
+
+The control hostname serves HTTPS directly on the mandatory listener without
+a loopback proxy hop. Authentication uses Argon2id password hashes, opaque
+random sessions stored by token hash, `Secure`/`HttpOnly`/`SameSite=Strict`
+cookies, CSRF tokens for mutations, and login throttling. Provider secret
+fields are redacted. Configuration writes use revisions and cause an orderly
+listener reload; a failed apply is automatically rolled back.
+
+The UI also shows runtime/certificate status, DNS diagnostics, recent audits,
+configuration history, and rollback controls.
+
+## Certificate publication
+
+Published managed certificates are retrieved by exact domain:
+
+```text
+GET /tlsproxy_api/certs/www.example.com
+Authorization: Bearer <retrieval-token>
 ```
 
-## Accounting (CDR log)
+The JSON response contains stable `certificate_id` and changing
+`generation_id` values, leaf and chain PEM, fingerprint, and validity. Use
+`If-None-Match` with the returned ETag for efficient polling. Add
+`?private_key=true` only when both the certificate policy and retrieval token
+permit key export. Retrieval tokens are independently scoped and expiring;
+only their SHA-256 hashes are stored. Requests are rate-limited and audited,
+and local-CA fallback identities can never be published.
 
-When enabled, every client connection writes one CSV line on close, suitable
-for usage accounting by SNI, listener, or target:
+## Operations
 
-```yaml
-accounting:
-  enabled: true
-  log_file: cdr.log
-  rotate_size: 18MiB   # bytes, or KiB/MiB/GiB
-  max_keep: 10         # rotated files kept
-  compress_after: 3    # cdr.log.1..3 stay raw; cdr.log.4+ are compressed
-  compression: zstd    # zstd (default) | gzip | none
+```bash
+tlsproxy backup --runtime-dir /var/lib/tlsproxy --output /backup/tlsproxy-2026-07-22
+tlsproxy restore --checkpoint /backup/tlsproxy-2026-07-22 --runtime-dir /var/lib/tlsproxy-restored
+tlsproxy cleanup --runtime-dir /var/lib/tlsproxy --generations 3 --audit-days 90
+tlsproxy recover-admin --runtime-dir /var/lib/tlsproxy --username admin --password-file /run/secrets/new-password
 ```
 
-Columns: `listener_type, connection_id, listener_name, sni, target_host,
-target_endpoint, remote_address, status, uploaded_bytes, downloaded_bytes,
-connection_start, connection_end`. `uploaded_bytes` counts bytes received from
-the client, and `downloaded_bytes` counts bytes received from upstream.
-`status` is `OK`, `DENIED` (ACL), or `CONNECT_FAILED`. Rotation is
-logrotate-style (`.1` is newest); rotated files past `compress_after` are
-compressed in-process. Records are written when a connection ends; connections
-open when the process is killed are lost.
+Restore refuses a non-empty destination. Administrator recovery is intended
+for offline use, revokes existing sessions, and writes an audit record.
+Runtime maintenance retains three generations per certificate, 90 days of
+audit, fifty configuration revisions, and removes expired sessions daily.
 
-Terminating listeners mint a leaf certificate on demand for the exact SNI in
-the client ClientHello, after the listener ACL allows that SNI. These ad-hoc
-certificates are cached in memory and are not written to disk. With
-`upstream_tls: true`, the proxy encrypts the upstream leg but does not
-authenticate the upstream certificate, so it provides no MITM detection.
+The fully local Pebble interoperability harness is documented in
+`tests/pebble/README.md`. It exercises actual TLS-ALPN callbacks to the
+mandatory port 443, activation, cache reload, and subsequent serving.
 
-Logs are written to stdout so a process supervisor (systemd, processmaster,
-etc.) can capture them. The default level is `info`; override it with the
-standard `RUST_LOG` environment variable (e.g. `RUST_LOG=debug`).
+## Legacy YAML migration
 
-Sample systemd unit file
-```yaml
-[Unit]
-Description=The TLS Proxy
-After=syslog.target network-online.target remote-fs.target nss-lookup.target
-Wants=network-online.target
-        
-[Service]
-Type=simple
-WorkingDirectory=/opt/services/tlsproxy
-PIDFile=/opt/services/tlsproxy/tlsproxy.pid
-ExecStart=/opt/services/tlsproxy/tlsproxy
-# ExecStop=/bin/kill -s QUIT $MAINPID
-PrivateTmp=true
-        
-[Install]
-WantedBy=multi-user.target
+YAML is accepted only by the explicit migration command. The destination
+database must be uninitialized.
+
+```bash
+tlsproxy migrate \
+  --config config.yaml \
+  --runtime-dir /var/lib/tlsproxy \
+  --admin-username admin \
+  --admin-password-file /run/secrets/tlsproxy-admin-password \
+  --control-hostname tls.example.com \
+  --self-ip 203.0.113.10 \
+  --provider-id letsencrypt-production
 ```
 
-## Start
+Legacy listeners become additional listeners. Migration never guesses which
+old listener should become the protected mandatory listener. `genconfig` and
+normal YAML `validate`/`run -c` modes no longer exist.
 
-Just run the tlsproxy. No argument required. All support files must be in the same folder
+## Logging and shutdown
 
-Visit your server at http://host:48888 to start managing.
-
-If prompted for Basic auth, please enter the username and password
-
-# Enjoy
+Logs go to stdout; `RUST_LOG` overrides the default `info` filter. ACME scans,
+DNS prerequisites, order lifecycle, listener routing, and connection failures
+are logged without account keys, EAB HMACs, certificate private keys, setup
+token hashes, or session tokens. Send Ctrl-C for orderly task cancellation and
+accounting shutdown.

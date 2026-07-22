@@ -429,6 +429,39 @@ pub async fn select_runtime_target(
     Ok(selected)
 }
 
+/// Resolves a per-host listener route. An explicit route target replaces the
+/// network destination but preserves the original SNI as the upstream TLS
+/// server name. DNS overrides are applied to either form by `ensure_group`.
+pub async fn select_routed_target(
+    sni_host: &str,
+    explicit_target: Option<&str>,
+    default_port: u16,
+    upstream_tls: bool,
+) -> Result<SelectedTarget> {
+    let requested = explicit_target
+        .map(|target| HostAndPort::parse_or_default(target, default_port))
+        .unwrap_or_else(|| HostAndPort::new(sni_host.to_string(), default_port));
+    if requested.port() == 0 {
+        return Err(anyhow!("route target port must be non-zero"));
+    }
+    let group = ensure_group(
+        requested.to_string(),
+        requested.host(),
+        requested.port(),
+        upstream_tls,
+        sni_host.to_string(),
+        Owner::Runtime,
+    )
+    .await?;
+    group.touch().await;
+    let mut selected = group
+        .choose_endpoint()
+        .await
+        .ok_or_else(|| anyhow!("no available upstream endpoint for {}", group.key.target))?;
+    selected.tls_server_name = sni_host.to_string();
+    Ok(selected)
+}
+
 pub fn spawn_global_health_checks(controller: &mut Controller) {
     let health_controller = controller.child();
     controller.spawn(async move {

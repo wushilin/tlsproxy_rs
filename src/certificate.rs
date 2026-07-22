@@ -422,7 +422,7 @@ pub fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| anyhow!("private key file `{}` contains no key", path.display()))
 }
 
-fn certified_key_from_parts(
+pub(crate) fn certified_key_from_parts(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<CertifiedKey> {

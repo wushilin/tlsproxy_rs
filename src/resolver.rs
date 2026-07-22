@@ -66,6 +66,12 @@ pub async fn init(config: &Config) {
     info!("initialized DNS override. {count} rules loaded");
 }
 
+pub async fn init_dns(dns: &DnsConfig) {
+    info!("initializing DNS override from runtime configuration");
+    let count = init_inner(dns).await;
+    info!("initialized DNS override. {count} rules loaded");
+}
+
 async fn init_inner(dns: &DnsConfig) -> usize {
     let mut tables = Tables::default();
 

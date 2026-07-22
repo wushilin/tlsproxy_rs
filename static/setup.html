@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TLS Proxy setup</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px system-ui, sans-serif; }
+    body { max-width: 42rem; margin: 4rem auto; padding: 0 1.5rem; }
+    form { display: grid; gap: 1rem; }
+    label { display: grid; gap: .35rem; }
+    input { padding: .65rem; }
+    button { padding: .75rem; cursor: pointer; }
+    #result { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Initial TLS Proxy setup</h1>
+  <p>Enter the one-time token printed by the service. This endpoint closes permanently after setup.</p>
+  <form id="setup">
+    <label>Setup token <input name="token" required autocomplete="off"></label>
+    <label>Administrator <input name="username" required autocomplete="username"></label>
+    <label>Password <input name="password" type="password" minlength="12" required autocomplete="new-password"></label>
+    <label>Control hostname <input name="control_hostname" placeholder="tls.example.com" required></label>
+    <label>Public IPs, comma separated <input name="self_ips" placeholder="203.0.113.10, 2001:db8::10"></label>
+    <label>Initial ACME provider <select name="provider_id">
+      <option value="letsencrypt-production">Let's Encrypt Production</option>
+      <option value="letsencrypt-staging">Let's Encrypt Staging</option>
+      <option value="gts-production">Google Trust Services Production (configure EAB after setup)</option>
+      <option value="gts-staging">Google Trust Services Staging (configure EAB after setup)</option>
+    </select></label>
+    <button type="submit">Complete setup</button>
+  </form>
+  <p id="result" role="status"></p>
+  <script>
+    document.querySelector('#setup').addEventListener('submit', async event => {
+      event.preventDefault();
+      const values = new FormData(event.currentTarget);
+      const body = Object.fromEntries(values);
+      body.self_ips = body.self_ips.split(',').map(value => value.trim()).filter(Boolean);
+      const response = await fetch('/tlsproxy_api/setup', {
+        method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body)
+      });
+      const result = await response.json();
+      document.querySelector('#result').textContent = result.message;
+      if (result.success) event.currentTarget.querySelectorAll('input,button').forEach(item => item.disabled = true);
+    });
+  </script>
+</body>
+</html>

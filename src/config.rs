@@ -7,6 +7,7 @@ use tokio::fs;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub listeners: HashMap<String, Listener>,
     #[serde(default)]
     pub options: Options,
@@ -279,6 +280,12 @@ impl Config {
 
     pub fn load_string(content: &str) -> Result<Config, Box<dyn Error>> {
         let config: Config = serde_yaml_ng::from_str(content)?;
+        config.validate()?;
+        return Ok(config);
+    }
+
+    pub fn validate(&self) -> Result<(), Box<dyn Error>> {
+        let config = self;
         if let Some(accounting) = &config.accounting {
             accounting.validate()?;
         }
@@ -303,7 +310,7 @@ impl Config {
                 }
             }
         }
-        return Ok(config);
+        return Ok(());
     }
 
 }
@@ -346,7 +353,7 @@ pub struct Rules {
 /// case-insensitively so hostnames match regardless of case (SNI hostnames
 /// are matched the same way as `static_hosts`). The pattern string is stored
 /// unchanged, so configs round-trip without gaining an implicit `(?i)`.
-mod ci_regex {
+pub(crate) mod ci_regex {
     use regex::{Regex, RegexBuilder};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

@@ -10,6 +10,7 @@ pub const DEFAULT_MAX_CLIENT_HELLO_SIZE: usize = 64 * 1024;
 #[derive(Debug)]
 pub struct ClientHello {
     pub sni_host: String,
+    pub alpn_protocols: Vec<Vec<u8>>,
     pub random: [u8; 32],
     pub buffered: Vec<u8>,
 }
@@ -45,8 +46,14 @@ where
                     .to_string();
                 let random = extract_client_random(&buffered)
                     .ok_or_else(|| anyhow!("unable to extract TLS ClientHello random"))?;
+                let alpn_protocols = accepted
+                    .client_hello()
+                    .alpn()
+                    .map(|protocols| protocols.map(ToOwned::to_owned).collect())
+                    .unwrap_or_default();
                 return Ok(ClientHello {
                     sni_host: server_name,
+                    alpn_protocols,
                     random,
                     buffered,
                 });
