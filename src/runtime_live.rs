@@ -18,6 +18,31 @@ pub fn load() -> Arc<RuntimeConfig> {
     current().load_full()
 }
 
+/// Everything needed to decide whether an upstream address would land on this
+/// proxy itself: the concrete addresses of currently bound listener sockets,
+/// the machine's interface addresses, and the operator-configured public self
+/// IPs (which cover NAT hairpinning that interface enumeration cannot see).
+/// Snapshotted per configuration revision, when listener sockets bind.
+#[derive(Debug, Default)]
+pub struct SelfEndpoints {
+    pub bound: Vec<std::net::SocketAddr>,
+    pub local_ips: Vec<std::net::IpAddr>,
+    pub self_ips: Vec<std::net::IpAddr>,
+}
+
+fn self_endpoints() -> &'static ArcSwap<SelfEndpoints> {
+    static ENDPOINTS: OnceLock<ArcSwap<SelfEndpoints>> = OnceLock::new();
+    ENDPOINTS.get_or_init(|| ArcSwap::from_pointee(SelfEndpoints::default()))
+}
+
+pub fn store_self_endpoints(endpoints: SelfEndpoints) {
+    self_endpoints().store(Arc::new(endpoints));
+}
+
+pub fn self_endpoints_snapshot() -> Arc<SelfEndpoints> {
+    self_endpoints().load_full()
+}
+
 /// The newest revision proven to work, either by a full runtime reload or by a
 /// successful hot apply. The runtime rollback path consumes it so a failing
 /// revision reverts to the latest working state, not to the last full reload.

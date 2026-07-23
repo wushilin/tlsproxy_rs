@@ -162,6 +162,32 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
         });
     }
 
+    // Snapshot this revision's self endpoints for loop prevention: every
+    // bound listener socket, the machine's interface addresses, and the
+    // configured public self IPs (NAT hairpins that interfaces cannot show).
+    {
+        let mut bound = vec![default_listener.local_addr()?];
+        for listener in &additional {
+            let socket = match listener {
+                BoundAdditional::Tls(_, socket, _)
+                | BoundAdditional::Http(_, socket, _)
+                | BoundAdditional::Redirect(_, socket, _)
+                | BoundAdditional::Forward(_, socket, _) => socket,
+            };
+            bound.push(socket.local_addr()?);
+        }
+        let local_ips = if_addrs::get_if_addrs()
+            .map(|interfaces| interfaces.into_iter().map(|interface| interface.ip()).collect())
+            .unwrap_or_default();
+        let self_ips = config
+            .control_plane
+            .self_ips
+            .iter()
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        crate::runtime_live::store_self_endpoints(crate::runtime_live::SelfEndpoints { bound, local_ips, self_ips });
+    }
+
     let runtime_dir = runtime_dir.to_string_lossy().to_string();
     let ca = LocalCa::new(&runtime_dir, &crate::config::LocalCaConfig::default())?;
     let cache = crate::managed_tls::ManagedCertificateCache::default();

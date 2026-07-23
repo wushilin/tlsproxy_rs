@@ -23,16 +23,51 @@ use crate::listener_stats::ListenerStats;
 use crate::request_id::RequestId;
 
 pub async fn reject_obvious_self_connect(listener: &Listener, resolved: &str, id: &RequestId) -> Result<()> {
-    let Ok(resolved_bind) = crate::bindaddr::resolve_bind_addr(&listener.bind) else { return Ok(()); };
-    let Ok(bind_addr) = resolved_bind.parse::<SocketAddr>() else { return Ok(()); };
+    let own_bind = crate::bindaddr::resolve_bind_addr(&listener.bind)
+        .ok()
+        .and_then(|value| value.parse::<SocketAddr>().ok());
     let Ok(upstream_addrs) = tokio::net::lookup_host(resolved).await else { return Ok(()); };
+    let endpoints = crate::runtime_live::self_endpoints_snapshot();
     for upstream in upstream_addrs {
-        if upstream.port() == bind_addr.port() && (upstream.ip() == bind_addr.ip() || (bind_addr.ip().is_unspecified() && upstream.ip().is_loopback())) {
+        // Own-bind check retained separately: it works even before the
+        // runtime registers its bound sockets (bootstrap, tests).
+        if own_bind.is_some_and(|bind| upstream_lands_on(upstream, bind, &endpoints.local_ips, &endpoints.self_ips)) {
             warn!("{id} upstream target {resolved} points back to this listener; closing loop");
+            return Err(anyhow!("detected self-connection loop"));
+        }
+        if endpoints.bound.iter().any(|bound| upstream_lands_on(upstream, *bound, &endpoints.local_ips, &endpoints.self_ips)) {
+            warn!("{id} upstream target {resolved} points back to another listener of this proxy; closing loop");
             return Err(anyhow!("detected self-connection loop"));
         }
     }
     Ok(())
+}
+
+/// Whether connecting to `upstream` would land on the listener socket bound
+/// at `bound`. An unspecified bind (`0.0.0.0`/`::`) receives loopback, any
+/// local interface address, and the configured public self IPs on its port;
+/// a specific bind receives its own address, plus the public self IPs when it
+/// is not loopback-only (NAT hairpinning a public address to a bound
+/// interface). Matching per bound socket rather than per bare port keeps a
+/// different process legitimately serving the same port number on an address
+/// we are not bound to reachable.
+fn upstream_lands_on(
+    upstream: SocketAddr,
+    bound: SocketAddr,
+    local_ips: &[std::net::IpAddr],
+    self_ips: &[std::net::IpAddr],
+) -> bool {
+    if upstream.port() != bound.port() {
+        return false;
+    }
+    if bound.ip().is_unspecified() {
+        upstream.ip().is_loopback()
+            || local_ips.contains(&upstream.ip())
+            || self_ips.contains(&upstream.ip())
+    } else {
+        upstream.ip() == bound.ip()
+            || (!bound.ip().is_loopback() && self_ips.contains(&upstream.ip()))
+    }
 }
 
 pub async fn check_acl(listener: &Listener, host: &str, id: &RequestId) -> Result<()> {
@@ -111,6 +146,33 @@ where R: AsyncRead + Send + Unpin + 'static, W: AsyncWrite + Send + Unpin + 'sta
 mod tests {
     use super::*;
     use crate::config::{ListenerMode, Policy, Rules};
+
+    #[test]
+    fn upstream_lands_on_matches_self_addresses_only_on_reachable_binds() {
+        let locals: Vec<std::net::IpAddr> = vec!["192.168.1.5".parse().unwrap(), "127.0.0.1".parse().unwrap()];
+        let selfs: Vec<std::net::IpAddr> = vec!["203.0.113.9".parse().unwrap()];
+        let addr = |value: &str| value.parse::<SocketAddr>().unwrap();
+
+        // unspecified bind receives loopback, local interface, and public self IPs on its port
+        let all = addr("0.0.0.0:443");
+        assert!(upstream_lands_on(addr("127.0.0.1:443"), all, &locals, &selfs));
+        assert!(upstream_lands_on(addr("192.168.1.5:443"), all, &locals, &selfs));
+        assert!(upstream_lands_on(addr("203.0.113.9:443"), all, &locals, &selfs));
+        assert!(!upstream_lands_on(addr("198.51.100.7:443"), all, &locals, &selfs), "foreign IP is not self");
+        assert!(!upstream_lands_on(addr("127.0.0.1:8443"), all, &locals, &selfs), "different port is not managed");
+
+        // specific bind receives its own address, and public self IPs via NAT hairpin
+        let eth = addr("192.168.1.5:9000");
+        assert!(upstream_lands_on(addr("192.168.1.5:9000"), eth, &locals, &selfs));
+        assert!(upstream_lands_on(addr("203.0.113.9:9000"), eth, &locals, &selfs), "NAT hairpin to a bound interface");
+        assert!(!upstream_lands_on(addr("127.0.0.1:9000"), eth, &locals, &selfs), "loopback does not reach an eth-bound socket");
+
+        // loopback-only bind: another process may serve the same port on other addresses
+        let local_only = addr("127.0.0.1:8080");
+        assert!(upstream_lands_on(addr("127.0.0.1:8080"), local_only, &locals, &selfs));
+        assert!(!upstream_lands_on(addr("192.168.1.5:8080"), local_only, &locals, &selfs), "same port on an unbound address stays reachable");
+        assert!(!upstream_lands_on(addr("203.0.113.9:8080"), local_only, &locals, &selfs), "public IP cannot hairpin to loopback-only");
+    }
 
     #[tokio::test]
     async fn client_request_half_close_does_not_truncate_slow_response() {
