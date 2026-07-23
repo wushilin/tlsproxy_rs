@@ -266,7 +266,9 @@ mod tests {
                 if predicate(&event.event_payload) { return event; }
             }
         }
-        reset().await;
+        // No global reset here: the tracker is shared process state and a
+        // reset wipes entries of concurrently running tests. The assertions
+        // use a listener name unique to this test instead.
         let mut events = crate::events_hub::subscribe();
         let request_id = RequestId::new();
         put(&request_id, "events-listener", "127.0.0.1:12345".parse().unwrap()).await;

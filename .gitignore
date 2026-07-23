@@ -17,3 +17,4 @@ admin-server.key
 runtime/
 .claude/worktrees/
 *.local.*
+tlsproxy-data/

@@ -6,6 +6,13 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const DEFAULT_MAX_HTTP_HEADER_SIZE: usize = 256 * 1024;
 
+/// Header carrying the random tokens of requests this proxy (or another
+/// tlsproxy hop) forwarded to a plaintext HTTP upstream. Inbound values are
+/// passed through untouched and a fresh token is appended per hop, so in a
+/// self-connection loop — direct or through several proxies — the originating
+/// instance recognizes its own recent token and closes the loop.
+pub const LOOP_TOKEN_HEADER: &str = "x-tlsproxy-rid";
+
 /// The buffered start of a plaintext HTTP/1.x connection: everything read so
 /// far (`buffered`, which may extend past the header block into the body) and
 /// the routing facts parsed from the request head.
@@ -21,6 +28,9 @@ pub struct HttpHead {
     /// The raw `Host` header value (`example.com` or `example.com:8080`).
     pub host_raw: String,
     pub authorization: Option<String>,
+    /// Values of `X-Tlsproxy-Rid` headers on the inbound request, checked
+    /// against recently forwarded tokens to detect self-connection loops.
+    pub loop_tokens: Vec<String>,
     strip_authorization: bool,
     /// Bytes read from the client; the head occupies `..head_len`.
     pub buffered: Vec<u8>,
@@ -87,6 +97,7 @@ fn parse_head(buffered: Vec<u8>, head_len: usize) -> Result<HttpHead> {
 
     let mut host_value: Option<&str> = None;
     let mut authorization: Option<String> = None;
+    let mut loop_tokens: Vec<String> = Vec::new();
     let mut last_was_host = false;
     for line in lines {
         if line.is_empty() {
@@ -110,6 +121,8 @@ fn parse_head(buffered: Vec<u8>, head_len: usize) -> Result<HttpHead> {
             host_value = Some(value.trim());
         } else if name.trim().eq_ignore_ascii_case("authorization") {
             authorization = Some(value.trim().to_string());
+        } else if name.trim().eq_ignore_ascii_case(LOOP_TOKEN_HEADER) {
+            loop_tokens.extend(value.split(',').map(|token| token.trim().to_string()).filter(|token| !token.is_empty()));
         }
     }
     let host_raw = host_value
@@ -123,6 +136,7 @@ fn parse_head(buffered: Vec<u8>, head_len: usize) -> Result<HttpHead> {
         port,
         host_raw,
         authorization,
+        loop_tokens,
         strip_authorization: false,
         buffered,
         head_len,
@@ -353,6 +367,15 @@ impl HttpHead {
         push_header("X-Forwarded-Host", &self.host_raw);
         push_header("X-Forwarded-Proto", scheme);
         push_header("Forwarded", &forwarded_values.join(", "));
+        // Fresh loop token per hop; inbound tokens from other tlsproxy hops
+        // were passed through above so a multi-instance loop is still caught
+        // by whichever instance sees its own token return.
+        let loop_token = {
+            use rand::Rng as _;
+            format!("{:032x}", rand::rng().random::<u128>())
+        };
+        crate::hello_cache::insert_request_token(loop_token.clone());
+        push_header("X-Tlsproxy-Rid", &loop_token);
         // The current data plane selects a path backend once per connection.
         // Closing after the response guarantees every subsequent request is
         // independently routed, including clients that otherwise use keep-alive.
@@ -615,6 +638,27 @@ mod tests {
         assert!(text.ends_with("\r\n\r\n"));
         // the client-sent proto must not survive
         assert!(!text.contains("https"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_injects_a_registered_loop_token_and_passes_foreign_tokens_through() {
+        let head = parse("GET / HTTP/1.1\r\nHost: app.example\r\nX-Tlsproxy-Rid: feedface\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(head.loop_tokens, vec!["feedface".to_string()]);
+        let rewritten = String::from_utf8(head.with_forwarded_headers("192.0.2.7".parse::<IpAddr>().unwrap())).unwrap();
+        // the upstream hop's token is preserved so the originating instance
+        // can still recognize it in a multi-instance loop
+        assert!(rewritten.contains("X-Tlsproxy-Rid: feedface\r\n"));
+        let ours = rewritten
+            .lines()
+            .filter_map(|line| line.strip_prefix("X-Tlsproxy-Rid: "))
+            .find(|value| *value != "feedface")
+            .expect("a fresh token is appended");
+        assert_eq!(ours.len(), 32);
+        assert!(crate::hello_cache::request_token_is_looped(ours), "our token is registered");
+        assert!(!crate::hello_cache::request_token_is_looped(ours), "detection consumes the token");
+        assert!(!crate::hello_cache::request_token_is_looped("feedface"), "foreign tokens are not registered");
     }
 
     #[tokio::test]

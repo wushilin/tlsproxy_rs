@@ -59,8 +59,11 @@ where CR: AsyncRead + Unpin + Send + 'static, CW: AsyncWrite + Unpin + Send + 's
     let download = pipe(id.clone(), upstream_read, client_write, stats, idle.clone(), false, downloaded.clone(), controller.clone(), limiter).await;
     // After the request side has finished, a response that makes no progress
     // for this long is torn down even when the listener idle timeout is
-    // disabled; otherwise a half-open upstream would leak both pipe tasks.
-    const HALF_CLOSED_DRAIN_LIMIT: Duration = Duration::from_secs(300);
+    // disabled. A client FIN is indistinguishable from a full close, so this
+    // bounds how long a vanished client can hold sockets and tasks while
+    // still letting an actively-sending response drain in full (comparable
+    // to HAProxy's `timeout client-fin`).
+    const HALF_CLOSED_DRAIN_LIMIT: Duration = Duration::from_secs(30);
     let monitor = controller.write().await.spawn(async move {
         loop {
             // A client may half-close its request side immediately after the

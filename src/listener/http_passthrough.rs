@@ -98,6 +98,10 @@ where
         )
         .await?,
     };
+    if head.loop_tokens.iter().any(|token| crate::hello_cache::request_token_is_looped(token)) {
+        log::warn!("{conn_id} {name} inbound request carries a loop token this proxy recently forwarded; closing self-connection loop");
+        return Err(anyhow!("detected self-connection loop"));
+    }
     // Count only the request head here; buffered body-prefix bytes are
     // counted by the relay pipe when the framing-bounded reader replays them.
     let header_len = head.buffered.len() - head.body_prefix().len();

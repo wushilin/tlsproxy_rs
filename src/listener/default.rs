@@ -256,6 +256,15 @@ pub(crate) async fn dispatch_non_control(
             crate::acme_challenge::accept_buffered(hello.buffered, client, certificate).await
         }
         ConnectionRoute::Ordinary { action, .. } => {
+            // Covers every route kind: a ClientHello random this proxy
+            // recently sent upstream (passthrough-forwarded or originated by
+            // our own TLS connector) arriving back here is a self-connection
+            // loop, whether it re-enters a passthrough, terminate, or
+            // reverse-proxy route.
+            if crate::hello_cache::is_looped(&hello.random) {
+                warn!("inbound ClientHello was recently forwarded by this proxy; closing self-connection loop");
+                bail!("detected self-connection loop");
+            }
             let limits = compatibility_listener(config, &action);
             match action {
                 TlsRouteAction::Passthrough { target_port, target, load_balancing } => {
