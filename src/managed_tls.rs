@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 
 use anyhow::{bail, Context, Result};
 use log::info;
@@ -13,6 +13,94 @@ use x509_parser::extensions::GeneralName;
 use crate::acme_types::{CertificateGeneration, ManagedCertificate};
 use crate::runtime_config::CertificateFallbackPolicy;
 use crate::store::{normalize_domain, Store};
+
+#[derive(Clone)]
+struct AutoRegistration {
+    store: Store,
+    request_scan: Arc<dyn Fn() + Send + Sync>,
+}
+
+fn auto_registration() -> &'static StdRwLock<Option<AutoRegistration>> {
+    static REGISTRATION: OnceLock<StdRwLock<Option<AutoRegistration>>> = OnceLock::new();
+    REGISTRATION.get_or_init(|| StdRwLock::new(None))
+}
+
+pub fn configure_auto_registration(store: Store, request_scan: impl Fn() + Send + Sync + 'static) {
+    *auto_registration().write().expect("auto-certificate registration poisoned") = Some(AutoRegistration {
+        store,
+        request_scan: Arc::new(request_scan),
+    });
+}
+
+fn recent_registration_attempts() -> &'static StdRwLock<lru::LruCache<String, std::time::Instant>> {
+    static ATTEMPTS: OnceLock<StdRwLock<lru::LruCache<String, std::time::Instant>>> = OnceLock::new();
+    ATTEMPTS.get_or_init(|| {
+        StdRwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).expect("non-zero cache size")))
+    })
+}
+
+const REGISTRATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Schedules certificate registration for a concrete SNI after an explicit
+/// terminating route has accepted it. This supports exact, suffix, and regex
+/// host rules without wildcards.
+///
+/// Because suffix/regex routes accept arbitrary client-chosen subdomains, a
+/// domain is only registered after the public-DNS prerequisite confirms it
+/// resolves to this deployment's configured self IPs — otherwise a client
+/// could mint unbounded certificate records and real ACME orders just by
+/// varying the SNI. (An operator wildcard DNS record pointing here makes every
+/// subdomain pass; that is the operator's explicit choice.) Attempts are
+/// throttled per domain and run in the background so TLS handshakes are never
+/// delayed by DNS lookups or store writes.
+pub fn request_automatic_for_sni(sni: &str) {
+    let Ok(domain) = normalize_domain(sni) else { return };
+    let Some(registration) = auto_registration().read().expect("auto-certificate registration poisoned").clone() else {
+        return;
+    };
+    {
+        let mut attempts = recent_registration_attempts().write().expect("registration throttle poisoned");
+        if attempts.get(&domain).is_some_and(|last| last.elapsed() < REGISTRATION_RETRY_INTERVAL) {
+            return;
+        }
+        attempts.put(domain.clone(), std::time::Instant::now());
+    }
+    tokio::spawn(async move {
+        if let Err(cause) = register_automatic(domain.clone(), registration).await {
+            log::warn!("automatic certificate registration for `{domain}` was not performed: {cause:#}");
+        }
+    });
+}
+
+async fn register_automatic(domain: String, registration: AutoRegistration) -> Result<()> {
+    let store = registration.store.clone();
+    let existing = {
+        let store = store.clone();
+        let domain = domain.clone();
+        tokio::task::spawn_blocking(move || store.certificate_for_domain(&domain))
+            .await
+            .context("automatic certificate lookup task failed")??
+    };
+    if existing.is_some() {
+        return Ok(());
+    }
+    let control = crate::runtime_live::load().control_plane.clone();
+    let dns = crate::acme::dns::PublicDnsPrerequisite::default().with_store(store.clone());
+    crate::acme::backend::DnsPrerequisite::verify(&dns, &domain, std::slice::from_ref(&domain), &control)
+        .await
+        .context("public DNS prerequisite rejected SNI-driven registration")?;
+    let created = {
+        let domain = domain.clone();
+        tokio::task::spawn_blocking(move || store.create_automatic_certificate_if_absent(&domain))
+            .await
+            .context("automatic certificate registration task failed")??
+    };
+    if created {
+        info!("registered automatic certificate for `{domain}` after DNS verification");
+        (registration.request_scan)();
+    }
+    Ok(())
+}
 
 #[derive(Clone, Default)]
 pub struct ManagedCertificateCache {
@@ -191,29 +279,18 @@ mod tests {
     async fn reload_is_exact_sni_and_exposes_active_identity() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
-        let managed = ManagedCertificate {
-            id: "site".into(),
-            domains: vec!["www.example".into(), "api.example".into()],
-            ..Default::default()
-        };
-        store.save_managed_certificate(&managed).unwrap();
-        let generation = generation("site", &["www.example", "api.example"]);
-        store
-            .activate_generation(
-                &generation,
-                &crate::acme_types::RenewalState {
-                    certificate_id: "site".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        for domain in ["www.example", "api.example"] {
+            let managed = ManagedCertificate { id: domain.into(), domains: vec![domain.into()], ..Default::default() };
+            store.save_managed_certificate(&managed).unwrap();
+            store.activate_generation(&generation(domain, &[domain]), &crate::acme_types::RenewalState { certificate_id: domain.into(), ..Default::default() }).unwrap();
+        }
         let cache = ManagedCertificateCache::default();
         assert_eq!(cache.reload(&store).await.unwrap(), 2);
         assert!(cache.resolve("WWW.EXAMPLE.").await.is_some());
         assert!(cache.resolve("other.example").await.is_none());
         assert_eq!(
             cache.identity("api.example").await,
-            Some(("site".into(), "generation-1".into()))
+            Some(("api.example".into(), "generation-1".into()))
         );
         let ca_directory = tempfile::tempdir().unwrap();
         let ca = crate::ca::LocalCa::new(
@@ -242,32 +319,32 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let managed = ManagedCertificate {
-            id: "site".into(),
+            id: "www.example".into(),
             domains: vec!["www.example".into()],
             ..Default::default()
         };
         store.save_managed_certificate(&managed).unwrap();
         let cache = ManagedCertificateCache::default();
 
-        let mut first = generation("site", &["www.example"]);
+        let mut first = generation("www.example", &["www.example"]);
         first.id = "generation-1".into();
         cache
             .activate_and_reload(
                 &store,
                 first,
-                crate::acme_types::RenewalState { certificate_id: "site".into(), ..Default::default() },
+                crate::acme_types::RenewalState { certificate_id: "www.example".into(), ..Default::default() },
             )
             .await
             .unwrap();
         assert_eq!(cache.identity("www.example").await.unwrap().1, "generation-1");
 
-        let mut second = generation("site", &["www.example"]);
+        let mut second = generation("www.example", &["www.example"]);
         second.id = "generation-2".into();
         cache
             .activate_and_reload(
                 &store,
                 second,
-                crate::acme_types::RenewalState { certificate_id: "site".into(), ..Default::default() },
+                crate::acme_types::RenewalState { certificate_id: "www.example".into(), ..Default::default() },
             )
             .await
             .unwrap();

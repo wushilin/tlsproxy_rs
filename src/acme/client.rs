@@ -275,11 +275,4 @@ mod tests {
         let _ = create_account(&crate::acme_types::AcmeProvider { id: "le-staging".into(), directory_url: "https://acme-staging-v02.api.letsencrypt.org/directory".into(), staging: true, ..Default::default() }).await.unwrap();
     }
 
-    #[tokio::test]
-    #[ignore = "requires GTS_EAB_KEY_ID and GTS_EAB_HMAC plus public network"]
-    async fn gts_staging_account_interoperability() {
-        let key_id = std::env::var("GTS_EAB_KEY_ID").expect("GTS_EAB_KEY_ID is required");
-        let hmac = std::env::var("GTS_EAB_HMAC").expect("GTS_EAB_HMAC is required");
-        let _ = create_account(&crate::acme_types::AcmeProvider { id: "gts-staging".into(), directory_url: "https://dv.acme-v02.test-api.pki.goog/directory".into(), eab_key_id: Some(key_id), eab_hmac_key: Some(hmac), staging: true, ..Default::default() }).await.unwrap();
-    }
 }

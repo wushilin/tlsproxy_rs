@@ -177,6 +177,7 @@ impl<D: DnsPrerequisite> StoreRenewalBackend<D> {
             last_attempt: Some(now),
             last_success: Some(now),
             next_attempt: None,
+            ca_retry_after: None,
             consecutive_failures: 0,
             last_error: None,
             ari_suggested_at,
@@ -201,14 +202,19 @@ impl<D: DnsPrerequisite> StoreRenewalBackend<D> {
             .as_ref()
             .map_or(1, |state| state.consecutive_failures.saturating_add(1));
         let now = OffsetDateTime::now_utc();
-        let jitter_percent = rand::random_range(80u64..=120);
-        let retry_minutes = retry_delay_minutes(failures, jitter_percent);
+        let ca_retry_after = retry_after_from_error(&error, now)
+            .filter(|deadline| *deadline > now)
+            // A CA-provided deadline is honored but bounded so a garbled or
+            // hostile timestamp cannot gate a certificate indefinitely.
+            .map(|deadline| deadline.min(now + time::Duration::hours(48)));
+        let next_attempt = ca_retry_after.unwrap_or(now + failure_backoff(failures));
         self.store
             .save_renewal_state_async(RenewalState {
                 certificate_id: certificate_id.to_owned(),
                 last_attempt: Some(now),
                 last_success: previous.as_ref().and_then(|state| state.last_success),
-                next_attempt: Some(now + time::Duration::minutes(i64::try_from(retry_minutes.max(1)).unwrap_or(720))),
+                next_attempt: Some(next_attempt),
+                ca_retry_after,
                 consecutive_failures: failures,
                 last_error: Some(error),
                 ari_suggested_at: previous.as_ref().and_then(|state| state.ari_suggested_at),
@@ -220,9 +226,49 @@ impl<D: DnsPrerequisite> StoreRenewalBackend<D> {
     }
 }
 
-fn retry_delay_minutes(failures: u32, jitter_percent: u64) -> u64 {
-    let exponential = 5u64.saturating_mul(1u64.checked_shl(failures.saturating_sub(1).min(16)).unwrap_or(u64::MAX));
-    exponential.saturating_mul(jitter_percent.clamp(80, 120)).saturating_div(100).clamp(1, 12 * 60)
+/// Exponential retry backoff: 5 minutes doubling per consecutive failure,
+/// capped at 12 hours, with ±20% jitter so certificates that failed together
+/// (for example during a CA outage) do not retry in the same scan tick.
+fn failure_backoff(consecutive_failures: u32) -> time::Duration {
+    use rand::Rng as _;
+    let exponent = consecutive_failures.saturating_sub(1).min(8);
+    let minutes = (5u64 << exponent).min(12 * 60);
+    let base_seconds = minutes * 60;
+    let jitter = rand::rng().random_range(-(base_seconds as i64) / 5..=(base_seconds as i64) / 5);
+    time::Duration::seconds(base_seconds as i64 + jitter)
+}
+
+/// Extracts a CA `Retry-After` deadline from an error chain's text. Supports
+/// the three shapes CAs actually send: an ISO-like timestamp, an HTTP-date
+/// (`Wed, 23 Jul 2026 16:21:23 GMT`), and delta-seconds (`Retry-After: 3600`).
+fn retry_after_from_error(error: &str, now: OffsetDateTime) -> Option<OffsetDateTime> {
+    lazy_static::lazy_static! {
+        static ref ISO: regex::Regex = regex::Regex::new(
+            r"(?i)retry[ -]after:?\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:Z| UTC)"
+        ).expect("retry-after ISO regex is valid");
+        static ref HTTP_DATE: regex::Regex = regex::Regex::new(
+            r"(?i)retry[ -]after:?\s+(?:[a-z]{3},\s*)?(\d{1,2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2})\s*(?:GMT|UTC)"
+        ).expect("retry-after HTTP-date regex is valid");
+        static ref DELTA: regex::Regex = regex::Regex::new(
+            r"(?i)retry[ -]after:?\s+(\d{1,8})(?:[^\d-]|$)"
+        ).expect("retry-after delta regex is valid");
+    }
+    if let Some(value) = ISO.captures(error).and_then(|captures| captures.get(1)).map(|value| value.as_str()) {
+        let format = if value.as_bytes().get(10) == Some(&b'T') {
+            time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]")
+        } else {
+            time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]")
+        };
+        return time::PrimitiveDateTime::parse(value, format).ok().map(|value| value.assume_utc());
+    }
+    if let Some(value) = HTTP_DATE.captures(error).and_then(|captures| captures.get(1)).map(|value| value.as_str()) {
+        let format = time::macros::format_description!("[day padding:none] [month repr:short case_sensitive:false] [year] [hour]:[minute]:[second]");
+        return time::PrimitiveDateTime::parse(value, format).ok().map(|value| value.assume_utc());
+    }
+    if let Some(value) = DELTA.captures(error).and_then(|captures| captures.get(1)).map(|value| value.as_str()) {
+        return value.parse::<i64>().ok().map(|seconds| now + time::Duration::seconds(seconds));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -236,11 +282,24 @@ mod tests {
     struct RejectDns;
 
     #[test]
-    fn retry_backoff_is_exponential_jittered_and_capped() {
-        assert_eq!(retry_delay_minutes(1, 100), 5);
-        assert_eq!(retry_delay_minutes(2, 100), 10);
-        assert_eq!(retry_delay_minutes(3, 80), 16);
-        assert_eq!(retry_delay_minutes(40, 120), 720);
+    fn parses_ca_retry_after_deadlines_from_acme_errors() {
+        let now = time::macros::datetime!(2026-07-23 12:00:00 UTC);
+        let expected = time::macros::datetime!(2026-07-23 16:21:23 UTC);
+        assert_eq!(retry_after_from_error("rate limited: retry after 2026-07-23 16:21:23 UTC", now), Some(expected));
+        assert_eq!(retry_after_from_error("Retry-After: 2026-07-23T16:21:23Z", now), Some(expected));
+        assert_eq!(retry_after_from_error("Retry-After: Wed, 23 Jul 2026 16:21:23 GMT", now), Some(expected));
+        assert_eq!(retry_after_from_error("too many requests: Retry-After: 3600", now), Some(now + time::Duration::hours(1)));
+        assert_eq!(retry_after_from_error("ordinary validation failure", now), None);
+    }
+
+    #[test]
+    fn failure_backoff_doubles_with_jitter_and_caps_at_twelve_hours() {
+        for (failures, minutes) in [(1u32, 5i64), (2, 10), (3, 20), (6, 160)] {
+            let backoff = failure_backoff(failures);
+            let base = time::Duration::minutes(minutes);
+            assert!(backoff >= base * 4 / 5 && backoff <= base * 6 / 5, "failures={failures} backoff={backoff}");
+        }
+        assert!(failure_backoff(30) <= time::Duration::hours(12) * 6 / 5);
     }
 
     impl DnsPrerequisite for RejectDns {
@@ -260,7 +319,7 @@ mod tests {
         let store = Store::open(directory.path()).unwrap();
         store
             .save_managed_certificate(&ManagedCertificate {
-                id: "home".into(),
+                id: "home.example".into(),
                 domains: vec!["Home.Example.".into()],
                 provider_id: "letsencrypt".into(),
                 ..Default::default()
@@ -280,7 +339,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].domains, vec!["home.example"]);
         assert!(backend.renew(candidates[0].clone()).await.is_err());
-        let state = store.renewal_state("home").unwrap().unwrap();
+        let state = store.renewal_state("home.example").unwrap().unwrap();
         assert_eq!(state.consecutive_failures, 1);
         assert!(state.next_attempt.is_some());
         assert!(state

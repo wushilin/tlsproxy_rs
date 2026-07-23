@@ -73,13 +73,10 @@ and AAAA records through the configured public resolvers.
 ## Automatic certificates
 
 The Auto Certs page manages providers and exact-domain or multi-SAN
-certificates. Built-in presets are provided for:
-
-- Let's Encrypt production and staging;
-- Google Trust Services production and staging.
-
-GTS requires an EAB key ID and base64url HMAC. The HMAC is never returned by
-the admin API and is erased from provider metadata after account binding.
+certificates. Built-in presets are provided for Let's Encrypt production and
+staging. Additional RFC 8555-compatible providers can be configured manually.
+When a provider requires External Account Binding, its HMAC is never returned
+by the admin API and is erased from provider metadata after account binding.
 Wildcard certificates are rejected because TLS-ALPN-01 cannot validate them.
 
 The scheduler:

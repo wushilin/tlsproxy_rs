@@ -12,10 +12,11 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 anyhow = "1"
+arc-swap = "1"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 serde_json = "1"
@@ -28,7 +29,7 @@ rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
-time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 x509-parser = { version = "0.18", features = ["verify"] }
 lru = "0.18.1"
 tokio-tree-context = "0.1.6"
@@ -51,3 +52,4 @@ futures-util = "0.3"
 tempfile = "3"
 
 [dev-dependencies]
+tokio-tungstenite = "0.29"

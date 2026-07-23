@@ -344,7 +344,7 @@ mod tests {
             "correct horse battery staple"
         ));
         let control = store.certificate_for_domain("tls.example").unwrap().unwrap();
-        assert_eq!(control.id, "control-plane");
+        assert_eq!(control.id, "tls.example");
         assert_eq!(control.provider_id, "letsencrypt-production");
         let stored = store.load_config().unwrap().unwrap();
         assert_eq!(

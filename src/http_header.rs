@@ -11,12 +11,17 @@ pub const DEFAULT_MAX_HTTP_HEADER_SIZE: usize = 256 * 1024;
 /// the routing facts parsed from the request head.
 #[derive(Debug)]
 pub struct HttpHead {
+    pub method: String,
+    /// Origin-form request path including any query string.
+    pub target: String,
     /// Hostname from the `Host` header, without any port.
     pub host: String,
     /// Explicit port from the `Host` header, when the client sent one.
     pub port: Option<u16>,
     /// The raw `Host` header value (`example.com` or `example.com:8080`).
     pub host_raw: String,
+    pub authorization: Option<String>,
+    strip_authorization: bool,
     /// Bytes read from the client; the head occupies `..head_len`.
     pub buffered: Vec<u8>,
     head_len: usize,
@@ -78,9 +83,10 @@ fn parse_head(buffered: Vec<u8>, head_len: usize) -> Result<HttpHead> {
         .map_err(|_| anyhow!("HTTP request head is not valid UTF-8"))?;
     let mut lines = head.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line));
     let request_line = lines.next().unwrap_or("");
-    validate_request_line(request_line)?;
+    let (method, target) = validate_request_line(request_line)?;
 
     let mut host_value: Option<&str> = None;
+    let mut authorization: Option<String> = None;
     let mut last_was_host = false;
     for line in lines {
         if line.is_empty() {
@@ -102,6 +108,8 @@ fn parse_head(buffered: Vec<u8>, head_len: usize) -> Result<HttpHead> {
                 bail!("HTTP request contains multiple Host headers");
             }
             host_value = Some(value.trim());
+        } else if name.trim().eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.trim().to_string());
         }
     }
     let host_raw = host_value
@@ -109,15 +117,19 @@ fn parse_head(buffered: Vec<u8>, head_len: usize) -> Result<HttpHead> {
         .to_string();
     let (host, port) = split_host_port(&host_raw)?;
     Ok(HttpHead {
+        method,
+        target,
         host,
         port,
         host_raw,
+        authorization,
+        strip_authorization: false,
         buffered,
         head_len,
     })
 }
 
-fn validate_request_line(line: &str) -> Result<()> {
+fn validate_request_line(line: &str) -> Result<(String, String)> {
     let mut parts = line.split_ascii_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -128,7 +140,10 @@ fn validate_request_line(line: &str) -> Result<()> {
     if !version.starts_with("HTTP/1.") {
         bail!("only HTTP/1.x requests are supported, got `{version}`");
     }
-    Ok(())
+    if !target.starts_with('/') {
+        bail!("only origin-form HTTP request targets are supported");
+    }
+    Ok((method.to_string(), target.to_string()))
 }
 
 /// Splits `example.com`, `example.com:8080`, `[::1]`, or `[::1]:8080` from a
@@ -160,12 +175,110 @@ fn split_host_port(value: &str) -> Result<(String, Option<u16>)> {
     Ok((host.to_string(), port))
 }
 
+/// How the first request's body is delimited on the wire. Anything that
+/// cannot be delimited unambiguously is rejected to prevent request smuggling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyFraming {
+    Length(u64),
+    Chunked,
+}
+
 impl HttpHead {
+    pub fn consume_authorization(&mut self) { self.strip_authorization = true; }
+
+    /// Bytes read past the request head (the start of the body, and possibly
+    /// pipelined data beyond it).
+    pub fn body_prefix(&self) -> &[u8] { &self.buffered[self.head_len..] }
+
+    /// Determines how the request body ends, so the data plane can stop
+    /// relaying client bytes at the message boundary instead of streaming the
+    /// connection verbatim (which would let pipelined requests bypass per-path
+    /// authentication and routing).
+    pub fn body_framing(&self) -> Result<BodyFraming> {
+        let head = std::str::from_utf8(&self.buffered[..self.head_len])
+            .map_err(|_| anyhow!("HTTP request head is not valid UTF-8"))?;
+        let mut content_length: Option<u64> = None;
+        let mut transfer_encoding: Option<String> = None;
+        let mut last_was_framing = false;
+        for line in head.split('\n').skip(1).map(|line| line.strip_suffix('\r').unwrap_or(line)) {
+            if line.is_empty() { break; }
+            if line.starts_with([' ', '\t']) {
+                if last_was_framing {
+                    bail!("folded body-framing headers are not supported");
+                }
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else { continue };
+            let name = name.trim().to_ascii_lowercase();
+            last_was_framing = matches!(name.as_str(), "content-length" | "transfer-encoding");
+            match name.as_str() {
+                "content-length" => {
+                    let value = value.trim();
+                    let parsed = value
+                        .parse::<u64>()
+                        .map_err(|_| anyhow!("invalid Content-Length `{value}`"))?;
+                    if content_length.is_some_and(|previous| previous != parsed) {
+                        bail!("conflicting Content-Length headers");
+                    }
+                    content_length = Some(parsed);
+                }
+                "transfer-encoding" => {
+                    if transfer_encoding.is_some() {
+                        bail!("multiple Transfer-Encoding headers are not supported");
+                    }
+                    transfer_encoding = Some(value.trim().to_ascii_lowercase());
+                }
+                _ => {}
+            }
+        }
+        match transfer_encoding {
+            Some(encoding) => {
+                if content_length.is_some() {
+                    bail!("Content-Length combined with Transfer-Encoding is rejected");
+                }
+                if encoding != "chunked" {
+                    bail!("unsupported Transfer-Encoding `{encoding}`");
+                }
+                Ok(BodyFraming::Chunked)
+            }
+            None => Ok(BodyFraming::Length(content_length.unwrap_or(0))),
+        }
+    }
+    pub fn strip_path_prefix(&mut self, prefix: &str) {
+        let prefix = prefix.trim_end_matches('/');
+        let stripped = self.target.strip_prefix(prefix).unwrap_or(&self.target);
+        let new_target = if stripped.is_empty() { "/" } else { stripped };
+        let head = String::from_utf8_lossy(&self.buffered[..self.head_len]);
+        if let Some(line_end) = head.find('\n') {
+            let first = head[..line_end].trim_end_matches('\r');
+            let mut parts = first.split_ascii_whitespace();
+            let method = parts.next().unwrap_or(&self.method);
+            let _old_target = parts.next();
+            let version = parts.next().unwrap_or("HTTP/1.1");
+            let ending = if head.as_bytes().get(line_end.wrapping_sub(1)) == Some(&b'\r') { "\r\n" } else { "\n" };
+            let mut rebuilt = format!("{method} {new_target} {version}{ending}").into_bytes();
+            rebuilt.extend_from_slice(&self.buffered[line_end + 1..]);
+            self.buffered = rebuilt;
+            self.head_len = find_head_end(&self.buffered)
+                .expect("rewriting a complete HTTP head preserves its terminator");
+            self.target = new_target.to_string();
+        }
+    }
+
     /// Rebuilds the buffered bytes with proxy forwarding headers injected into
     /// the first request: the client is appended to `X-Forwarded-For` and
     /// `Forwarded`, while `X-Forwarded-Host` and `X-Forwarded-Proto` are set
     /// to this hop's values. Bytes past the header block pass through as-is.
     pub fn with_forwarded_headers(&self, client_ip: IpAddr) -> Vec<u8> {
+        self.rewrite_for_proxy(client_ip, "http", None)
+    }
+
+    pub fn rewrite_for_proxy(
+        &self,
+        client_ip: IpAddr,
+        scheme: &str,
+        upstream_host: Option<&str>,
+    ) -> Vec<u8> {
         let head = String::from_utf8_lossy(&self.buffered[..self.head_len]);
         let mut lines = head
             .split('\n')
@@ -193,6 +306,10 @@ impl HttpHead {
             skipping_folds = false;
             if let Some((name, value)) = line.split_once(':') {
                 match name.trim().to_ascii_lowercase().as_str() {
+                    "host" if upstream_host.is_some() => {
+                        skipping_folds = true;
+                        continue;
+                    }
                     "x-forwarded-for" => {
                         xff_values.push(value.trim().to_string());
                         skipping_folds = true;
@@ -203,7 +320,11 @@ impl HttpHead {
                         skipping_folds = true;
                         continue;
                     }
-                    "x-forwarded-host" | "x-forwarded-proto" => {
+                    "authorization" if self.strip_authorization => {
+                        skipping_folds = true;
+                        continue;
+                    }
+                    "x-forwarded-host" | "x-forwarded-proto" | "connection" => {
                         skipping_folds = true;
                         continue;
                     }
@@ -220,8 +341,7 @@ impl HttpHead {
             IpAddr::V6(ip) => format!("for=\"[{ip}]\""),
         };
         forwarded_values.push(format!(
-            "{forwarded_for};host={};proto=http",
-            self.host_raw
+            "{forwarded_for};host={};proto={scheme}", self.host_raw
         ));
         let mut push_header = |name: &str, value: &str| {
             output.extend_from_slice(name.as_bytes());
@@ -231,11 +351,133 @@ impl HttpHead {
         };
         push_header("X-Forwarded-For", &xff_values.join(", "));
         push_header("X-Forwarded-Host", &self.host_raw);
-        push_header("X-Forwarded-Proto", "http");
+        push_header("X-Forwarded-Proto", scheme);
         push_header("Forwarded", &forwarded_values.join(", "));
+        // The current data plane selects a path backend once per connection.
+        // Closing after the response guarantees every subsequent request is
+        // independently routed, including clients that otherwise use keep-alive.
+        push_header("Connection", "close");
+        if let Some(host) = upstream_host {
+            push_header("Host", host);
+        }
         output.extend_from_slice(b"\r\n");
         output.extend_from_slice(&self.buffered[self.head_len..]);
         output
+    }
+}
+
+/// Passes a chunked request body through verbatim while tracking the chunk
+/// framing, and reports EOF exactly at the end of the message (terminal chunk
+/// plus trailers). Framing lines are read one byte at a time so no bytes
+/// belonging to a pipelined follow-up request are ever consumed.
+pub struct ChunkedBodyReader<R> {
+    inner: R,
+    state: ChunkedState,
+}
+
+enum ChunkedState {
+    SizeLine { line: Vec<u8> },
+    Data { remaining: u64 },
+    DataEnd { seen_cr: bool },
+    Trailers { line: Vec<u8>, consumed: usize },
+    Done,
+}
+
+const MAX_CHUNK_LINE: usize = 256;
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
+
+impl<R> ChunkedBodyReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self { inner, state: ChunkedState::SizeLine { line: Vec::new() } }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ChunkedBodyReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::io::{Error, ErrorKind};
+        use std::task::Poll;
+        let this = self.as_mut().get_mut();
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let want = match &this.state {
+            ChunkedState::Done => return Poll::Ready(Ok(())),
+            // Framing lines advance one byte at a time to avoid overshooting
+            // the message boundary; chunk payloads read in bulk.
+            ChunkedState::Data { remaining } => (*remaining).min(buffer.remaining() as u64) as usize,
+            _ => 1,
+        };
+        let mut chunk = [0u8; 8192];
+        let mut scratch = tokio::io::ReadBuf::new(&mut chunk[..want.min(8192)]);
+        match std::pin::Pin::new(&mut this.inner).poll_read(context, &mut scratch) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(cause)) => return Poll::Ready(Err(cause)),
+            Poll::Ready(Ok(())) => {}
+        }
+        let filled = scratch.filled();
+        if filled.is_empty() {
+            return Poll::Ready(Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "connection closed inside a chunked request body",
+            )));
+        }
+        let malformed = |message: &str| Error::new(ErrorKind::InvalidData, message.to_string());
+        match &mut this.state {
+            ChunkedState::SizeLine { line } => {
+                let byte = filled[0];
+                if byte == b'\n' {
+                    let text = std::str::from_utf8(line).map_err(|_| malformed("chunk size line is not UTF-8"))?;
+                    let size_text = text.trim_end_matches('\r');
+                    let size_text = size_text.split(';').next().unwrap_or("").trim();
+                    let size = u64::from_str_radix(size_text, 16)
+                        .map_err(|_| malformed("invalid chunk size"))?;
+                    this.state = if size == 0 {
+                        ChunkedState::Trailers { line: Vec::new(), consumed: 0 }
+                    } else {
+                        ChunkedState::Data { remaining: size }
+                    };
+                } else {
+                    if line.len() >= MAX_CHUNK_LINE {
+                        return Poll::Ready(Err(malformed("chunk size line too long")));
+                    }
+                    line.push(byte);
+                }
+            }
+            ChunkedState::Data { remaining } => {
+                *remaining -= filled.len() as u64;
+                if *remaining == 0 {
+                    this.state = ChunkedState::DataEnd { seen_cr: false };
+                }
+            }
+            ChunkedState::DataEnd { seen_cr } => match (filled[0], *seen_cr) {
+                (b'\r', false) => *seen_cr = true,
+                (b'\n', _) => this.state = ChunkedState::SizeLine { line: Vec::new() },
+                _ => return Poll::Ready(Err(malformed("chunk data is not terminated by CRLF"))),
+            },
+            ChunkedState::Trailers { line, consumed } => {
+                *consumed += 1;
+                if *consumed > MAX_TRAILER_BYTES {
+                    return Poll::Ready(Err(malformed("chunked trailers too long")));
+                }
+                let byte = filled[0];
+                if byte == b'\n' {
+                    if line.iter().all(|value| *value == b'\r') && line.len() <= 1 {
+                        this.state = ChunkedState::Done;
+                    } else {
+                        line.clear();
+                    }
+                } else {
+                    line.push(byte);
+                }
+            }
+            ChunkedState::Done => unreachable!("Done returns before reading"),
+        }
+        buffer.put_slice(filled);
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -373,6 +615,44 @@ mod tests {
         assert!(text.ends_with("\r\n\r\n"));
         // the client-sent proto must not survive
         assert!(!text.contains("https"));
+    }
+
+    #[tokio::test]
+    async fn body_framing_handles_lengths_chunked_and_smuggling_conflicts() {
+        use super::BodyFraming;
+        let head = parse("GET / HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+        assert_eq!(head.body_framing().unwrap(), BodyFraming::Length(0));
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 12\r\n\r\n").await.unwrap();
+        assert_eq!(head.body_framing().unwrap(), BodyFraming::Length(12));
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        assert_eq!(head.body_framing().unwrap(), BodyFraming::Chunked);
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        assert!(head.body_framing().is_err());
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n").await.unwrap();
+        assert!(head.body_framing().is_err());
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n").await.unwrap();
+        assert!(head.body_framing().is_err());
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_stops_exactly_at_the_message_boundary() {
+        use tokio::io::AsyncReadExt;
+        let wire = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\nGET /admin HTTP/1.1\r\n".to_vec();
+        let mut reader = super::ChunkedBodyReader::new(Cursor::new(wire));
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n");
+
+        let wire = b"3\r\nabc\r\n0\r\nExpires: soon\r\n\r\ntrailing pipelined".to_vec();
+        let mut reader = super::ChunkedBodyReader::new(Cursor::new(wire));
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"3\r\nabc\r\n0\r\nExpires: soon\r\n\r\n");
+
+        let truncated = b"5\r\nab".to_vec();
+        let mut reader = super::ChunkedBodyReader::new(Cursor::new(truncated));
+        let mut body = Vec::new();
+        assert!(reader.read_to_end(&mut body).await.is_err());
     }
 
     #[tokio::test]

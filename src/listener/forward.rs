@@ -1,6 +1,7 @@
 //! Raw layer-4 forwarding handler for non-system listeners.
 
 use std::sync::Arc;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -23,10 +24,12 @@ pub(crate) async fn run(
     listener_config: Arc<Listener>,
     context: Arc<ListenerStats>,
     controller: Arc<RwLock<Controller>>,
+    client_ip: IpAddr,
+    load_balancing: crate::runtime_config::HttpLoadBalancing,
 ) -> Result<()> {
     let conn_id = client.get_extension::<RequestId>().await.unwrap();
     info!("{conn_id} {name} forward worker started");
-    let resolved = crate::forward::choose_online(&name)
+    let resolved = crate::forward::choose_online(&name, client_ip, load_balancing)
         .await
         .ok_or_else(|| anyhow!("no online forward backends"))?;
     active_tracker::set_target(&conn_id, &resolved.tls_server_name, &resolved.endpoint).await;

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use axum::extract::{Form, Path, Query, Request, State};
+use axum::extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Form, Path, Query, Request, State};
+use futures_util::{SinkExt, StreamExt};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -62,13 +63,28 @@ pub fn router(state: ControlState) -> Router {
         .route("/tlsproxy_api/config/history", get(config_history))
         .route("/tlsproxy_api/config/rollback/{revision}", post(rollback_config))
         .route("/tlsproxy_api/providers", get(list_providers).put(save_provider))
+        .route("/tlsproxy_api/providers/{id}", delete(delete_provider))
         .route("/tlsproxy_api/managed_certs", get(list_certificates).post(save_certificate))
+        .route("/tlsproxy_api/managed_certs/{id}", delete(delete_certificate))
+        .route("/tlsproxy_api/managed_certs/{id}/publish", put(update_certificate_publish))
         .route("/tlsproxy_api/renew", post(request_renewal))
         .route("/tlsproxy_api/retrieval_tokens", get(list_retrieval_tokens).post(create_retrieval_token))
         .route("/tlsproxy_api/retrieval_tokens/{id}", delete(delete_retrieval_token))
         .route("/tlsproxy_api/audit", get(list_audit))
         .route("/tlsproxy_api/dns_diagnostics", get(list_dns_diagnostics))
         .route("/tlsproxy_api/status", get(runtime_status))
+        .route("/tlsproxy_api/active_connections", get(active_connections))
+        .route("/tlsproxy_api/events/ws", get(events_websocket))
+        .route("/tlsproxy_api/events/snapshot", get(events_snapshot))
+        .route("/tlsproxy_api/listeners/{listener}/events/ws", get(listener_events_websocket))
+        .route("/tlsproxy_api/listeners/{listener}/active_connections", get(listener_active_connections))
+        .route("/tlsproxy_api/listeners/{listener}/{operation}", post(listener_operation))
+        .route("/tlsproxy_api/health_checks", get(health_checks))
+        .route("/tlsproxy_api/health_checks/history", get(health_check_history))
+        .route("/tlsproxy_api/database/export", get(export_database))
+        // Database exports carry full certificate/audit history, so the
+        // default 2 MB body limit would reject realistic restores.
+        .route("/tlsproxy_api/database/import", post(import_database).layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024)))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_session));
     Router::new()
         .route("/login", get(login_page).post(login))
@@ -202,7 +218,7 @@ async fn create_retrieval_token(State(state): State<ControlState>, Json(request)
     }
     let bearer_token = random_token();
     let id = hex::encode(&sha2::Sha256::digest(bearer_token.as_bytes())[..12]);
-    let token = RetrievalToken { id: id.clone(), label: request.label, token_hash: token_hash(&bearer_token), certificate_ids: request.certificate_ids, allow_private_key: request.allow_private_key, created_at: Some(OffsetDateTime::now_utc()), expires_at: request.expires_at, disabled: false };
+    let token = RetrievalToken { id: id.clone(), label: request.label, token_hash: token_hash(&bearer_token), bearer_token: bearer_token.clone(), certificate_ids: request.certificate_ids, allow_private_key: request.allow_private_key, created_at: Some(OffsetDateTime::now_utc()), expires_at: request.expires_at, disabled: false };
     match state.store.save_retrieval_token(&token) {
         Ok(()) => (StatusCode::CREATED, Json(CreatedRetrievalToken { id, bearer_token })).into_response(),
         Err(cause) => internal(cause),
@@ -235,7 +251,16 @@ async fn runtime_status(State(state): State<ControlState>) -> Response {
     for certificate in certificates {
         let active = state.store.active_generation(&certificate.id).ok().flatten();
         let renewal = state.store.renewal_state(&certificate.id).ok().flatten();
-        managed.push(serde_json::json!({"id":certificate.id,"domains":certificate.domains,"enabled":certificate.enabled,"generation_id":active.as_ref().map(|v|&v.id),"not_after":active.and_then(|v|v.not_after),"renewal":renewal}));
+        managed.push(serde_json::json!({
+            "id": certificate.id,
+            "domains": certificate.domains,
+            "enabled": certificate.enabled,
+            "generation_id": active.as_ref().map(|value| &value.id),
+            "fingerprint_sha256": active.as_ref().map(|value| &value.fingerprint_sha256),
+            "not_before": active.as_ref().and_then(|value| value.not_before),
+            "not_after": active.and_then(|value| value.not_after),
+            "renewal": renewal
+        }));
     }
     Json(serde_json::json!({
         "revision": stored.revision,
@@ -244,6 +269,210 @@ async fn runtime_status(State(state): State<ControlState>) -> Response {
         "additional_listeners": stored.config.additional_listeners,
         "managed_certificates": managed,
     })).into_response()
+}
+
+async fn active_connections() -> Json<Vec<crate::active_tracker::ActiveConnectionSerde>> {
+    Json(crate::active_tracker::get_active_list().await)
+}
+
+async fn listener_active_connections(Path(listener): Path<String>) -> Json<Vec<crate::active_tracker::ActiveConnectionSerde>> {
+    Json(crate::active_tracker::get_active_list().await.into_iter().filter(|connection| connection.listener == listener).collect())
+}
+
+async fn listener_operation(
+    State(state): State<ControlState>,
+    Extension(session): Extension<SessionRecord>,
+    Path((listener, operation)): Path<(String, String)>,
+) -> Response {
+    let _write_guard = state.config_write.lock().await;
+    let mut stored = match state.store.load_config_async().await {
+        Ok(Some(value)) => value,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(cause) => return internal(cause),
+    };
+    let mandatory = listener == "__default__" || listener == crate::runtime_config::DEFAULT_LISTENER_NAME;
+    if !mandatory && !stored.config.additional_listeners.contains_key(&listener) {
+        return (StatusCode::NOT_FOUND, "listener does not exist").into_response();
+    }
+    match operation.as_str() {
+        "start" if mandatory => return (StatusCode::BAD_REQUEST, "Public HTTPS is always running").into_response(),
+        "stop" if mandatory => return (StatusCode::BAD_REQUEST, "Public HTTPS cannot be stopped").into_response(),
+        "start" => { stored.config.disabled_listeners.remove(&listener); }
+        "stop" => { stored.config.disabled_listeners.insert(listener.clone()); }
+        // Restart cycles just the one listener in place: no configuration
+        // change is saved (a no-op save would pollute revision history and
+        // reload every listener) and other listeners keep their connections.
+        "restart" => {
+            if stored.config.disabled_listeners.contains(&listener) {
+                return (StatusCode::CONFLICT, "listener is stopped; start it instead").into_response();
+            }
+            let name = listener.clone();
+            tokio::spawn(async move {
+                // Let the HTTPS response flush before its listener may be cycled.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if !crate::runtime::request_listener_restart(&name).await {
+                    log::warn!("restart requested for `{name}` but the listener is not running");
+                }
+            });
+            return Json(serde_json::json!({"listener": listener, "operation": operation})).into_response();
+        }
+        _ => return (StatusCode::BAD_REQUEST, "operation must be start, stop, or restart").into_response(),
+    }
+    match state.store.save_config_async(stored.config, session.username).await {
+        Ok(saved) => {
+            (state.configuration_changed)();
+            Json(serde_json::json!({"revision": saved.revision, "listener": listener, "operation": operation})).into_response()
+        }
+        Err(cause) => (StatusCode::BAD_REQUEST, cause.to_string()).into_response(),
+    }
+}
+
+async fn events_websocket(State(state): State<ControlState>, Extension(session_hash): Extension<String>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| stream_events(socket, None, state, session_hash)).into_response()
+}
+
+async fn events_snapshot() -> Json<Vec<crate::events_hub::Event>> {
+    Json(crate::events_hub::snapshot_events().await)
+}
+
+async fn listener_events_websocket(State(state): State<ControlState>, Extension(session_hash): Extension<String>, Path(listener): Path<String>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| stream_events(socket, Some(listener), state, session_hash)).into_response()
+}
+
+async fn stream_events(socket: WebSocket, listener: Option<String>, state: ControlState, session_hash: String) {
+    static NEXT_STREAM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let stream_id = NEXT_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::info!("event websocket {stream_id} opened; listener={listener:?}");
+    let (mut outgoing, mut incoming) = socket.split();
+    let mut receiver = crate::events_hub::subscribe();
+    for event in crate::events_hub::snapshot_events().await {
+        let key = event.event_payload.get("key").and_then(|value| value.as_str()).unwrap_or_default();
+        let accepted = listener.as_deref().is_none_or(|listener| key == listener);
+        if !accepted { continue; }
+        let Ok(encoded) = serde_json::to_string(&event) else { continue };
+        if let Err(cause) = outgoing.send(Message::Text(encoded.into())).await {
+            log::warn!("event websocket {stream_id} ended while sending initial snapshot: {cause}");
+            return;
+        }
+    }
+    let mut session_check = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = session_check.tick() => {
+                let valid_session = state.store.session_async(session_hash.clone()).await.ok().flatten()
+                    .filter(|session| session.expires_at.is_some_and(|expiry| expiry > OffsetDateTime::now_utc()));
+                let valid = if let Some(session) = valid_session {
+                    state.store.user_async(session.username).await.ok().flatten()
+                        .is_some_and(|user| user.administrator && !user.disabled)
+                } else { false };
+                if !valid {
+                    log::info!("event websocket {stream_id} closing because its session is no longer valid");
+                    let _ = outgoing.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+            frame = incoming.next() => match frame {
+                Some(Ok(Message::Ping(payload))) => {
+                    if let Err(cause) = outgoing.send(Message::Pong(payload)).await {
+                        log::warn!("event websocket {stream_id} ended while sending pong: {cause}");
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    log::info!("event websocket {stream_id} received client close: {frame:?}");
+                    break;
+                }
+                Some(Err(cause)) => {
+                    log::warn!("event websocket {stream_id} receive failed: {cause}");
+                    break;
+                }
+                None => {
+                    log::info!("event websocket {stream_id} ended because the client stream reached EOF");
+                    break;
+                }
+                _ => {}
+            },
+            received = receiver.recv() => {
+                let event = match received {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        log::warn!("event websocket {stream_id} ended because the event hub closed");
+                        break;
+                    }
+                };
+                let key = event.event_payload.get("key").and_then(|value| value.as_str()).unwrap_or_default();
+                let event_listener = event.event_payload.get("listener_name").and_then(|value| value.as_str());
+                let accepted = match listener.as_deref() {
+                    Some(listener) => key == listener || event_listener == Some(listener),
+                    None => event.event_type != crate::events_hub::CONNECTION_BYTES_TRANSFERRED_CHANGED,
+                };
+                if !accepted { continue; }
+                let Ok(encoded) = serde_json::to_string(&event) else { continue };
+                if let Err(cause) = outgoing.send(Message::Text(encoded.into())).await {
+                    log::warn!("event websocket {stream_id} ended while publishing an event: {cause}");
+                    break;
+                }
+            }
+        }
+    }
+    log::info!("event websocket {stream_id} closed; listener={listener:?}");
+}
+
+async fn health_checks() -> Json<Vec<crate::forward::HealthCheckTarget>> {
+    Json(crate::forward::health_check_targets().await)
+}
+
+#[derive(Deserialize)]
+struct HealthHistoryQuery { listener: String, host: String, backend: String, endpoint: String }
+
+async fn health_check_history(State(state): State<ControlState>, Query(query): Query<HealthHistoryQuery>) -> Response {
+    match state.store.health_check_history_filtered_async(query.listener, query.host, query.backend, query.endpoint).await {
+        Ok(values) => Json(values).into_response(),
+        Err(cause) => internal(cause),
+    }
+}
+
+fn is_administrator(state: &ControlState, session: &SessionRecord) -> bool {
+    state.store.user(&session.username).ok().flatten().is_some_and(|user| user.administrator && !user.disabled)
+}
+
+async fn export_database(State(state): State<ControlState>, Extension(session): Extension<SessionRecord>) -> Response {
+    if !is_administrator(&state, &session) { return StatusCode::FORBIDDEN.into_response(); }
+    match state.store.export_json() {
+        Ok(export) => match serde_json::to_string_pretty(&export) {
+            Ok(body) => ([(header::CONTENT_TYPE, "application/json"), (header::CONTENT_DISPOSITION, "attachment; filename=\"tlsproxy-rocksdb-export.json\"")], body).into_response(),
+            Err(cause) => internal(cause),
+        },
+        Err(cause) => internal(cause),
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportDatabaseRequest {
+    mode: String,
+    export: crate::store::RocksDbJsonExport,
+}
+
+async fn import_database(State(state): State<ControlState>, Extension(session): Extension<SessionRecord>, Json(request): Json<ImportDatabaseRequest>) -> Response {
+    if !is_administrator(&state, &session) { return StatusCode::FORBIDDEN.into_response(); }
+    let clear_existing = match request.mode.as_str() {
+        "merge" => false,
+        "clear_and_import" => true,
+        _ => return (StatusCode::BAD_REQUEST, "mode must be `merge` or `clear_and_import`").into_response(),
+    };
+    match state.store.import_json(&request.export, clear_existing) {
+        Ok(imported) => {
+            let _ = state.store.append_audit("database_json_import", serde_json::json!({"mode": request.mode, "entries": imported, "actor": session.username}));
+            (state.configuration_changed)();
+            Json(serde_json::json!({"imported_entries": imported, "mode": request.mode})).into_response()
+        }
+        Err(cause) => (StatusCode::BAD_REQUEST, cause.to_string()).into_response(),
+    }
 }
 
 async fn login_page() -> Html<&'static str> {
@@ -415,12 +644,18 @@ async fn rollback_config(State(state): State<ControlState>, Extension(session): 
     let _write_guard = state.config_write.lock().await;
     let previous = match state.store.config_revision(revision) { Ok(Some(value)) => value, Ok(None) => return StatusCode::NOT_FOUND.into_response(), Err(cause) => return internal(cause) };
     let current = match state.store.load_config() { Ok(Some(value)) => value, Ok(None) => return StatusCode::NOT_FOUND.into_response(), Err(cause) => return internal(cause) };
+    if previous.config.default_listener.bind != current.config.default_listener.bind {
+        return (StatusCode::BAD_REQUEST, "the mandatory Public HTTPS bind address cannot be changed by rollback").into_response();
+    }
     if current.config.control_plane.hostname != previous.config.control_plane.hostname {
         let hostname = &previous.config.control_plane.hostname;
         let usable = state.store.certificate_for_domain(hostname).ok().flatten()
             .and_then(|managed| state.store.active_generation(&managed.id).ok().flatten().map(|generation| (managed, generation)))
             .is_some_and(|(managed, generation)| crate::managed_tls::validate_generation(&managed, &generation).is_ok());
         if !usable { return (StatusCode::BAD_REQUEST, "historical control hostname has no active valid managed certificate").into_response(); }
+    }
+    if let Err(cause) = state.store.ensure_automatic_certificates(&previous.config) {
+        return (StatusCode::BAD_REQUEST, cause.to_string()).into_response();
     }
     match state.store.save_config(&previous.config, &session.username) {
         Ok(stored) => { (state.configuration_changed)(); Json(stored).into_response() },
@@ -448,6 +683,12 @@ async fn put_config(
     if current.revision != request.revision {
         return (StatusCode::CONFLICT, "Configuration revision changed").into_response();
     }
+    if request.config.default_listener.bind != current.config.default_listener.bind {
+        return (StatusCode::BAD_REQUEST, "the mandatory Public HTTPS bind address cannot be changed").into_response();
+    }
+    if let Err(cause) = request.config.validate() {
+        return (StatusCode::BAD_REQUEST, cause.to_string()).into_response();
+    }
     if current.config.control_plane.hostname != request.config.control_plane.hostname {
         let new_hostname = request.config.control_plane.hostname.clone();
         let managed = match state.store.certificate_for_domain_async(new_hostname.clone()).await {
@@ -464,16 +705,37 @@ async fn put_config(
             return (StatusCode::BAD_REQUEST, format!("The new control hostname certificate is unusable: {cause}")).into_response();
         }
     }
+    if let Err(cause) = state.store.ensure_automatic_certificates(&request.config) {
+        return (StatusCode::BAD_REQUEST, cause.to_string()).into_response();
+    }
+    let previous_config = current.config.clone();
     match state
         .store
         .save_config_async(request.config, session.username)
         .await
     {
         Ok(saved) => {
-            (state.configuration_changed)();
+            apply_runtime_config(&state, &previous_config, &saved).await;
             Json(saved).into_response()
         }
         Err(cause) => (StatusCode::BAD_REQUEST, cause.to_string()).into_response(),
+    }
+}
+
+async fn apply_runtime_config(state: &ControlState, previous: &RuntimeConfig, saved: &crate::store::StoredConfig) {
+    if crate::runtime_live::listener_settings_only(previous, &saved.config) {
+        crate::runtime_live::store(saved.config.clone());
+        if let Err(cause) = crate::forward::apply_hot_listener_settings(&saved.config).await {
+            log::error!("hot listener configuration failed: {cause:#}; reloading runtime");
+            (state.configuration_changed)();
+        } else {
+            // A hot-applied revision is proven working; record it so a later
+            // failed full reload rolls back to it rather than to the older
+            // revision the runtime loop last applied.
+            crate::runtime_live::store_last_good(saved.clone());
+        }
+    } else {
+        (state.configuration_changed)();
     }
 }
 
@@ -486,11 +748,14 @@ struct PublicProvider {
     eab_key_id: Option<String>,
     has_eab_hmac_key: bool,
     staging: bool,
+    is_default: bool,
+    builtin: bool,
     directory_ca_pem: Option<String>,
 }
 
 impl From<AcmeProvider> for PublicProvider {
     fn from(value: AcmeProvider) -> Self {
+        let builtin = matches!(value.id.as_str(), "letsencrypt-production" | "letsencrypt-staging");
         Self {
             id: value.id,
             name: value.name,
@@ -499,6 +764,8 @@ impl From<AcmeProvider> for PublicProvider {
             eab_key_id: value.eab_key_id,
             has_eab_hmac_key: value.eab_hmac_key.is_some(),
             staging: value.staging,
+            is_default: value.is_default,
+            builtin,
             directory_ca_pem: value.directory_ca_pem,
         }
     }
@@ -512,9 +779,27 @@ async fn list_providers(State(state): State<ControlState>) -> Response {
 }
 
 async fn save_provider(State(state): State<ControlState>, Json(provider): Json<AcmeProvider>) -> Response {
+    // Serialize with other admin mutations so read-modify-write invariants
+    // (unique default provider, reference checks) cannot interleave.
+    let _write_guard = state.config_write.lock().await;
     let store = state.store.clone();
     match tokio::task::spawn_blocking(move || {
         let mut provider = provider;
+        match provider.id.as_str() {
+            "letsencrypt-production" => {
+                provider.name = "Let's Encrypt Production".into();
+                provider.directory_url = "https://acme-v02.api.letsencrypt.org/directory".into();
+                provider.staging = false;
+                provider.directory_ca_pem = None;
+            }
+            "letsencrypt-staging" => {
+                provider.name = "Let's Encrypt Staging".into();
+                provider.directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory".into();
+                provider.staging = true;
+                provider.directory_ca_pem = None;
+            }
+            _ => {}
+        }
         if provider.eab_hmac_key.is_none() {
             if let Some(existing) = store.provider(&provider.id)? {
                 provider.eab_hmac_key = existing.eab_hmac_key;
@@ -532,6 +817,32 @@ async fn save_provider(State(state): State<ControlState>, Json(provider): Json<A
     }
 }
 
+async fn delete_provider(State(state): State<ControlState>, Path(id): Path<String>) -> Response {
+    let _write_guard = state.config_write.lock().await;
+    if matches!(id.as_str(), "letsencrypt-production" | "letsencrypt-staging") {
+        return (StatusCode::CONFLICT, "built-in Let's Encrypt providers cannot be deleted").into_response();
+    }
+    let config = match state.store.load_config() {
+        Ok(Some(value)) => value.config,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(cause) => return internal(cause),
+    };
+    if config.control_plane.provider_id == id {
+        return (StatusCode::CONFLICT, "provider is used by the control-plane certificate").into_response();
+    }
+    match state.store.managed_certificates() {
+        Ok(values) if values.iter().any(|certificate| certificate.provider_id == id) => {
+            return (StatusCode::CONFLICT, "provider is used by a managed certificate").into_response();
+        }
+        Ok(_) => {}
+        Err(cause) => return internal(cause),
+    }
+    match state.store.delete_provider(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(cause) => internal(cause),
+    }
+}
+
 async fn list_certificates(State(state): State<ControlState>) -> Response {
     match state.store.managed_certificates_async().await {
         Ok(values) => Json(values).into_response(),
@@ -541,14 +852,49 @@ async fn list_certificates(State(state): State<ControlState>) -> Response {
 
 async fn save_certificate(
     State(state): State<ControlState>,
-    Json(certificate): Json<ManagedCertificate>,
+    Json(mut certificate): Json<ManagedCertificate>,
 ) -> Response {
+    let _write_guard = state.config_write.lock().await;
+    certificate.automatic = false;
+    if certificate.domains.len() == 1 {
+        match crate::store::normalize_domain(&certificate.domains[0]) {
+            Ok(domain) => { certificate.id = domain.clone(); certificate.domains = vec![domain]; }
+            Err(cause) => return (StatusCode::BAD_REQUEST, cause.to_string()).into_response(),
+        }
+    }
     let store = state.store.clone();
     match tokio::task::spawn_blocking(move || store.save_managed_certificate(&certificate)).await {
         Ok(Ok(())) => {
             (state.configuration_changed)();
             StatusCode::NO_CONTENT.into_response()
         }
+        Ok(Err(cause)) => (StatusCode::BAD_REQUEST, cause.to_string()).into_response(),
+        Err(cause) => internal(cause),
+    }
+}
+
+async fn delete_certificate(State(state): State<ControlState>, Path(id): Path<String>) -> Response {
+    let _write_guard = state.config_write.lock().await;
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || store.delete_managed_certificate(&id)).await {
+        Ok(Ok(true)) => {
+            (state.configuration_changed)();
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(cause)) => (StatusCode::CONFLICT, cause.to_string()).into_response(),
+        Err(cause) => internal(cause),
+    }
+}
+
+async fn update_certificate_publish(State(state): State<ControlState>, Path(id): Path<String>, Json(publish): Json<crate::acme_types::PublishPolicy>) -> Response {
+    let store = state.store.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut certificate = store.managed_certificate(&id)?.context("managed certificate not found")?;
+        certificate.publish = publish;
+        store.save_managed_certificate(&certificate)
+    }).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(cause)) => (StatusCode::BAD_REQUEST, cause.to_string()).into_response(),
         Err(cause) => internal(cause),
     }
@@ -672,7 +1018,7 @@ mod tests {
     #[tokio::test]
     async fn publication_is_domain_indexed_scoped_etagged_and_key_gated() {
         let (_directory, store) = initialized_store();
-        let managed = ManagedCertificate { id: "published".into(), domains: vec!["www.example".into()], provider_id: "test".into(), publish: crate::acme_types::PublishPolicy { enabled: true, allow_private_key: false }, ..Default::default() };
+        let managed = ManagedCertificate { id: "www.example".into(), domains: vec!["www.example".into()], provider_id: "test".into(), publish: crate::acme_types::PublishPolicy { enabled: true, allow_private_key: false }, ..Default::default() };
         store.save_managed_certificate(&managed).unwrap();
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["www.example".into()]).unwrap().self_signed(&key).unwrap();
@@ -685,7 +1031,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let etag = response.headers()[header::ETAG].clone();
         let body: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-        assert_eq!(body["certificate_id"], "published");
+        assert_eq!(body["certificate_id"], "www.example");
         assert_eq!(body["generation_id"], "gen-2");
         assert!(body["private_key_pem"].is_null());
         let unchanged = app.clone().oneshot(Request::builder().uri("/tlsproxy_api/certs/www.example").header(header::AUTHORIZATION, format!("Bearer {bearer}")).header(header::IF_NONE_MATCH, etag).body(Body::empty()).unwrap()).await.unwrap();

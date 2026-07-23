@@ -1,4 +1,5 @@
 use crate::config::{Listener, ListenerMode};
+use crate::runtime_config::HttpLoadBalancing;
 use crate::controller::Controller;
 use crate::hostutil::HostAndPort;
 use crate::resolver;
@@ -7,11 +8,15 @@ use lazy_static::lazy_static;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 use tokio::net::{lookup_host, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 use tokio_rustls::TlsConnector;
 
@@ -29,6 +34,35 @@ lazy_static! {
         Arc::new(RwLock::new(HashMap::new()));
     static ref DNS_CACHE: Arc<RwLock<HashMap<(String, u16), CachedDns>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    static ref HTTP_ROUTE_CURSORS: Arc<RwLock<HashMap<String, u64>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    static ref HEALTH_BINDINGS: Arc<RwLock<Vec<HealthBinding>>> =
+        Arc::new(RwLock::new(Vec::new()));
+}
+
+#[derive(Debug, Clone)]
+struct HealthBinding {
+    group: GroupKey,
+    listener: String,
+    host: String,
+    path: String,
+    backend: String,
+    transport: String,
+    load_balancing: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthCheckTarget {
+    pub listener: String,
+    pub host: String,
+    pub path: String,
+    pub backend: String,
+    pub endpoint: String,
+    pub transport: String,
+    pub load_balancing: String,
+    pub online: Option<bool>,
+    pub since_ms: u128,
+    pub last_checked_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +89,7 @@ pub struct SelectedTarget {
 struct GroupKey {
     target: String,
     upstream_tls: bool,
+    http_health: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +103,7 @@ struct EndpointState {
     endpoint: String,
     online: Option<bool>,
     since_ms: u128,
+    last_checked_ms: u128,
 }
 
 #[derive(Debug)]
@@ -88,6 +124,7 @@ impl MonitorGroup {
         requested_target: String,
         effective: HostAndPort,
         upstream_tls: bool,
+        http_health: bool,
         tls_server_name: String,
         owner: Owner,
     ) -> Arc<Self> {
@@ -95,6 +132,7 @@ impl MonitorGroup {
         let key = GroupKey {
             target: effective.to_string(),
             upstream_tls,
+            http_health,
         };
         let group = Arc::new(Self {
             key,
@@ -180,6 +218,7 @@ impl MonitorGroup {
                     endpoint,
                     online: None,
                     since_ms: now,
+                    last_checked_ms: 0,
                 })
             })
             .collect();
@@ -193,6 +232,7 @@ impl MonitorGroup {
                 .iter_mut()
                 .find(|state| state.endpoint == endpoint)
             {
+                state.last_checked_ms = now_ms();
                 if state.online != Some(online) {
                     let before = state.online;
                     state.online = Some(online);
@@ -274,6 +314,7 @@ pub async fn register_forward_listener(
             requested.host(),
             requested.port(),
             upstream_tls,
+            false,
             requested.host().to_string(),
             Owner::Configured,
         )
@@ -382,9 +423,143 @@ pub async fn reset() {
     LISTENER_BACKENDS.write().await.clear();
     FORWARD_LISTENERS.write().await.clear();
     GROUPS.write().await.clear();
+    HTTP_ROUTE_CURSORS.write().await.clear();
+    HEALTH_BINDINGS.write().await.clear();
 }
 
-pub async fn choose_online(listener_name: &str) -> Option<SelectedTarget> {
+fn matcher_label(matcher: &crate::runtime_config::HostMatcher) -> String {
+    matcher.exact.iter().cloned()
+        .chain(matcher.suffix.iter().map(|value| format!("*.{}", value.trim_start_matches('.'))))
+        .chain(matcher.patterns.iter().map(|value| format!("/{value}/")))
+        .collect::<Vec<_>>().join(", ")
+}
+
+async fn bind_http_action(listener: &str, host: &str, path: &str, action: &crate::runtime_config::HttpRouteAction) -> Result<()> {
+    for backend in &action.backends {
+        let requested = HostAndPort::parse_or_default(&backend.address, action.target_port);
+        let tls = backend.transport == crate::runtime_config::UpstreamTransport::Tls;
+        let tls_name = backend.tls_server_name.clone().unwrap_or_else(|| requested.host().to_string());
+        let group = ensure_group(requested.to_string(), requested.host(), requested.port(), tls, true, tls_name, Owner::Configured).await?;
+        HEALTH_BINDINGS.write().await.push(HealthBinding {
+            group: group.key.clone(), listener: listener.into(), host: host.into(), path: path.into(),
+            backend: backend.address.clone(), transport: if tls { "tls" } else { "plaintext" }.into(),
+            load_balancing: match action.load_balancing { HttpLoadBalancing::RoundRobin => "round_robin", HttpLoadBalancing::ClientIpHash => "client_ip_hash" }.into(),
+        });
+    }
+    for route in &action.paths {
+        if let crate::runtime_config::HttpPathAction::ReverseProxy { action } = &route.action {
+            Box::pin(bind_http_action(listener, host, &route.prefix, action)).await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn configure_health_checks(config: &crate::runtime_config::RuntimeConfig) -> Result<()> {
+    HEALTH_BINDINGS.write().await.clear();
+    for route in &config.default_listener.ordinary_traffic.routes {
+        if let crate::runtime_config::TlsRouteAction::ReverseProxy { action } = &route.action {
+            bind_http_action(crate::runtime_config::DEFAULT_LISTENER_NAME, &matcher_label(&route.matcher), "/", action).await?;
+        }
+    }
+    for (listener, configured) in &config.additional_listeners {
+        if config.disabled_listeners.contains(listener) {
+            continue;
+        }
+        match configured {
+            crate::runtime_config::AdditionalListenerConfig::Tls(value) => {
+                for route in &value.routing.routes {
+                    if let crate::runtime_config::TlsRouteAction::ReverseProxy { action } = &route.action {
+                        bind_http_action(listener, &matcher_label(&route.matcher), "/", action).await?;
+                    }
+                }
+            }
+            crate::runtime_config::AdditionalListenerConfig::Http(value) => {
+                for route in &value.routes { bind_http_action(listener, &matcher_label(&route.matcher), "/", &route.action).await?; }
+            }
+            crate::runtime_config::AdditionalListenerConfig::Redirect(_) | crate::runtime_config::AdditionalListenerConfig::Forward(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub async fn apply_hot_listener_settings(config: &crate::runtime_config::RuntimeConfig) -> Result<()> {
+    for (name, listener) in &config.additional_listeners {
+        if config.disabled_listeners.contains(name) {
+            continue;
+        }
+        if let crate::runtime_config::AdditionalListenerConfig::Forward(listener) = listener {
+            register_forward_listener(name.clone(), &listener.targets, listener.upstream_tls).await?;
+        }
+    }
+    configure_health_checks(config).await
+}
+
+pub async fn health_check_targets() -> Vec<HealthCheckTarget> {
+    let bindings = HEALTH_BINDINGS.read().await.clone();
+    let groups = GROUPS.read().await;
+    let mut values = Vec::new();
+    for binding in bindings {
+        let Some(group) = groups.get(&binding.group) else { continue };
+        for endpoint in group.endpoints.read().await.iter() {
+            values.push(HealthCheckTarget {
+                listener: binding.listener.clone(), host: binding.host.clone(), path: binding.path.clone(),
+                backend: binding.backend.clone(), endpoint: endpoint.endpoint.clone(), transport: binding.transport.clone(),
+                load_balancing: binding.load_balancing.clone(), online: endpoint.online, since_ms: endpoint.since_ms,
+                last_checked_ms: endpoint.last_checked_ms,
+            });
+        }
+    }
+    values.sort_by(|a, b| (&a.listener, &a.host, &a.backend, &a.endpoint).cmp(&(&b.listener, &b.host, &b.backend, &b.endpoint)));
+    values
+}
+
+/// Selects a healthy endpoint from a reverse-proxy route's backend pool.
+/// Legacy target/port routes remain supported when `backends` is empty.
+pub async fn select_http_backend(
+    route_key: &str,
+    host: &str,
+    client_ip: IpAddr,
+    action: &crate::runtime_config::HttpRouteAction,
+) -> Result<(SelectedTarget, bool)> {
+    use crate::runtime_config::HttpLoadBalancing;
+    if action.backends.is_empty() {
+        let tls = action.upstream == crate::runtime_config::UpstreamTransport::Tls;
+        return Ok((select_routed_target(host, action.target.as_deref(), action.target_port, tls).await?, tls));
+    }
+    let mut available = Vec::new();
+    for backend in &action.backends {
+        let requested: HostAndPort = backend.address.parse()
+            .map_err(|cause| anyhow!("invalid HTTP backend `{}`: {cause}", backend.address))?;
+        let tls = backend.transport == crate::runtime_config::UpstreamTransport::Tls;
+        let tls_name = backend.tls_server_name.clone().unwrap_or_else(|| requested.host().to_string());
+        let group = ensure_group(requested.to_string(), requested.host(), requested.port(), tls, true, tls_name, Owner::Runtime).await?;
+        group.touch().await;
+        let endpoints = group.endpoints.read().await;
+        if endpoints.iter().any(|item| item.online == Some(true)) || endpoints.iter().any(|item| item.online.is_none()) {
+            available.push((Arc::clone(&group), tls));
+        }
+    }
+    if available.is_empty() { return Err(anyhow!("no healthy reverse-proxy backends for `{host}`")); }
+    let index = match action.load_balancing {
+        HttpLoadBalancing::ClientIpHash => {
+            let mut hasher = DefaultHasher::new();
+            client_ip.hash(&mut hasher);
+            (hasher.finish() as usize) % available.len()
+        }
+        HttpLoadBalancing::RoundRobin => {
+            let mut cursors = HTTP_ROUTE_CURSORS.write().await;
+            let cursor = cursors.entry(route_key.to_string()).or_default();
+            let index = (*cursor as usize) % available.len();
+            *cursor = cursor.wrapping_add(1);
+            index
+        }
+    };
+    let (group, tls) = &available[index];
+    let selected = group.choose_endpoint().await.ok_or_else(|| anyhow!("no healthy reverse-proxy endpoints for `{host}`"))?;
+    Ok((selected, *tls))
+}
+
+pub async fn choose_online(listener_name: &str, client_ip: IpAddr, load_balancing: crate::runtime_config::HttpLoadBalancing) -> Option<SelectedTarget> {
     let groups = GROUPS.read().await;
     let keys = FORWARD_LISTENERS.read().await.get(listener_name).cloned();
     let mut selected = Vec::new();
@@ -401,7 +576,10 @@ pub async fn choose_online(listener_name: &str) -> Option<SelectedTarget> {
     if selected.is_empty() {
         return None;
     }
-    let index = (now_ms() as usize) % selected.len();
+    let index = match load_balancing {
+        crate::runtime_config::HttpLoadBalancing::ClientIpHash => { let mut hasher=DefaultHasher::new(); client_ip.hash(&mut hasher); (hasher.finish() as usize)%selected.len() }
+        crate::runtime_config::HttpLoadBalancing::RoundRobin => { let mut cursors=HTTP_ROUTE_CURSORS.write().await; let cursor=cursors.entry(listener_name.to_string()).or_default(); let index=(*cursor as usize)%selected.len(); *cursor=cursor.wrapping_add(1); index }
+    };
     selected.get(index).cloned()
 }
 
@@ -416,6 +594,7 @@ pub async fn select_runtime_target(
         requested_host,
         requested_port,
         upstream_tls,
+        false,
         tls_server_name.to_string(),
         Owner::Runtime,
     )
@@ -449,6 +628,7 @@ pub async fn select_routed_target(
         requested.host(),
         requested.port(),
         upstream_tls,
+        false,
         sni_host.to_string(),
         Owner::Runtime,
     )
@@ -462,14 +642,78 @@ pub async fn select_routed_target(
     Ok(selected)
 }
 
-pub fn spawn_global_health_checks(controller: &mut Controller) {
+/// Selects from a comma/semicolon-separated Layer-4 route pool. Each named
+/// target goes through the configured DNS override and then normal DNS
+/// expansion in `ensure_group`, exactly like reverse-proxy backends.
+pub async fn select_routed_pool(
+    route_key: &str,
+    sni_host: &str,
+    explicit_targets: Option<&str>,
+    default_port: u16,
+    upstream_tls: bool,
+    client_ip: IpAddr,
+    load_balancing: crate::runtime_config::HttpLoadBalancing,
+) -> Result<SelectedTarget> {
+    use crate::runtime_config::HttpLoadBalancing;
+
+    let target_texts: Vec<&str> = explicit_targets
+        .map(|targets| targets.split([',', ';']).map(str::trim).filter(|value| !value.is_empty()).collect())
+        .unwrap_or_else(|| vec![sni_host]);
+    if target_texts.is_empty() {
+        return Err(anyhow!("route backend pool requires at least one target"));
+    }
+
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+    for target in target_texts {
+        let requested = HostAndPort::parse_or_default(target, default_port);
+        if requested.port() == 0 {
+            return Err(anyhow!("route target `{target}` has an invalid port"));
+        }
+        let group = ensure_group(
+            requested.to_string(), requested.host(), requested.port(), upstream_tls,
+            false, sni_host.to_string(), Owner::Runtime,
+        ).await?;
+        group.touch().await;
+        let endpoints = group.endpoints.read().await;
+        if endpoints.iter().any(|item| item.online != Some(false)) {
+            preferred.push(group.clone());
+        } else if !endpoints.is_empty() {
+            fallback.push(group.clone());
+        }
+    }
+    let available = if preferred.is_empty() { fallback } else { preferred };
+    if available.is_empty() {
+        return Err(anyhow!("no available upstream endpoint for route `{route_key}`"));
+    }
+    let index = match load_balancing {
+        HttpLoadBalancing::ClientIpHash => {
+            let mut hasher = DefaultHasher::new();
+            client_ip.hash(&mut hasher);
+            (hasher.finish() as usize) % available.len()
+        }
+        HttpLoadBalancing::RoundRobin => {
+            let mut cursors = HTTP_ROUTE_CURSORS.write().await;
+            let cursor = cursors.entry(route_key.to_string()).or_default();
+            let index = (*cursor as usize) % available.len();
+            *cursor = cursor.wrapping_add(1);
+            index
+        }
+    };
+    let mut selected = available[index].choose_endpoint().await
+        .ok_or_else(|| anyhow!("no available upstream endpoint for route `{route_key}`"))?;
+    selected.tls_server_name = sni_host.to_string();
+    Ok(selected)
+}
+
+pub fn spawn_global_health_checks(controller: &mut Controller, store: crate::store::Store) {
     let health_controller = controller.child();
     controller.spawn(async move {
-        run_global_health_checks(health_controller).await;
+        run_global_health_checks(health_controller, store).await;
     });
 }
 
-pub async fn check_all_once(check_controller: &mut Controller) {
+pub async fn check_all_once(check_controller: &mut Controller, store: &crate::store::Store) {
     evict_expired_runtime_groups().await;
     evict_excess_runtime_groups().await;
     let groups: Vec<_> = GROUPS.read().await.values().cloned().collect();
@@ -488,6 +732,15 @@ pub async fn check_all_once(check_controller: &mut Controller) {
         }
     }
     check_jobs(jobs, check_controller).await;
+    let checked_at = OffsetDateTime::now_utc();
+    let samples = health_check_targets().await.into_iter().filter_map(|value| Some(crate::store::HealthCheckSample {
+        listener: value.listener, host: value.host, path: value.path, backend: value.backend,
+        endpoint: value.endpoint, transport: value.transport, load_balancing: value.load_balancing,
+        online: value.online?, checked_at,
+    })).collect::<Vec<_>>();
+    if let Err(cause) = store.save_health_check_samples_async(samples).await {
+        log::warn!("failed to persist health-check status: {cause:#}");
+    }
 }
 
 async fn ensure_group(
@@ -495,6 +748,7 @@ async fn ensure_group(
     requested_host: &str,
     requested_port: u16,
     upstream_tls: bool,
+    http_health: bool,
     tls_server_name: String,
     owner: Owner,
 ) -> Result<Arc<MonitorGroup>> {
@@ -502,6 +756,7 @@ async fn ensure_group(
     let key = GroupKey {
         target: effective.to_string(),
         upstream_tls,
+        http_health,
     };
     if let Some(group) = GROUPS.read().await.get(&key).cloned() {
         if owner == Owner::Runtime {
@@ -513,6 +768,7 @@ async fn ensure_group(
         requested_target,
         effective,
         upstream_tls,
+        http_health,
         tls_server_name,
         owner,
     )
@@ -572,12 +828,13 @@ fn excess_runtime_groups_to_evict(mut runtime_groups: Vec<(GroupKey, u128)>) -> 
 }
 
 async fn prune_unreferenced_configured_groups() {
-    let referenced: HashSet<GroupKey> = FORWARD_LISTENERS
+    let mut referenced: HashSet<GroupKey> = FORWARD_LISTENERS
         .read()
         .await
         .values()
         .flat_map(|keys| keys.iter().cloned())
         .collect();
+    referenced.extend(HEALTH_BINDINGS.read().await.iter().map(|binding| binding.group.clone()));
     GROUPS
         .write()
         .await
@@ -600,10 +857,10 @@ async fn publish_configured_statuses() {
     *LISTENER_BACKENDS.write().await = statuses;
 }
 
-async fn run_global_health_checks(mut health_controller: Controller) {
+async fn run_global_health_checks(mut health_controller: Controller, store: crate::store::Store) {
     loop {
         let mut check_controller = health_controller.child();
-        check_all_once(&mut check_controller).await;
+        check_all_once(&mut check_controller, &store).await;
         check_controller.cancel();
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -617,7 +874,7 @@ async fn check_jobs(jobs: Vec<(Arc<MonitorGroup>, String)>, check_controller: &m
         let group = Arc::clone(group);
         let endpoint = endpoint.clone();
         check_controller.spawn(async move {
-            let online = probe(&endpoint, group.key.upstream_tls, &group.tls_server_name).await;
+            let online = probe(&endpoint, group.key.upstream_tls, group.key.http_health, &group.tls_server_name).await;
             let _ = tx.send((group, endpoint, online)).await;
         });
     }
@@ -776,13 +1033,13 @@ impl rustls::client::danger::ServerCertVerifier for TrustAllVerifier {
     }
 }
 
-async fn probe(endpoint: &str, upstream_tls: bool, tls_server_name: &str) -> bool {
-    let stream = match TcpStream::connect(endpoint).await {
+async fn probe(endpoint: &str, upstream_tls: bool, http_health: bool, tls_server_name: &str) -> bool {
+    let mut stream = match TcpStream::connect(endpoint).await {
         Ok(stream) => stream,
         Err(_) => return false,
     };
     if !upstream_tls {
-        return true;
+        return !http_health || probe_http(&mut stream, tls_server_name).await;
     }
 
     let config = rustls::ClientConfig::builder()
@@ -794,7 +1051,22 @@ async fn probe(endpoint: &str, upstream_tls: bool, tls_server_name: &str) -> boo
     else {
         return false;
     };
-    connector.connect(server_name, stream).await.is_ok()
+    let Ok(mut tls) = connector.connect(server_name, stream).await else { return false };
+    !http_health || probe_http(&mut tls, tls_server_name).await
+}
+
+async fn probe_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(stream: &mut S, host: &str) -> bool {
+    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).await.is_err() { return false; }
+    let mut response = [0u8; 64];
+    let Ok(count) = stream.read(&mut response).await else { return false };
+    let first_line = String::from_utf8_lossy(&response[..count]);
+    let Some(status) = first_line.split_ascii_whitespace().nth(1).and_then(|value| value.parse::<u16>().ok()) else { return false };
+    // Authentication and authorization failures still prove that an HTTP
+    // backend is reachable and serving requests. Mark only invalid responses
+    // and server-side failures as unhealthy; otherwise protected backends
+    // become unavailable immediately after their first unauthenticated probe.
+    (100..500).contains(&status)
 }
 
 fn now_ms() -> u128 {
@@ -815,12 +1087,31 @@ fn state_name(online: Option<bool>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn http_probe_accepts_authentication_challenge_as_healthy() {
+        let (mut probe_side, mut backend_side) = tokio::io::duplex(1024);
+        let backend = tokio::spawn(async move {
+            let mut request = [0u8; 1024];
+            let count = backend_side.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET / HTTP/1.1\r\n"));
+            backend_side
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        assert!(probe_http(&mut probe_side, "vpnman.local").await);
+        backend.await.unwrap();
+    }
 
     fn test_group(owner: Owner, target: &str, endpoints: Vec<EndpointState>) -> MonitorGroup {
         MonitorGroup {
             key: GroupKey {
                 target: target.into(),
                 upstream_tls: false,
+                http_health: false,
             },
             requested_target: target.into(),
             effective_host: target
@@ -851,11 +1142,13 @@ mod tests {
                     endpoint: "[2606:4700:4700::1111]:443".into(),
                     online: Some(false),
                     since_ms: now_ms(),
+                    last_checked_ms: now_ms(),
                 },
                 EndpointState {
                     endpoint: "104.16.248.249:443".into(),
                     online: Some(false),
                     since_ms: now_ms(),
+                    last_checked_ms: now_ms(),
                 },
             ],
         );
@@ -884,6 +1177,7 @@ mod tests {
                 endpoint: "127.0.0.1:443".into(),
                 online: Some(false),
                 since_ms: now_ms(),
+                last_checked_ms: now_ms(),
             }],
         );
 
@@ -902,6 +1196,7 @@ mod tests {
                 let key = GroupKey {
                     target: format!("runtime-{index}.example:443"),
                     upstream_tls: false,
+                    http_health: false,
                 };
                 (key, index as u128)
             })
@@ -913,10 +1208,12 @@ mod tests {
         assert!(evicted.contains(&GroupKey {
             target: "runtime-0.example:443".into(),
             upstream_tls: false,
+            http_health: false,
         }));
         assert!(!evicted.contains(&GroupKey {
             target: "runtime-204.example:443".into(),
             upstream_tls: false,
+            http_health: false,
         }));
     }
 

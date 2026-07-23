@@ -2,6 +2,7 @@ pub mod control_plane;
 pub mod default;
 pub mod forward;
 pub mod http_passthrough;
+pub mod static_files;
 pub mod tls_passthrough;
 pub mod tls_terminate;
 

@@ -73,6 +73,8 @@ pub struct AcmeProvider {
     pub eab_hmac_key: Option<String>,
     #[serde(default)]
     pub staging: bool,
+    #[serde(default)]
+    pub is_default: bool,
     /// Optional PEM root used only for private/local ACME directories such as Pebble.
     #[serde(default)]
     pub directory_ca_pem: Option<String>,
@@ -108,6 +110,9 @@ pub struct ManagedCertificate {
     pub provider_id: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Created from a TLS-terminating host route and retained while in use.
+    #[serde(default)]
+    pub automatic: bool,
     #[serde(default)]
     pub publish: PublishPolicy,
     #[serde(default)]
@@ -123,6 +128,7 @@ impl Default for ManagedCertificate {
             domains: Vec::new(),
             provider_id: String::new(),
             enabled: true,
+            automatic: false,
             publish: PublishPolicy::default(),
             created_at: None,
             updated_at: None,
@@ -174,6 +180,10 @@ pub struct RenewalState {
     pub last_success: Option<OffsetDateTime>,
     #[serde(default)]
     pub next_attempt: Option<OffsetDateTime>,
+    /// A server-provided retry deadline. Unlike a local retry gate, an
+    /// administrator-triggered scan must not clear this value early.
+    #[serde(default)]
+    pub ca_retry_after: Option<OffsetDateTime>,
     #[serde(default)]
     pub consecutive_failures: u32,
     #[serde(default)]
@@ -195,9 +205,13 @@ pub struct RetrievalToken {
     pub id: String,
     #[serde(default)]
     pub label: String,
-    /// SHA-256 of the bearer value. The bearer itself is returned only once.
+    /// SHA-256 of the bearer value, used for constant-time authentication.
     #[serde(default)]
     pub token_hash: String,
+    /// Recoverable bearer value. This is intentionally persisted so an
+    /// administrator can copy an existing retrieval token again.
+    #[serde(default)]
+    pub bearer_token: String,
     /// Empty means every published managed certificate.
     #[serde(default)]
     pub certificate_ids: BTreeSet<String>,

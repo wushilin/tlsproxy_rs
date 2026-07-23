@@ -4,6 +4,7 @@
 //! not know about the control hostname or ACME ALPN.
 
 use std::sync::Arc;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -29,7 +30,7 @@ pub(crate) async fn run(
     context: Arc<ListenerStats>,
     controller: Arc<RwLock<Controller>>,
     inspected: Option<ClientHello>,
-    route_target: Option<(Option<String>, u16)>,
+    route_target: Option<(Option<String>, u16, crate::runtime_config::HttpLoadBalancing, IpAddr)>,
 ) -> Result<()> {
     let conn_id = client.get_extension::<RequestId>().await.unwrap();
     info!("{conn_id} {name} passthrough worker started");
@@ -55,12 +56,15 @@ pub(crate) async fn run(
     context.increase_uploaded_bytes(header_len);
     active_tracker::add_uploaded(&conn_id, header_len as u64).await;
     let selected = match route_target {
-        Some((target, target_port)) => {
-            crate::forward::select_routed_target(
+        Some((target, target_port, load_balancing, client_ip)) => {
+            crate::forward::select_routed_pool(
+                &name,
                 &sni_target,
                 target.as_deref(),
                 target_port,
                 true,
+                client_ip,
+                load_balancing,
             )
             .await?
         }

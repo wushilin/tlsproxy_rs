@@ -4,6 +4,7 @@
 //! routing and ACME interception remain in `listener::default`.
 
 use std::sync::Arc;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -37,6 +38,8 @@ pub(crate) async fn run_inspected(
     target: Option<String>,
     target_port: u16,
     upstream_tls: bool,
+    load_balancing: crate::runtime_config::HttpLoadBalancing,
+    client_ip: IpAddr,
     certified_key: Arc<rustls::sign::CertifiedKey>,
 ) -> Result<()> {
     let conn_id = client.get_extension::<RequestId>().await.unwrap();
@@ -50,7 +53,7 @@ pub(crate) async fn run_inspected(
         context,
         controller,
         ca,
-        Some((expected_sni, target, target_port, upstream_tls)),
+        Some((expected_sni, target, target_port, upstream_tls, load_balancing, client_ip)),
         Some(certified_key),
     )
     .await
@@ -64,7 +67,7 @@ async fn run_stream<S>(
     context: Arc<ListenerStats>,
     controller: Arc<RwLock<Controller>>,
     ca: LocalCa,
-    route: Option<(String, Option<String>, u16, bool)>,
+    route: Option<(String, Option<String>, u16, bool, crate::runtime_config::HttpLoadBalancing, IpAddr)>,
     certified_key: Option<Arc<rustls::sign::CertifiedKey>>,
 ) -> Result<()>
 where
@@ -83,7 +86,7 @@ where
         .to_string();
     if route
         .as_ref()
-        .is_some_and(|(expected, _, _, _)| expected != &sni_target)
+        .is_some_and(|(expected, ..)| expected != &sni_target)
     {
         return Err(anyhow!("TLS SNI changed between inspection and handshake"));
     }
@@ -91,13 +94,16 @@ where
     active_tracker::set_sni(&conn_id, &sni_target).await;
     let upstream_tls = route
         .as_ref()
-        .map_or(listener_config.upstream_tls, |(_, _, _, tls)| *tls);
+        .map_or(listener_config.upstream_tls, |(_, _, _, tls, _, _)| *tls);
     let selected = match route.as_ref() {
-        Some((_, target, target_port, _)) => crate::forward::select_routed_target(
+        Some((_, target, target_port, _, load_balancing, client_ip)) => crate::forward::select_routed_pool(
+            &name,
             &sni_target,
             target.as_deref(),
             *target_port,
             upstream_tls,
+            *client_ip,
+            *load_balancing,
         )
         .await?,
         None => crate::relay::resolve_target(
