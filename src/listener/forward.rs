@@ -33,6 +33,11 @@ pub(crate) async fn run(
         .await
         .ok_or_else(|| anyhow!("no online forward backends"))?;
     active_tracker::set_target(&conn_id, &resolved.tls_server_name, &resolved.endpoint).await;
+    // A raw forward listener connects upstream before reading any client
+    // bytes, so a self-pointing target amplifies connections unboundedly
+    // (accept -> connect -> accept -> ...). Loop markers cannot exist in an
+    // opaque byte stream, so the address check is the only guard here.
+    crate::relay::reject_obvious_self_connect(&listener_config, &resolved.endpoint, &conn_id).await?;
     let upstream = tokio::time::timeout(
         Duration::from_secs(5),
         TcpStream::connect(&resolved.endpoint),
