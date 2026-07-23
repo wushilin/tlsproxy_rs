@@ -46,6 +46,21 @@ pub async fn reset() {
     ACTIVE.write().await.clear()
 }
 
+/// Drops every tracked connection belonging to one listener. Used after a
+/// per-listener restart force-cancels its connection tasks, whose normal
+/// `track_end` removal never runs.
+pub async fn purge_listener(listener: &str) -> usize {
+    let mut w = ACTIVE.write().await;
+    let listener_was = w.values().filter(|active| active.listener == listener).count();
+    if listener_was == 0 {
+        return 0;
+    }
+    w.retain(|_, active| active.listener != listener);
+    drop(w);
+    crate::events_hub::publish_connection_count(listener, listener_was, 0);
+    listener_was
+}
+
 pub async fn put(request_id: &RequestId, listener: &str, addr: SocketAddr) {
     let mut w = ACTIVE.write().await;
     let global_was = w.len();

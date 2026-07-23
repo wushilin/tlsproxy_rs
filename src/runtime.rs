@@ -69,6 +69,12 @@ async fn run_restartable<F, Fut>(
                 info!("listener `{name}` restarting: dropping its connections and rebinding {bind_pattern}");
             }
         }
+        // The dropped round force-cancelled its connection tasks, so their
+        // track_end cleanup never ran; remove their tracker entries here.
+        let purged = crate::active_tracker::purge_listener(&name).await;
+        if purged > 0 {
+            info!("listener `{name}` restart dropped {purged} active connections");
+        }
         let mut rebound = None;
         for _ in 0..20 {
             match bind(&bind_pattern).await {
@@ -229,11 +235,7 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
         }
     }
 
-    let default_stats = Arc::new(ListenerStats::new(
-        DEFAULT_LISTENER_NAME,
-        config.default_listener.ordinary_traffic.max_idle_time_ms.unwrap_or(u64::MAX),
-    ));
-    crate::events_hub::register_listener(&default_stats).await;
+    let default_idle_ms = config.default_listener.ordinary_traffic.max_idle_time_ms.unwrap_or(u64::MAX);
     let default_config = Arc::new(config.default_listener.clone());
     let control_hostname = (!config.control_plane.hostname.is_empty())
         .then(|| config.control_plane.hostname.clone());
@@ -251,11 +253,14 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
             move |socket, controller| {
                 let config = default_config.clone();
                 let hostname = control_hostname.clone();
-                let stats = default_stats.clone();
                 let ca = default_ca.clone();
                 let service = control_service.clone();
                 let cache = default_cache.clone();
                 async move {
+                    // Fresh per round, like the other listeners, so a restart
+                    // does not inherit active counts from cancelled tasks.
+                    let stats = Arc::new(ListenerStats::new(DEFAULT_LISTENER_NAME, default_idle_ms));
+                    crate::events_hub::register_listener(&stats).await;
                     if let Err(cause) = crate::listener::default::run(
                         socket, config, hostname, stats, controller, ca, service, cache, fallback,
                     )

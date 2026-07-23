@@ -98,7 +98,9 @@ where
         )
         .await?,
     };
-    let header_len = head.buffered.len();
+    // Count only the request head here; buffered body-prefix bytes are
+    // counted by the relay pipe when the framing-bounded reader replays them.
+    let header_len = head.buffered.len() - head.body_prefix().len();
     if expected_sni.as_deref().is_some_and(|sni| !sni.trim_end_matches('.').eq_ignore_ascii_case(head.host.trim_end_matches('.'))) {
         return Err(anyhow!("HTTPS SNI `{}` does not match HTTP Host `{}`", expected_sni.unwrap_or_default(), head.host));
     }
