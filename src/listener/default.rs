@@ -19,6 +19,7 @@ use crate::runtime_config::{DefaultListenerConfig, TlsRouteAction, UpstreamTrans
 use crate::store::normalize_domain;
 use crate::tls_header::ClientHello;
 use crate::request_id::RequestId;
+use crate::dataplane::pipeline::Intercept;
 
 use super::{DefaultRoute, RejectReason};
 
@@ -249,7 +250,7 @@ pub(crate) async fn dispatch_non_control(
             let limits = compatibility_listener(config, &action);
             match action {
                 TlsRouteAction::Passthrough { target_port, target, load_balancing } => {
-                    crate::listener::tls_passthrough::run(
+                    crate::dataplane::tls::passthrough::run(
                         name,
                         client,
                         limits,
@@ -270,7 +271,7 @@ pub(crate) async fn dispatch_non_control(
                     let certified_key = certificate_cache
                         .resolve_with_fallback(&hello.sni_host, &ca, certificate_fallback)
                         .await?;
-                    crate::listener::tls_terminate::run_inspected(
+                    crate::dataplane::tls::terminate::run_inspected(
                         name,
                         client,
                         hello,
@@ -308,17 +309,18 @@ pub(crate) async fn dispatch_non_control(
                         Duration::from_secs(5),
                         start.into_stream(Arc::new(server)),
                     ).await??;
-                    let mut client = Extensible::of(tls);
+                    let client = Extensible::of(tls);
                     if let Some(request_id) = request_id {
                         client.extend((*request_id).clone()).await;
                     }
-                    let head = crate::http_header::read_http_head(
-                        &mut client,
-                        Duration::from_secs(10),
-                        crate::http_header::DEFAULT_MAX_HTTP_HEADER_SIZE,
-                    ).await?;
+                    // The decrypted stream is now re-intercepted as an HTTP
+                    // connection: same pipeline shape, next protocol layer.
+                    let crate::dataplane::pipeline::Intercepted { artifact: head, stream: client } =
+                        crate::dataplane::http::HeadIntercept::new(client, Duration::from_secs(10))
+                            .intercept()
+                            .await?;
                     let route_key = format!("{name}:{}", sni.to_ascii_lowercase());
-                    crate::listener::http_passthrough::run(
+                    crate::dataplane::http::run(
                         name, client, remote_address, limits, context, controller,
                         Some(head), Some((route_key, action)), true, Some(sni),
                     ).await

@@ -14,6 +14,7 @@ use crate::acme::scheduler::RenewalScheduler;
 use crate::ca::LocalCa;
 use crate::config::{Listener, ListenerMode, Policy, Rules};
 use crate::controller::Controller;
+use crate::dataplane::pipeline::Intercept;
 use crate::extensible::Extensible;
 use crate::listener_stats::ListenerStats;
 use crate::request_id::RequestId;
@@ -395,8 +396,8 @@ async fn run_tls_listener(
         drop(controller.spawn(async move {
             let _guard = crate::dataplane::ConnGuard::start(request_id.clone(), task_name.clone(), remote, task_stats.clone(), ListenerType::TlsPassthrough);
             let result: Result<()> = async {
-                let mut client = client;
-                let hello = crate::tls_header::read_client_hello(&mut client, Duration::from_secs(5), crate::tls_header::DEFAULT_MAX_CLIENT_HELLO_SIZE).await?;
+                let crate::dataplane::pipeline::Intercepted { artifact: hello, stream: client } =
+                    crate::dataplane::tls::ClientHelloIntercept::new(client, Duration::from_secs(5)).intercept().await?;
                 let action = task_config.ordinary_traffic.select_route(&hello.sni_host).cloned().context("SNI denied by listener policy")?;
                 let listener_type = match action {
                     TlsRouteAction::Passthrough { .. } => ListenerType::TlsPassthrough,
@@ -437,15 +438,15 @@ async fn run_http_listener(name: String, listener: TcpListener, config: HostRout
             let _guard = crate::dataplane::ConnGuard::start(request_id.clone(), task_name.clone(), remote, task_stats.clone(), ListenerType::HttpPassthrough);
             crate::active_tracker::set_listener_type(&request_id, ListenerType::HttpPassthrough);
             let result: Result<()> = async {
-                let mut client = client;
-                let head = crate::http_header::read_http_head(&mut client, Duration::from_secs(10), crate::http_header::DEFAULT_MAX_HTTP_HEADER_SIZE).await?;
+                let crate::dataplane::pipeline::Intercepted { artifact: head, stream: client } =
+                    crate::dataplane::http::HeadIntercept::new(client, Duration::from_secs(10)).intercept().await?;
                 let action = task_config.select_route(&head.host).cloned().context("HTTP host denied by reverse-proxy listener policy")?;
                 if action.behavior == crate::runtime_config::HttpBehavior::RedirectHttps {
-                    crate::listener::http_passthrough::redirect_https(client, head, action.redirect.as_ref(), task_config.redirect_https_port).await?;
+                    crate::dataplane::http::redirect_https(client, head, action.redirect.as_ref(), task_config.redirect_https_port).await?;
                     return Ok(());
                 }
                 let route_key = format!("{task_name}:{}", head.host.to_ascii_lowercase());
-                crate::listener::http_passthrough::run(task_name.clone(), client, remote, task_legacy, task_stats.clone(), connection_controller, Some(head), Some((route_key, action)), false, None).await?;
+                crate::dataplane::http::run(task_name.clone(), client, remote, task_legacy, task_stats.clone(), connection_controller, Some(head), Some((route_key, action)), false, None).await?;
                 Ok(())
             }.await;
             if let Err(cause) = &result { warn!("listener {task_name} connection failed: {cause:#}"); }
@@ -473,7 +474,7 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
         drop(controller.spawn(async move {
             let _guard = crate::dataplane::ConnGuard::start(request_id.clone(), task_name.clone(), remote, task_stats.clone(), ListenerType::PortForward);
             crate::active_tracker::set_listener_type(&request_id, ListenerType::PortForward);
-            if let Err(cause) = crate::listener::forward::run(task_name.clone(), client, task_legacy, task_stats.clone(), connection_controller, remote.ip(), task_load_balancing).await {
+            if let Err(cause) = crate::dataplane::forward::run(task_name.clone(), client, task_legacy, task_stats.clone(), connection_controller, remote.ip(), task_load_balancing).await {
                 warn!("listener {task_name} connection failed: {cause:#}");
             }
         }));

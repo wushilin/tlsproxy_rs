@@ -1,4 +1,8 @@
-//! Plain HTTP host-routing handler for non-system listeners.
+//! HTTP interception layer: reverse-proxy host/path routing, static file
+//! serving, and HTTPS redirects. Reached both by a plain-HTTP listener and by
+//! the TLS terminate backend re-intercepting a decrypted stream as HTTP.
+
+pub mod static_files;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,6 +16,46 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::RwLock;
 use base64::Engine;
 use subtle::ConstantTimeEq;
+
+use crate::dataplane::pipeline::{Intercept, Intercepted};
+
+/// Interception point for an HTTP connection: its request head. The
+/// continuation stream is the same connection, positioned at the message body
+/// (any buffered body/pipelined bytes are retained in the returned head).
+/// Reached both by a plain-HTTP listener and by the TLS terminate backend
+/// re-intercepting a decrypted stream as HTTP.
+pub struct HeadIntercept<S> {
+    stream: Extensible<S>,
+    timeout: Duration,
+    max_size: usize,
+}
+
+impl<S> HeadIntercept<S> {
+    pub fn new(stream: Extensible<S>, timeout: Duration) -> Self {
+        Self {
+            stream,
+            timeout,
+            max_size: http_header::DEFAULT_MAX_HTTP_HEADER_SIZE,
+        }
+    }
+}
+
+impl<S> Intercept for HeadIntercept<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    type Artifact = http_header::HttpHead;
+    type Stream = Extensible<S>;
+
+    async fn intercept(mut self) -> Result<Intercepted<http_header::HttpHead, Extensible<S>>> {
+        let artifact =
+            http_header::read_http_head(&mut self.stream, self.timeout, self.max_size).await?;
+        Ok(Intercepted {
+            artifact,
+            stream: self.stream,
+        })
+    }
+}
 
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
@@ -121,7 +165,7 @@ where
             if !require_basic_auth(&mut client, &mut head, &path_route.basic_auth).await? { return Ok(()); }
             match path_route.action {
                 crate::runtime_config::HttpPathAction::StaticFiles { document_root, index, directory_listing } => {
-                    return crate::listener::static_files::serve(client, head, &path_route.prefix, &document_root, index.as_deref(), directory_listing).await;
+                    return crate::dataplane::http::static_files::serve(client, head, &path_route.prefix, &document_root, index.as_deref(), directory_listing).await;
                 }
                 crate::runtime_config::HttpPathAction::ReverseProxy { action } => {
                     if path_route.strip_prefix { head.strip_path_prefix(&path_route.prefix); }
@@ -129,7 +173,7 @@ where
                 }
             }
         } else if !host_action.paths.is_empty() && host_action.backends.is_empty() && host_action.target.is_none() {
-            return crate::listener::static_files::not_found(client, head.method == "HEAD").await;
+            return crate::dataplane::http::static_files::not_found(client, head.method == "HEAD").await;
         }
     }
     // Only the first request's head has passed authentication, ACL, and path
@@ -217,6 +261,23 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn head_intercept_yields_head_and_keeps_body_prefix() {
+        let (mut browser, server) = tokio::io::duplex(2048);
+        browser
+            .write_all(b"POST /submit HTTP/1.1\r\nHost: h.example\r\nContent-Length: 4\r\n\r\nBODY")
+            .await
+            .unwrap();
+        let client = Extensible::of(server);
+        let Intercepted { artifact: head, stream: _client } =
+            HeadIntercept::new(client, Duration::from_secs(1)).intercept().await.unwrap();
+        assert_eq!(head.host, "h.example");
+        assert_eq!(head.method, "POST");
+        // The body that arrived with the head rides along in the artifact; the
+        // continuation stream carries anything sent afterwards.
+        assert_eq!(head.body_prefix(), b"BODY");
+    }
 
     #[tokio::test]
     async fn https_redirect_preserves_path_query_and_omits_standard_port() {
