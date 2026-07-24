@@ -17,7 +17,6 @@ use crate::controller::Controller;
 use crate::dataplane::pipeline::Intercept;
 use crate::extensible::Extensible;
 use crate::listener_stats::ListenerStats;
-use crate::request_id::RequestId;
 use crate::runtime_config::{
     AdditionalListenerConfig, DefaultListenerConfig, HostRoutedHttpListenerConfig,
     HostRoutedTlsListenerConfig, RawForwardListenerConfig,
@@ -381,8 +380,8 @@ async fn run_tls_listener(
     loop {
         let Ok((socket, remote)) = listener.accept().await else { continue };
         let client = Extensible::of(socket);
-        client.extend(RequestId::new()).await;
-        let request_id = client.get_extension::<RequestId>().await.unwrap();
+       
+        let request_id = client.request_id();
         let task_name = name.clone();
         let task_stats = stats.clone();
         let task_config = crate::runtime_live::load().additional_listeners.get(name.as_str()).and_then(|listener| match listener {
@@ -423,8 +422,8 @@ async fn run_http_listener(name: String, listener: TcpListener, config: HostRout
     let name = Arc::new(name);
     loop {
         let Ok((socket, remote)) = listener.accept().await else { continue };
-        let client = Extensible::of(socket); client.extend(RequestId::new()).await;
-        let request_id = client.get_extension::<RequestId>().await.unwrap();
+        let client = Extensible::of(socket);
+        let request_id = client.request_id();
         let live = crate::runtime_live::load();
         let task_config = live.additional_listeners.get(name.as_str()).and_then(|listener| match listener {
             AdditionalListenerConfig::Http(config) | AdditionalListenerConfig::Redirect(config) => Some(Arc::new(config.clone())),
@@ -462,8 +461,8 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
     let name = Arc::new(name);
     loop {
         let Ok((socket, remote)) = listener.accept().await else { continue };
-        let client = Extensible::of(socket); client.extend(RequestId::new()).await;
-        let request_id = client.get_extension::<RequestId>().await.unwrap();
+        let client = Extensible::of(socket);
+        let request_id = client.request_id();
         let live = crate::runtime_live::load();
         let live_forward = live.additional_listeners.get(name.as_str()).and_then(|listener| match listener { AdditionalListenerConfig::Forward(config) => Some(config), _ => None });
         let task_load_balancing = live_forward.map(|config| config.load_balancing).unwrap_or(load_balancing);

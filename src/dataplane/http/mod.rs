@@ -64,7 +64,6 @@ use crate::controller::Controller;
 use crate::extensible::Extensible;
 use crate::http_header;
 use crate::listener_stats::ListenerStats;
-use crate::request_id::RequestId;
 use crate::upstream_tls::connect_trust_all_tls;
 
 pub(crate) async fn redirect_https<S>(
@@ -131,7 +130,7 @@ pub(crate) async fn run<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let conn_id = client.get_extension::<RequestId>().await.unwrap();
+    let conn_id = client.request_id();
     info!("{conn_id} {name} http worker started");
     let mut head = match inspected {
         Some(head) => head,

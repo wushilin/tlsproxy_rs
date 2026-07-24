@@ -18,7 +18,6 @@ use crate::listener_stats::ListenerStats;
 use crate::runtime_config::{DefaultListenerConfig, TlsRouteAction, UpstreamTransport};
 use crate::store::normalize_domain;
 use crate::tls_header::ClientHello;
-use crate::request_id::RequestId;
 use crate::dataplane::pipeline::Intercept;
 
 use super::{DefaultRoute, RejectReason};
@@ -62,7 +61,6 @@ pub async fn run(
     loop {
         let (socket, remote_address) = listener.accept().await?;
         let client = Extensible::of(socket);
-        client.extend(RequestId::new()).await;
         let connection_controller = Arc::new(RwLock::new(listener_controller.child()));
         let task_name = Arc::clone(&name);
         let live = crate::runtime_live::load();
@@ -106,10 +104,7 @@ async fn handle_connection(
     certificate_cache: crate::managed_tls::ManagedCertificateCache,
     certificate_fallback: crate::runtime_config::CertificateFallbackPolicy,
 ) {
-    let request_id = client
-        .get_extension::<RequestId>()
-        .await
-        .expect("default listener installs request ID");
+    let request_id = client.request_id();
     // The guard owns tracking, active counts, and the CDR for this connection;
     // it cleans up in Drop even if this task is force cancelled.
     let guard = crate::dataplane::ConnGuard::start(
@@ -295,7 +290,7 @@ pub(crate) async fn dispatch_non_control(
                         .resolve_with_fallback(&hello.sni_host, &ca, certificate_fallback)
                         .await?;
                     let sni = hello.sni_host.clone();
-                    let request_id = client.get_extension::<RequestId>().await;
+                    let request_id = client.request_id();
                     let replay = crate::acme_challenge::ReplayStream::new(hello.buffered, client);
                     let acceptor = tokio_rustls::LazyConfigAcceptor::new(
                         rustls::server::Acceptor::default(),
@@ -310,10 +305,9 @@ pub(crate) async fn dispatch_non_control(
                         Duration::from_secs(5),
                         start.into_stream(Arc::new(server)),
                     ).await??;
-                    let client = Extensible::of(tls);
-                    if let Some(request_id) = request_id {
-                        client.extend((*request_id).clone()).await;
-                    }
+                    // Preserve the original connection id across the TLS
+                    // boundary onto the fresh decrypted stream.
+                    let client = Extensible::with_request_id(tls, request_id);
                     // The decrypted stream is now re-intercepted as an HTTP
                     // connection: same pipeline shape, next protocol layer.
                     let crate::dataplane::pipeline::Intercepted { artifact: head, stream: client } =

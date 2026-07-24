@@ -42,7 +42,7 @@ pub(crate) async fn run_inspected(
     client_ip: IpAddr,
     certified_key: Arc<rustls::sign::CertifiedKey>,
 ) -> Result<()> {
-    let conn_id = client.get_extension::<RequestId>().await.unwrap();
+    let conn_id = client.request_id();
     let expected_sni = hello.sni_host.clone();
     let replay = crate::acme_challenge::ReplayStream::new(hello.buffered, client);
     run_stream(

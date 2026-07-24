@@ -20,7 +20,6 @@ use crate::controller::Controller;
 use crate::extensible::Extensible;
 use crate::hello_cache;
 use crate::listener_stats::ListenerStats;
-use crate::request_id::RequestId;
 use crate::tls_header::{self, ClientHello};
 
 pub(crate) async fn run(
@@ -32,7 +31,7 @@ pub(crate) async fn run(
     inspected: Option<ClientHello>,
     route_target: Option<(Option<String>, u16, crate::runtime_config::HttpLoadBalancing, IpAddr)>,
 ) -> Result<()> {
-    let conn_id = client.get_extension::<RequestId>().await.unwrap();
+    let conn_id = client.request_id();
     info!("{conn_id} {name} passthrough worker started");
     let client_hello = match inspected {
         Some(client_hello) => client_hello,

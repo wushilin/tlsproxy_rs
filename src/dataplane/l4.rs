@@ -15,7 +15,6 @@ use crate::config::Listener;
 use crate::controller::Controller;
 use crate::extensible::Extensible;
 use crate::listener_stats::ListenerStats;
-use crate::request_id::RequestId;
 use crate::upstream_tls::connect_trust_all_tls;
 
 pub(crate) async fn run(
@@ -27,7 +26,7 @@ pub(crate) async fn run(
     client_ip: IpAddr,
     load_balancing: crate::runtime_config::HttpLoadBalancing,
 ) -> Result<()> {
-    let conn_id = client.get_extension::<RequestId>().await.unwrap();
+    let conn_id = client.request_id();
     info!("{conn_id} {name} forward worker started");
     let resolved = crate::forward::choose_online(&name, client_ip, load_balancing)
         .await
