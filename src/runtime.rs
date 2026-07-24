@@ -474,7 +474,7 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
         drop(controller.spawn(async move {
             let _guard = crate::dataplane::ConnGuard::start(request_id.clone(), task_name.clone(), remote, task_stats.clone(), ListenerType::PortForward);
             crate::active_tracker::set_listener_type(&request_id, ListenerType::PortForward);
-            if let Err(cause) = crate::dataplane::forward::run(task_name.clone(), client, task_legacy, task_stats.clone(), connection_controller, remote.ip(), task_load_balancing).await {
+            if let Err(cause) = crate::dataplane::l4::run(task_name.clone(), client, task_legacy, task_stats.clone(), connection_controller, remote.ip(), task_load_balancing).await {
                 warn!("listener {task_name} connection failed: {cause:#}");
             }
         }));

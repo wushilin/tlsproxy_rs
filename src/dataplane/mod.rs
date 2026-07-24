@@ -5,12 +5,12 @@
 //! connection is intercepted at its ClientHello ([`tls`]), and if it
 //! terminates into HTTP it is re-intercepted at its request head ([`http`]).
 //! Terminal backends — passthrough and terminate forwarders, the HTTP reverse
-//! proxy / static server / redirect, and the raw L4 [`forward`] — consume an
+//! proxy / static server / redirect, and the raw L4 [`l4`] — consume an
 //! intercepted artifact plus its continuation stream. Cross-cutting lifecycle
 //! (tracking, accounting, active counts) is owned by [`lifecycle`] so every
 //! path, including force-cancelled ones, is accounted uniformly.
 
-pub mod forward;
+pub mod l4;
 pub mod http;
 pub mod lifecycle;
 pub mod pipeline;
