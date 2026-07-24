@@ -11,26 +11,22 @@ use anyhow::{anyhow, Result};
 use log::{info, warn};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
 
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
 use crate::config::Listener;
-use crate::controller::Controller;
 use crate::extensible::Extensible;
 use crate::hello_cache;
-use crate::listener_stats::ListenerStats;
 use crate::tls_header::{self, ClientHello};
 
 pub(crate) async fn run(
-    name: Arc<String>,
-    mut client: Extensible<TcpStream>,
+    ctx: crate::dataplane::ConnCtx,
     listener_config: Arc<Listener>,
-    context: Arc<ListenerStats>,
-    controller: Arc<RwLock<Controller>>,
+    mut client: Extensible<TcpStream>,
     inspected: Option<ClientHello>,
     route_target: Option<(Option<String>, u16, crate::runtime_config::HttpLoadBalancing, IpAddr)>,
 ) -> Result<()> {
+    let crate::dataplane::ConnCtx { name, stats: context, controller, remote: _ } = ctx;
     let conn_id = client.request_id();
     info!("{conn_id} {name} passthrough worker started");
     let client_hello = match inspected {

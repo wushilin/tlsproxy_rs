@@ -149,19 +149,9 @@ async fn handle_connection(
             }
             route => {
                 let is_acme = matches!(&route, ConnectionRoute::AcmeChallenge { .. });
-                dispatch_non_control(
-                    route,
-                    hello,
-                    client,
-                    remote_address,
-                    name.clone(),
-                    &config,
-                    stats.clone(),
-                    controller,
-                    ca,
-                    certificate_cache,
-                    certificate_fallback,
-                )
+                let ctx = crate::dataplane::ConnCtx { name: name.clone(), remote: remote_address, stats: stats.clone(), controller };
+                let tls = crate::dataplane::TlsCtx { ca, cache: certificate_cache, fallback: certificate_fallback };
+                dispatch_non_control(ctx, tls, route, hello, client, &config)
                 .await?;
                 if is_acme {
                     crate::active_tracker::set_status(&request_id, crate::accounting::ConnStatus::Ok);
@@ -214,17 +204,12 @@ pub fn decide(
 /// connections deliberately remain the responsibility of the admin service
 /// adapter so this module cannot accidentally proxy the reserved hostname.
 pub(crate) async fn dispatch_non_control(
+    ctx: crate::dataplane::ConnCtx,
+    tls: crate::dataplane::TlsCtx,
     route: ConnectionRoute,
     hello: ClientHello,
     client: Extensible<TcpStream>,
-    remote_address: SocketAddr,
-    name: Arc<String>,
     config: &DefaultListenerConfig,
-    context: Arc<ListenerStats>,
-    controller: Arc<RwLock<Controller>>,
-    ca: LocalCa,
-    certificate_cache: crate::managed_tls::ManagedCertificateCache,
-    certificate_fallback: crate::runtime_config::CertificateFallbackPolicy,
 ) -> Result<()> {
     match route {
         ConnectionRoute::AcmeChallenge { domain } => {
@@ -246,14 +231,13 @@ pub(crate) async fn dispatch_non_control(
             let limits = compatibility_listener(config, &action);
             match action {
                 TlsRouteAction::Passthrough { target_port, target, load_balancing } => {
+                    let client_ip = ctx.remote.ip();
                     crate::dataplane::tls::passthrough::run(
-                        name,
-                        client,
+                        ctx,
                         limits,
-                        context,
-                        controller,
+                        client,
                         Some(hello),
-                        Some((target, target_port, load_balancing, remote_address.ip())),
+                        Some((target, target_port, load_balancing, client_ip)),
                     )
                     .await
                 }
@@ -264,30 +248,27 @@ pub(crate) async fn dispatch_non_control(
                     load_balancing,
                 } => {
                     crate::managed_tls::request_automatic_for_sni(&hello.sni_host);
-                    let certified_key = certificate_cache
-                        .resolve_with_fallback(&hello.sni_host, &ca, certificate_fallback)
+                    let certified_key = tls.cache
+                        .resolve_with_fallback(&hello.sni_host, &tls.ca, tls.fallback)
                         .await?;
                     crate::dataplane::tls::terminate::run_inspected(
-                        name,
+                        ctx,
+                        limits,
+                        tls.ca,
                         client,
                         hello,
-                        limits,
-                        context,
-                        controller,
-                        ca,
                         target,
                         target_port,
                         upstream == UpstreamTransport::Tls,
                         load_balancing,
-                        remote_address.ip(),
                         certified_key,
                     )
                     .await
                 }
                 TlsRouteAction::ReverseProxy { action } => {
                     crate::managed_tls::request_automatic_for_sni(&hello.sni_host);
-                    let certified_key = certificate_cache
-                        .resolve_with_fallback(&hello.sni_host, &ca, certificate_fallback)
+                    let certified_key = tls.cache
+                        .resolve_with_fallback(&hello.sni_host, &tls.ca, tls.fallback)
                         .await?;
                     let sni = hello.sni_host.clone();
                     let request_id = client.request_id();
@@ -301,22 +282,22 @@ pub(crate) async fn dispatch_non_control(
                         .with_no_client_auth()
                         .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified_key)));
                     server.alpn_protocols = vec![b"http/1.1".to_vec()];
-                    let tls = tokio::time::timeout(
+                    let tls_stream = tokio::time::timeout(
                         Duration::from_secs(5),
                         start.into_stream(Arc::new(server)),
                     ).await??;
                     // Preserve the original connection id across the TLS
                     // boundary onto the fresh decrypted stream.
-                    let client = Extensible::with_request_id(tls, request_id);
+                    let client = Extensible::with_request_id(tls_stream, request_id);
                     // The decrypted stream is now re-intercepted as an HTTP
                     // connection: same pipeline shape, next protocol layer.
                     let crate::dataplane::pipeline::Intercepted { artifact: head, stream: client } =
                         crate::dataplane::http::HeadIntercept::new(client, Duration::from_secs(10))
                             .intercept()
                             .await?;
-                    let route_key = format!("{name}:{}", sni.to_ascii_lowercase());
+                    let route_key = format!("{}:{}", ctx.name, sni.to_ascii_lowercase());
                     crate::dataplane::http::run(
-                        name, client, remote_address, limits, context, controller,
+                        ctx, limits, client,
                         Some(head), Some((route_key, action)), true, Some(sni),
                     ).await
                 }

@@ -28,20 +28,18 @@ use crate::tls_header::ClientHello;
 /// listener dispatcher. The buffered bytes are replayed into rustls and the
 /// already-selected route controls both destination and upstream TLS mode.
 pub(crate) async fn run_inspected(
-    name: Arc<String>,
+    ctx: crate::dataplane::ConnCtx,
+    listener_config: Arc<Listener>,
+    ca: LocalCa,
     client: Extensible<TcpStream>,
     hello: ClientHello,
-    listener_config: Arc<Listener>,
-    context: Arc<ListenerStats>,
-    controller: Arc<RwLock<Controller>>,
-    ca: LocalCa,
     target: Option<String>,
     target_port: u16,
     upstream_tls: bool,
     load_balancing: crate::runtime_config::HttpLoadBalancing,
-    client_ip: IpAddr,
     certified_key: Arc<rustls::sign::CertifiedKey>,
 ) -> Result<()> {
+    let crate::dataplane::ConnCtx { name, stats: context, controller, remote } = ctx;
     let conn_id = client.request_id();
     let expected_sni = hello.sni_host.clone();
     let replay = crate::acme_challenge::ReplayStream::new(hello.buffered, client);
@@ -53,7 +51,7 @@ pub(crate) async fn run_inspected(
         context,
         controller,
         ca,
-        Some((expected_sni, target, target_port, upstream_tls, load_balancing, client_ip)),
+        Some((expected_sni, target, target_port, upstream_tls, load_balancing, remote.ip())),
         Some(certified_key),
     )
     .await

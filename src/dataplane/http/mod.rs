@@ -4,7 +4,6 @@
 
 pub mod static_files;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +12,6 @@ use log::info;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::RwLock;
 use base64::Engine;
 use subtle::ConstantTimeEq;
 
@@ -60,10 +58,8 @@ where
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
 use crate::config::Listener;
-use crate::controller::Controller;
 use crate::extensible::Extensible;
 use crate::http_header;
-use crate::listener_stats::ListenerStats;
 use crate::upstream_tls::connect_trust_all_tls;
 
 pub(crate) async fn redirect_https<S>(
@@ -116,12 +112,9 @@ where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
 }
 
 pub(crate) async fn run<S>(
-    name: Arc<String>,
-    mut client: Extensible<S>,
-    remote_address: SocketAddr,
+    ctx: crate::dataplane::ConnCtx,
     listener_config: Arc<Listener>,
-    context: Arc<ListenerStats>,
-    controller: Arc<RwLock<Controller>>,
+    mut client: Extensible<S>,
     inspected: Option<http_header::HttpHead>,
     route: Option<(String, crate::runtime_config::HttpRouteAction)>,
     client_tls: bool,
@@ -130,6 +123,7 @@ pub(crate) async fn run<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let crate::dataplane::ConnCtx { name, remote: remote_address, stats: context, controller } = ctx;
     let conn_id = client.request_id();
     info!("{conn_id} {name} http worker started");
     let mut head = match inspected {

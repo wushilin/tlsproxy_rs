@@ -404,9 +404,12 @@ async fn run_tls_listener(
                     TlsRouteAction::Reject => ListenerType::TlsPassthrough,
                 };
                 crate::active_tracker::set_listener_type(&request_id, listener_type);
+                let ctx = crate::dataplane::ConnCtx { name: task_name.clone(), remote, stats: task_stats.clone(), controller: connection_controller };
+                let tls = crate::dataplane::TlsCtx { ca: task_ca, cache: task_cache, fallback };
                 crate::listener::default::dispatch_non_control(
+                    ctx, tls,
                     crate::listener::default::ConnectionRoute::Ordinary { sni: hello.sni_host.clone(), action },
-                    hello, client, remote, task_name.clone(), &task_config, task_stats.clone(), connection_controller, task_ca, task_cache, fallback,
+                    hello, client, &task_config,
                 ).await?;
                 Ok(())
             }.await;
@@ -445,7 +448,8 @@ async fn run_http_listener(name: String, listener: TcpListener, config: HostRout
                     return Ok(());
                 }
                 let route_key = format!("{task_name}:{}", head.host.to_ascii_lowercase());
-                crate::dataplane::http::run(task_name.clone(), client, remote, task_legacy, task_stats.clone(), connection_controller, Some(head), Some((route_key, action)), false, None).await?;
+                let ctx = crate::dataplane::ConnCtx { name: task_name.clone(), remote, stats: task_stats.clone(), controller: connection_controller };
+                crate::dataplane::http::run(ctx, task_legacy, client, Some(head), Some((route_key, action)), false, None).await?;
                 Ok(())
             }.await;
             if let Err(cause) = &result { warn!("listener {task_name} connection failed: {cause:#}"); }

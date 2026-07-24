@@ -17,3 +17,27 @@ pub mod pipeline;
 pub mod tls;
 
 pub use lifecycle::ConnGuard;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Connection-invariant handles every data-plane backend needs, known the
+/// moment a connection is accepted. Bundled so handler signatures don't
+/// balloon; each backend destructures it at entry, leaving its body written
+/// against the individual fields. Route-derived values (the per-route
+/// `Listener` limits, certificate keys) stay explicit parameters because they
+/// are not known until the route is chosen.
+pub struct ConnCtx {
+    pub name: Arc<String>,
+    pub remote: SocketAddr,
+    pub stats: Arc<crate::listener_stats::ListenerStats>,
+    pub controller: Arc<RwLock<crate::controller::Controller>>,
+}
+
+/// Certificate handles the TLS terminate / reverse-proxy dispatch needs.
+pub struct TlsCtx {
+    pub ca: crate::ca::LocalCa,
+    pub cache: crate::managed_tls::ManagedCertificateCache,
+    pub fallback: crate::runtime_config::CertificateFallbackPolicy,
+}
