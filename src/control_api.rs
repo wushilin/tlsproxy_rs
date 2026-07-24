@@ -455,6 +455,10 @@ async fn export_database(State(state): State<ControlState>, Extension(session): 
 struct ImportDatabaseRequest {
     mode: String,
     export: crate::store::RocksDbJsonExport,
+    /// Column families the operator chose to import. Omitted or empty means
+    /// the client did not scope the import; `import_json` then imports all.
+    #[serde(default)]
+    column_families: Vec<String>,
 }
 
 async fn import_database(State(state): State<ControlState>, Extension(session): Extension<SessionRecord>, Json(request): Json<ImportDatabaseRequest>) -> Response {
@@ -464,9 +468,16 @@ async fn import_database(State(state): State<ControlState>, Extension(session): 
         "clear_and_import" => true,
         _ => return (StatusCode::BAD_REQUEST, "mode must be `merge` or `clear_and_import`").into_response(),
     };
-    match state.store.import_json(&request.export, clear_existing) {
+    let selected: Option<std::collections::HashSet<String>> =
+        (!request.column_families.is_empty()).then(|| request.column_families.iter().cloned().collect());
+    match state.store.import_json(&request.export, clear_existing, selected.as_ref()) {
         Ok(imported) => {
-            let _ = state.store.append_audit("database_json_import", serde_json::json!({"mode": request.mode, "entries": imported, "actor": session.username}));
+            let scope = selected.as_ref().map(|set| {
+                let mut names: Vec<_> = set.iter().cloned().collect();
+                names.sort();
+                names
+            });
+            let _ = state.store.append_audit("database_json_import", serde_json::json!({"mode": request.mode, "entries": imported, "column_families": scope, "actor": session.username}));
             (state.configuration_changed)();
             Json(serde_json::json!({"imported_entries": imported, "mode": request.mode})).into_response()
         }

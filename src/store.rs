@@ -116,24 +116,39 @@ impl Store {
         Ok(RocksDbJsonExport { format: "tlsproxy-rocksdb-json-v1".into(), schema_version: SCHEMA_VERSION, exported_at: OffsetDateTime::now_utc(), column_families })
     }
 
-    pub fn import_json(&self, export: &RocksDbJsonExport, clear_existing: bool) -> Result<usize> {
+    /// Imports the export's entries. When `selected` is `Some`, only the named
+    /// column families are imported (and, under `clear_existing`, only those
+    /// are cleared) — a scoped restore that leaves other families untouched.
+    /// `None` imports every family present in the export.
+    pub fn import_json(
+        &self,
+        export: &RocksDbJsonExport,
+        clear_existing: bool,
+        selected: Option<&std::collections::HashSet<String>>,
+    ) -> Result<usize> {
         if export.format != "tlsproxy-rocksdb-json-v1" { bail!("unsupported RocksDB JSON export format"); }
         if export.schema_version != SCHEMA_VERSION { bail!("export schema version {} does not match runtime schema version {SCHEMA_VERSION}", export.schema_version); }
         let allowed = std::iter::once("default").chain(ALL_CFS.iter().copied()).filter(|name| *name != CF_HEALTH_CHECK_STATUS).collect::<std::collections::HashSet<_>>();
+        if let Some(selected) = selected {
+            if let Some(unknown) = selected.iter().find(|name| !allowed.contains(name.as_str())) {
+                bail!("unknown or excluded column family `{unknown}`");
+            }
+            if selected.is_empty() { bail!("select at least one column family to import"); }
+        }
         let mut batch = WriteBatch::default();
         let mut imported = 0usize;
-        if clear_existing {
-            for name in &allowed {
-                let cf = self.cf(name)?;
+        for (name, entries) in &export.column_families {
+            if !allowed.contains(name.as_str()) { bail!("unknown or excluded column family `{name}`"); }
+            if selected.is_some_and(|selected| !selected.contains(name)) { continue; }
+            let cf = self.cf(name)?;
+            // Clear happens per imported family so a scoped clear-and-import
+            // never wipes families the caller did not choose.
+            if clear_existing {
                 for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
                     let (key, _) = item?;
                     batch.delete_cf(&cf, key);
                 }
             }
-        }
-        for (name, entries) in &export.column_families {
-            if !allowed.contains(name.as_str()) { bail!("unknown or excluded column family `{name}`"); }
-            let cf = self.cf(name)?;
             for entry in entries {
                 let key = base64::engine::general_purpose::STANDARD.decode(&entry.key_base64).with_context(|| format!("invalid base64 key in `{name}`"))?;
                 let value = base64::engine::general_purpose::STANDARD.decode(&entry.value_base64).with_context(|| format!("invalid base64 value in `{name}`"))?;
@@ -1643,11 +1658,33 @@ mod tests {
         let target_dir = tempdir().unwrap();
         let target = Store::open(target_dir.path()).unwrap();
         target.append_audit("remove_me", serde_json::json!({})).unwrap();
-        let imported = target.import_json(&export, true).unwrap();
+        let imported = target.import_json(&export, true, None).unwrap();
         assert!(imported > 0);
         assert_eq!(target.db.get_cf(&target.cf(CF_ACCOUNTS).unwrap(), [0, 255, 1]).unwrap().unwrap(), [9, 0, 254]);
         assert_eq!(target.load_config().unwrap().unwrap().updated_by, "backup");
         assert!(!target.audits(10).unwrap().iter().any(|value| value.get("kind").and_then(|kind| kind.as_str()) == Some("remove_me")));
+    }
+
+    #[test]
+    fn scoped_import_touches_only_selected_column_families() {
+        let source_dir = tempdir().unwrap();
+        let source = Store::open(source_dir.path()).unwrap();
+        source.save_config(&RuntimeConfig::default(), "backup").unwrap();
+        source.db.put_cf(&source.cf(CF_ACCOUNTS).unwrap(), [1, 2, 3], [4, 5, 6]).unwrap();
+        let export = source.export_json().unwrap();
+
+        let target_dir = tempdir().unwrap();
+        let target = Store::open(target_dir.path()).unwrap();
+        // Import only the accounts family; config must stay untouched.
+        let selected = std::collections::HashSet::from([CF_ACCOUNTS.to_string()]);
+        let imported = target.import_json(&export, true, Some(&selected)).unwrap();
+        assert_eq!(imported, 1);
+        assert_eq!(target.db.get_cf(&target.cf(CF_ACCOUNTS).unwrap(), [1, 2, 3]).unwrap().unwrap(), [4, 5, 6]);
+        assert!(target.load_config().unwrap().is_none(), "config family was not selected, so nothing imported to it");
+
+        // An empty selection is rejected; an unknown family is rejected.
+        assert!(target.import_json(&export, false, Some(&std::collections::HashSet::new())).is_err());
+        assert!(target.import_json(&export, false, Some(&std::collections::HashSet::from(["nope".to_string()]))).is_err());
     }
 
     #[cfg(unix)]
