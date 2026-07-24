@@ -486,10 +486,16 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../static/control.html"))
 }
 
+const REMEMBER_DAYS: i64 = 30;
+
 #[derive(Deserialize)]
 struct LoginForm {
     username: String,
     password: String,
+    /// Present (`Some`) when the "Remember for 30 days" checkbox is ticked;
+    /// an HTML checkbox omits the field entirely when unchecked.
+    #[serde(default)]
+    remember: Option<String>,
 }
 
 async fn login(State(state): State<ControlState>, Form(form): Form<LoginForm>) -> Response {
@@ -517,19 +523,26 @@ async fn login(State(state): State<ControlState>, Form(form): Form<LoginForm>) -
     let token = random_token();
     let csrf_token = random_token();
     let now = OffsetDateTime::now_utc();
+    // "Remember for 30 days" extends both the server-side session lifetime and
+    // the cookie Max-Age; otherwise the session lasts the default work window.
+    let lifetime = if form.remember.is_some() {
+        time::Duration::days(REMEMBER_DAYS)
+    } else {
+        time::Duration::hours(SESSION_HOURS)
+    };
     let session = SessionRecord {
         token_hash: token_hash(&token),
         username: user.username,
         csrf_token,
         created_at: Some(now),
-        expires_at: Some(now + time::Duration::hours(SESSION_HOURS)),
+        expires_at: Some(now + lifetime),
     };
     if let Err(cause) = state.store.save_session_async(session).await {
         return internal(cause);
     }
     let cookie = format!(
         "{SESSION_COOKIE}={token}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
-        SESSION_HOURS * 3600
+        lifetime.whole_seconds()
     );
     ([(header::SET_COOKIE, cookie)], Redirect::to("/")).into_response()
 }

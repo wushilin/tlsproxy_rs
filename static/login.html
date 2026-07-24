@@ -1,5 +1,67 @@
-<!doctype html><html><head><meta charset="utf-8"><title>TLS Proxy Login</title></head>
-<body><main><h1>TLS Proxy</h1><form method="post" action="/login">
-<label>Username <input name="username" autocomplete="username" required></label>
-<label>Password <input name="password" type="password" autocomplete="current-password" required></label>
-<button type="submit">Sign in</button></form></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TLS Proxy · Sign in</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f4f6fb; --card: #ffffff; --ink: #172033; --muted: #5b6478;
+      --line: #d9dfeb; --brand: #165dcc; --brand-ink: #ffffff; --danger: #c0392b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0e1420; --card: #161d2b; --ink: #e7ecf5; --muted: #94a0b6; --line: #263042; --brand: #4d8bf0; --brand-ink: #0b1220; }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100dvh; display: grid; place-items: center;
+      padding: 1.5rem; background: radial-gradient(120% 120% at 50% 0%, color-mix(in srgb, var(--brand) 12%, var(--bg)) 0%, var(--bg) 55%);
+      font: 16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: var(--ink);
+    }
+    main {
+      width: 100%; max-width: 22rem; background: var(--card); border: 1px solid var(--line);
+      border-radius: 16px; padding: 2rem 1.75rem; box-shadow: 0 18px 50px -28px rgba(12,22,44,.55);
+    }
+    .brand { display: flex; align-items: center; gap: .6rem; margin-bottom: 1.5rem; }
+    .brand .mark { width: 2.1rem; height: 2.1rem; border-radius: 9px; background: var(--brand); color: var(--brand-ink); display: grid; place-items: center; font-weight: 700; }
+    .brand h1 { font-size: 1.15rem; margin: 0; letter-spacing: .01em; }
+    .brand p { margin: 0; font-size: .8rem; color: var(--muted); }
+    form { display: grid; gap: 1rem; }
+    label { display: grid; gap: .35rem; font-size: .85rem; color: var(--muted); }
+    input[type=text], input[type=password] {
+      width: 100%; padding: .7rem .8rem; font-size: 1rem; color: var(--ink);
+      background: color-mix(in srgb, var(--card) 92%, var(--bg)); border: 1px solid var(--line); border-radius: 10px;
+    }
+    input:focus { outline: 2px solid color-mix(in srgb, var(--brand) 60%, transparent); outline-offset: 1px; border-color: var(--brand); }
+    .remember { display: flex; align-items: center; gap: .55rem; font-size: .88rem; color: var(--ink); }
+    .remember input { width: 1.05rem; height: 1.05rem; accent-color: var(--brand); }
+    button {
+      margin-top: .25rem; padding: .8rem; font-size: 1rem; font-weight: 600; cursor: pointer;
+      color: var(--brand-ink); background: var(--brand); border: 0; border-radius: 10px;
+    }
+    button:hover { filter: brightness(1.05); }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand">
+      <span class="mark">T</span>
+      <div><h1>TLS Proxy</h1><p>Administrator sign in</p></div>
+    </div>
+    <form method="post" action="/login">
+      <label>Username
+        <input name="username" type="text" autocomplete="username" autofocus required>
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <label class="remember">
+        <input name="remember" type="checkbox" value="1">
+        Remember for 30 days
+      </label>
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>
