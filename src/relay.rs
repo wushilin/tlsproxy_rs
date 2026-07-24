@@ -73,7 +73,7 @@ fn upstream_lands_on(
 pub async fn check_acl(listener: &Listener, host: &str, id: &RequestId) -> Result<()> {
     if listener.is_allowed(host) { info!("{id} {host} allowed by ACL"); return Ok(()); }
     info!("{id} {host} denied by ACL");
-    active_tracker::set_status(id, ConnStatus::Denied).await;
+    active_tracker::set_status(id, ConnStatus::Denied);
     Err(anyhow!("{host} denied by ACL"))
 }
 
@@ -129,8 +129,8 @@ where R: AsyncRead + Send + Unpin + 'static, W: AsyncWrite + Send + Unpin + 'sta
             let Ok(count) = reader.read(&mut buffer).await else { break; };
             if count == 0 { break; }
             counter.fetch_add(count as u64, Ordering::SeqCst);
-            if upload { stats.increase_uploaded_bytes(count); active_tracker::add_uploaded(&id, count as u64).await; }
-            else { stats.increase_downloaded_bytes(count); active_tracker::add_downloaded(&id, count as u64).await; }
+            if upload { stats.increase_uploaded_bytes(count); active_tracker::add_uploaded(&id, count as u64); }
+            else { stats.increase_downloaded_bytes(count); active_tracker::add_downloaded(&id, count as u64); }
             limiter.consume(count).await;
             if writer.write_all(&buffer[..count]).await.is_err() { break; }
             idle.lock().await.mark();

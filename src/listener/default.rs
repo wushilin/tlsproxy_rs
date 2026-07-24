@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::net::TcpStream;
@@ -109,19 +109,25 @@ async fn handle_connection(
         .get_extension::<RequestId>()
         .await
         .expect("default listener installs request ID");
-    let started = Instant::now();
-    let active = stats.increase_conn_count();
-    crate::active_tracker::put(&request_id, &name, remote_address).await;
-    info!("{request_id} ({name}) default-listener connection from {remote_address}, active={active}");
+    // The guard owns tracking, active counts, and the CDR for this connection;
+    // it cleans up in Drop even if this task is force cancelled.
+    let guard = crate::dataplane::ConnGuard::start(
+        request_id.clone(),
+        name.clone(),
+        remote_address,
+        stats.clone(),
+        crate::accounting::ListenerType::TlsPassthrough,
+    );
+    info!("{request_id} ({name}) default-listener connection from {remote_address}");
 
-    let result: Result<crate::accounting::ListenerType> = async {
+    let result: Result<()> = async {
         let hello = crate::tls_header::read_client_hello(
             &mut client,
             Duration::from_secs(5),
             crate::tls_header::DEFAULT_MAX_CLIENT_HELLO_SIZE,
         )
         .await?;
-        crate::active_tracker::set_sni(&request_id, &hello.sni_host).await;
+        crate::active_tracker::set_sni(&request_id, &hello.sni_host);
         let route = decide(
             &hello,
             &config,
@@ -129,21 +135,22 @@ async fn handle_connection(
             |domain| crate::acme_challenge::global().resolve(domain).is_some(),
         );
         info!("{request_id} default-listener route selected: {route:?}");
+        let listener_type = match &route {
+            ConnectionRoute::ControlPlane { .. }
+            | ConnectionRoute::AcmeChallenge { .. }
+            | ConnectionRoute::Ordinary {
+                action: TlsRouteAction::Terminate { .. } | TlsRouteAction::ReverseProxy { .. },
+                ..
+            } => crate::accounting::ListenerType::TlsTerminate,
+            _ => crate::accounting::ListenerType::TlsPassthrough,
+        };
+        crate::active_tracker::set_listener_type(&request_id, listener_type);
         match route {
             ConnectionRoute::ControlPlane { hostname } => {
                 control_service.serve(hostname, hello, client).await?;
-                crate::active_tracker::set_status(&request_id, crate::accounting::ConnStatus::Ok).await;
-                Ok(crate::accounting::ListenerType::TlsTerminate)
+                crate::active_tracker::set_status(&request_id, crate::accounting::ConnStatus::Ok);
             }
             route => {
-                let listener_type = match &route {
-                    ConnectionRoute::Ordinary {
-                        action: TlsRouteAction::Terminate { .. } | TlsRouteAction::ReverseProxy { .. },
-                        ..
-                    }
-                    | ConnectionRoute::AcmeChallenge { .. } => crate::accounting::ListenerType::TlsTerminate,
-                    _ => crate::accounting::ListenerType::TlsPassthrough,
-                };
                 let is_acme = matches!(&route, ConnectionRoute::AcmeChallenge { .. });
                 dispatch_non_control(
                     route,
@@ -160,45 +167,19 @@ async fn handle_connection(
                 )
                 .await?;
                 if is_acme {
-                    crate::active_tracker::set_status(&request_id, crate::accounting::ConnStatus::Ok).await;
+                    crate::active_tracker::set_status(&request_id, crate::accounting::ConnStatus::Ok);
                 }
-                Ok(listener_type)
             }
         }
+        Ok(())
     }
     .await;
     if let Err(cause) = &result {
         warn!("{request_id} default-listener connection failed: {cause:#}");
     }
-    let closed = crate::active_tracker::remove(&request_id).await;
-    if let Some(closed) = closed.filter(|_| crate::accounting::enabled()) {
-        let listener_type = result
-            .as_ref()
-            .copied()
-            .unwrap_or(crate::accounting::ListenerType::TlsPassthrough);
-        let end_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
-        crate::accounting::submit(crate::accounting::CdrRecord {
-            listener_type,
-            connection_id: request_id.to_string(),
-            listener_name: (*name).clone(),
-            sni: closed.sni,
-            target_host: closed.target_host,
-            target_endpoint: closed.target_endpoint,
-            remote_address: closed.remote_address.to_string(),
-            status: closed.status,
-            uploaded_bytes: closed.uploaded_bytes,
-            downloaded_bytes: closed.downloaded_bytes,
-            start_unix_ms: closed.started_at_unix_ms,
-            end_unix_ms,
-        });
-    }
-    let active = stats.decrease_conn_count();
     info!(
-        "{request_id} default-listener connection closed: active={active}, elapsed_ms={}",
-        started.elapsed().as_millis()
+        "{request_id} default-listener connection closed: elapsed_ms={}",
+        guard.elapsed().as_millis()
     );
 }
 

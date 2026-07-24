@@ -272,11 +272,11 @@ async fn runtime_status(State(state): State<ControlState>) -> Response {
 }
 
 async fn active_connections() -> Json<Vec<crate::active_tracker::ActiveConnectionSerde>> {
-    Json(crate::active_tracker::get_active_list().await)
+    Json(crate::active_tracker::get_active_list())
 }
 
 async fn listener_active_connections(Path(listener): Path<String>) -> Json<Vec<crate::active_tracker::ActiveConnectionSerde>> {
-    Json(crate::active_tracker::get_active_list().await.into_iter().filter(|connection| connection.listener == listener).collect())
+    Json(crate::active_tracker::get_active_list().into_iter().filter(|connection| connection.listener == listener).collect())
 }
 
 async fn listener_operation(
@@ -344,7 +344,7 @@ async fn stream_events(socket: WebSocket, listener: Option<String>, state: Contr
     let stream_id = NEXT_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     log::info!("event websocket {stream_id} opened; listener={listener:?}");
     let (mut outgoing, mut incoming) = socket.split();
-    let mut receiver = crate::events_hub::subscribe();
+    let receiver = crate::events_hub::subscribe();
     for event in crate::events_hub::snapshot_events().await {
         let key = event.event_payload.get("key").and_then(|value| value.as_str()).unwrap_or_default();
         let accepted = listener.as_deref().is_none_or(|listener| key == listener);
@@ -396,14 +396,13 @@ async fn stream_events(socket: WebSocket, listener: Option<String>, state: Contr
                 }
                 _ => {}
             },
-            received = receiver.recv() => {
-                let event = match received {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log::warn!("event websocket {stream_id} ended because the event hub closed");
-                        break;
-                    }
+            received = receiver.recv_async() => {
+                // named_queue drops oldest per-subscriber on lag rather than
+                // signalling it; the per-second snapshot events reconcile any
+                // gap. Any error means the topic closed.
+                let Ok(event) = received else {
+                    log::warn!("event websocket {stream_id} ended because the event hub closed");
+                    break;
                 };
                 let key = event.event_payload.get("key").and_then(|value| value.as_str()).unwrap_or_default();
                 let event_listener = event.event_payload.get("listener_name").and_then(|value| value.as_str());

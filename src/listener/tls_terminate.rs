@@ -91,7 +91,7 @@ where
         return Err(anyhow!("TLS SNI changed between inspection and handshake"));
     }
     info!("{conn_id} received TLS ClientHello for SNI target {sni_target}");
-    active_tracker::set_sni(&conn_id, &sni_target).await;
+    active_tracker::set_sni(&conn_id, &sni_target);
     let upstream_tls = route
         .as_ref()
         .map_or(listener_config.upstream_tls, |(_, _, _, tls, _, _)| *tls);
@@ -115,7 +115,7 @@ where
         )
         .await?,
     };
-    active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint).await;
+    active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint);
     let certified_key = match certified_key {
         Some(key) => key,
         None => ca.resolve_or_mint(&sni_target)?,
@@ -143,7 +143,7 @@ where
     )
     .await??;
     info!("{conn_id} connected to upstream {}", selected.endpoint);
-    active_tracker::set_status(&conn_id, ConnStatus::Ok).await;
+    active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(tls_stream);
     if upstream_tls {
         let upstream = connect_trust_all_tls(upstream, &sni_target).await?;

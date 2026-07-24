@@ -1,15 +1,19 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::accounting::ConnStatus;
+use crate::accounting::{ConnStatus, ListenerType};
 use crate::request_id::RequestId;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+
+// The tracker uses a std (blocking) RwLock, not a tokio one: its critical
+// sections are tiny map operations, and being synchronous lets the RAII
+// connection guard clean up from `Drop` (which cannot await) on any exit,
+// including forced task cancellation.
 
 #[derive(Debug, Clone)]
 struct ActiveConnection {
@@ -23,6 +27,11 @@ struct ActiveConnection {
     target_host: String,
     target_endpoint: String,
     status: ConnStatus,
+    listener_type: Option<ListenerType>,
+}
+
+fn active() -> std::sync::RwLockWriteGuard<'static, HashMap<RequestId, ActiveConnection>> {
+    ACTIVE.write().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,27 +51,12 @@ lazy_static! {
         Arc::new(RwLock::new(HashMap::new()));
 }
 
-pub async fn reset() {
-    ACTIVE.write().await.clear()
+pub fn reset() {
+    active().clear()
 }
 
-/// Drops every tracked connection belonging to one listener. Used after a
-/// per-listener restart force-cancels its connection tasks, whose normal
-/// `track_end` removal never runs.
-pub async fn purge_listener(listener: &str) -> usize {
-    let mut w = ACTIVE.write().await;
-    let listener_was = w.values().filter(|active| active.listener == listener).count();
-    if listener_was == 0 {
-        return 0;
-    }
-    w.retain(|_, active| active.listener != listener);
-    drop(w);
-    crate::events_hub::publish_connection_count(listener, listener_was, 0);
-    listener_was
-}
-
-pub async fn put(request_id: &RequestId, listener: &str, addr: SocketAddr) {
-    let mut w = ACTIVE.write().await;
+pub fn put(request_id: &RequestId, listener: &str, addr: SocketAddr) {
+    let mut w = active();
     let global_was = w.len();
     let listener_was = w.values().filter(|active| active.listener == listener).count();
     let started_at_unix_ms = SystemTime::now()
@@ -82,6 +76,7 @@ pub async fn put(request_id: &RequestId, listener: &str, addr: SocketAddr) {
             target_host: String::new(),
             target_endpoint: String::new(),
             status: ConnStatus::default(),
+            listener_type: None,
         },
     );
     let global_now = w.len();
@@ -96,21 +91,21 @@ pub async fn put(request_id: &RequestId, listener: &str, addr: SocketAddr) {
     }));
 }
 
-pub async fn add_uploaded(request_id: &RequestId, count: u64) {
-    if let Some(active) = ACTIVE.write().await.get_mut(request_id) {
-        active.uploaded_bytes = active.uploaded_bytes.saturating_add(count);
+pub fn add_uploaded(request_id: &RequestId, count: u64) {
+    if let Some(connection) = active().get_mut(request_id) {
+        connection.uploaded_bytes = connection.uploaded_bytes.saturating_add(count);
     }
 }
 
-pub async fn add_downloaded(request_id: &RequestId, count: u64) {
-    if let Some(active) = ACTIVE.write().await.get_mut(request_id) {
-        active.downloaded_bytes = active.downloaded_bytes.saturating_add(count);
+pub fn add_downloaded(request_id: &RequestId, count: u64) {
+    if let Some(connection) = active().get_mut(request_id) {
+        connection.downloaded_bytes = connection.downloaded_bytes.saturating_add(count);
     }
 }
 
-pub async fn set_sni(request_id: &RequestId, sni: &str) {
+pub fn set_sni(request_id: &RequestId, sni: &str) {
     let listener = {
-        let mut active = ACTIVE.write().await;
+        let mut active = active();
         let Some(connection) = active.get_mut(request_id) else { return };
         connection.sni = sni.to_string();
         connection.listener.clone()
@@ -121,16 +116,24 @@ pub async fn set_sni(request_id: &RequestId, sni: &str) {
     }));
 }
 
-pub async fn set_target(request_id: &RequestId, target_host: &str, target_endpoint: &str) {
-    if let Some(active) = ACTIVE.write().await.get_mut(request_id) {
-        active.target_host = target_host.to_string();
-        active.target_endpoint = target_endpoint.to_string();
+pub fn set_target(request_id: &RequestId, target_host: &str, target_endpoint: &str) {
+    if let Some(connection) = active().get_mut(request_id) {
+        connection.target_host = target_host.to_string();
+        connection.target_endpoint = target_endpoint.to_string();
     }
 }
 
-pub async fn set_status(request_id: &RequestId, status: ConnStatus) {
-    if let Some(active) = ACTIVE.write().await.get_mut(request_id) {
-        active.status = status;
+pub fn set_status(request_id: &RequestId, status: ConnStatus) {
+    if let Some(connection) = active().get_mut(request_id) {
+        connection.status = status;
+    }
+}
+
+/// Records the accounting listener type so the connection guard can emit an
+/// accurate CDR from Drop without the exit path threading it through.
+pub fn set_listener_type(request_id: &RequestId, listener_type: ListenerType) {
+    if let Some(connection) = active().get_mut(request_id) {
+        connection.listener_type = Some(listener_type);
     }
 }
 
@@ -146,10 +149,11 @@ pub struct ClosedConnection {
     pub target_host: String,
     pub target_endpoint: String,
     pub status: ConnStatus,
+    pub listener_type: Option<ListenerType>,
 }
 
-pub async fn remove(request_id: &RequestId) -> Option<ClosedConnection> {
-    let mut w = ACTIVE.write().await;
+pub fn remove(request_id: &RequestId) -> Option<ClosedConnection> {
+    let mut w = active();
     let global_was = w.len();
     let listener = w.get(request_id).map(|active| active.listener.clone())?;
     let listener_was = w.values().filter(|active| active.listener == listener).count();
@@ -176,11 +180,12 @@ pub async fn remove(request_id: &RequestId) -> Option<ClosedConnection> {
         target_host: active.target_host,
         target_endpoint: active.target_endpoint,
         status: active.status,
+        listener_type: active.listener_type,
     })
 }
 
-pub async fn get_active_list() -> Vec<ActiveConnectionSerde> {
-    let r = ACTIVE.read().await;
+pub fn get_active_list() -> Vec<ActiveConnectionSerde> {
+    let r = ACTIVE.read().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut result: Vec<_> = r
         .iter()
         .map(|(id, active)| ActiveConnectionSerde {
@@ -207,18 +212,17 @@ pub async fn get_active_list() -> Vec<ActiveConnectionSerde> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn remove_returns_accumulated_connection_details() {
+    #[test]
+    fn remove_returns_accumulated_connection_details() {
         let request_id = RequestId::new();
         let addr: SocketAddr = "10.1.2.3:44444".parse().unwrap();
-        put(&request_id, "listener-a", addr).await;
-        add_uploaded(&request_id, 100).await;
-        add_downloaded(&request_id, 200).await;
-        set_sni(&request_id, "example.com").await;
-        set_target(&request_id, "example.com", "1.2.3.4:443").await;
-        set_status(&request_id, ConnStatus::Ok).await;
+        put(&request_id, "listener-a", addr);
+        add_uploaded(&request_id, 100);
+        add_downloaded(&request_id, 200);
+        set_sni(&request_id, "example.com");
+        set_target(&request_id, "example.com", "1.2.3.4:443");
+        set_status(&request_id, ConnStatus::Ok);
         let closed = remove(&request_id)
-            .await
             .expect("connection should be tracked");
         assert_eq!(closed.listener, "listener-a");
         assert_eq!(closed.remote_address, addr);
@@ -230,55 +234,55 @@ mod tests {
         assert_eq!(closed.status, ConnStatus::Ok);
         assert!(closed.started_at_unix_ms > 0);
         assert!(
-            remove(&request_id).await.is_none(),
+            remove(&request_id).is_none(),
             "second remove returns None"
         );
     }
 
-    #[tokio::test]
-    async fn new_connections_default_to_connect_failed_with_empty_dimensions() {
+    #[test]
+    fn new_connections_default_to_connect_failed_with_empty_dimensions() {
         let request_id = RequestId::new();
         let addr: SocketAddr = "10.1.2.3:44445".parse().unwrap();
-        put(&request_id, "listener-b", addr).await;
-        let closed = remove(&request_id).await.unwrap();
+        put(&request_id, "listener-b", addr);
+        let closed = remove(&request_id).unwrap();
         assert_eq!(closed.status, ConnStatus::ConnectFailed);
         assert_eq!(closed.sni, "");
         assert_eq!(closed.target_host, "");
         assert_eq!(closed.target_endpoint, "");
     }
 
-    #[tokio::test]
-    async fn setters_ignore_unknown_request_ids() {
+    #[test]
+    fn setters_ignore_unknown_request_ids() {
         let request_id = RequestId::new();
-        set_sni(&request_id, "ghost").await;
-        set_status(&request_id, ConnStatus::Denied).await;
-        assert!(remove(&request_id).await.is_none());
+        set_sni(&request_id, "ghost");
+        set_status(&request_id, ConnStatus::Denied);
+        assert!(remove(&request_id).is_none());
     }
 
     #[tokio::test]
     async fn connection_open_and_close_publish_listener_and_global_counts() {
         async fn next_matching(
-            events: &mut tokio::sync::broadcast::Receiver<crate::events_hub::Event>,
+            events: &crate::events_hub::EventReceiver,
             predicate: impl Fn(&serde_json::Value) -> bool,
         ) -> crate::events_hub::Event {
             loop {
-                let event = events.recv().await.unwrap();
+                let event = events.recv_async().await.unwrap();
                 if predicate(&event.event_payload) { return event; }
             }
         }
         // No global reset here: the tracker is shared process state and a
         // reset wipes entries of concurrently running tests. The assertions
         // use a listener name unique to this test instead.
-        let mut events = crate::events_hub::subscribe();
+        let events = crate::events_hub::subscribe();
         let request_id = RequestId::new();
-        put(&request_id, "events-listener", "127.0.0.1:12345".parse().unwrap()).await;
-        let listener_open = next_matching(&mut events, |payload| payload["key"] == "events-listener" && payload["now"] == 1).await;
-        let global_open = next_matching(&mut events, |payload| payload["key"] == "__global__" && payload["now"].as_u64() == payload["was"].as_u64().map(|was| was + 1)).await;
+        put(&request_id, "events-listener", "127.0.0.1:12345".parse().unwrap());
+        let listener_open = next_matching(&events, |payload| payload["key"] == "events-listener" && payload["now"] == 1).await;
+        let global_open = next_matching(&events, |payload| payload["key"] == "__global__" && payload["now"].as_u64() == payload["was"].as_u64().map(|was| was + 1)).await;
         assert_eq!(listener_open.event_payload, serde_json::json!({"key":"events-listener","was":0,"now":1}));
         assert_eq!(global_open.event_type, crate::events_hub::CONNECTION_COUNT_CHANGED);
-        remove(&request_id).await.unwrap();
-        let listener_close = next_matching(&mut events, |payload| payload["key"] == "events-listener" && payload["now"] == 0).await;
-        let global_close = next_matching(&mut events, |payload| payload["key"] == "__global__" && payload["was"].as_u64() == payload["now"].as_u64().map(|now| now + 1)).await;
+        remove(&request_id).unwrap();
+        let listener_close = next_matching(&events, |payload| payload["key"] == "events-listener" && payload["now"] == 0).await;
+        let global_close = next_matching(&events, |payload| payload["key"] == "__global__" && payload["was"].as_u64() == payload["now"].as_u64().map(|now| now + 1)).await;
         assert_eq!(listener_close.event_payload, serde_json::json!({"key":"events-listener","was":1,"now":0}));
         assert_eq!(global_close.event_type, crate::events_hub::CONNECTION_COUNT_CHANGED);
     }

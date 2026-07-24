@@ -3,9 +3,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use serde::Serialize;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
 
 use crate::listener_stats::ListenerStats;
+
+/// Single process-wide broadcast topic carrying every dashboard event. Named
+/// so any producer/consumer can attach without threading a handle through
+/// call sites; broadcasting so every subscriber (each open WebSocket) sees
+/// every event.
+pub const EVENTS_TOPIC: &str = "tlsproxy.events";
+const EVENTS_CAPACITY: usize = 4096;
+
+pub type EventReceiver = named_queue::Receiver<Event>;
 
 pub const CONNECTION_COUNT_CHANGED: &str = "CONNECTION_COUNT_CHANGED";
 pub const CONNECTION_BYTES_TRANSFERRED_CHANGED: &str = "CONNECTION_BYTES_TRANSFERRED_CHANGED";
@@ -21,9 +30,21 @@ pub struct Event {
     pub event_payload: serde_json::Value,
 }
 
-fn sender() -> &'static broadcast::Sender<Event> {
-    static SENDER: OnceLock<broadcast::Sender<Event>> = OnceLock::new();
-    SENDER.get_or_init(|| broadcast::channel(4096).0)
+fn ensure_topic() {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        // A broadcasting queue fans each event out to every subscriber, with
+        // a per-subscriber buffer that drops oldest on lag.
+        let _ = named_queue::create_broadcasting::<Event>(EVENTS_TOPIC, EVENTS_CAPACITY);
+    });
+}
+
+fn sender() -> &'static named_queue::Sender<Event> {
+    static SENDER: OnceLock<named_queue::Sender<Event>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        ensure_topic();
+        named_queue::acquire_sender::<Event>(EVENTS_TOPIC).expect("events topic is registered")
+    })
 }
 
 fn listeners() -> &'static RwLock<HashMap<String, Weak<ListenerStats>>> {
@@ -71,7 +92,13 @@ pub fn transfer_totals(listener: &str) -> Arc<TransferTotals> {
     )
 }
 
-pub fn subscribe() -> broadcast::Receiver<Event> { sender().subscribe() }
+/// Starts an independent subscription. Each call is its own broadcast stream;
+/// callers must not clone the returned receiver to fan out (clones share one
+/// subscription) — acquire again instead.
+pub fn subscribe() -> EventReceiver {
+    ensure_topic();
+    named_queue::acquire_receiver::<Event>(EVENTS_TOPIC).expect("events topic is registered")
+}
 
 pub fn publish(event_type: &'static str, event_payload: serde_json::Value) {
     let _ = sender().send(Event { event_type, event_payload });
@@ -89,7 +116,7 @@ pub async fn register_listener(stats: &Arc<ListenerStats>) {
 }
 
 pub async fn snapshot_events() -> Vec<Event> {
-    let connections = crate::active_tracker::get_active_list().await;
+    let connections = crate::active_tracker::get_active_list();
     let mut counts = HashMap::<String, usize>::new();
     for connection in &connections {
         *counts.entry(connection.listener.clone()).or_default() += 1;
@@ -127,7 +154,7 @@ pub fn spawn_sampler(controller: &mut crate::controller::Controller) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let connections = crate::active_tracker::get_active_list().await;
+            let connections = crate::active_tracker::get_active_list();
             let mut connection_counts = HashMap::<String, usize>::new();
             for connection in &connections {
                 *connection_counts.entry(connection.listener.clone()).or_default() += 1;

@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
 use crate::acme::backend::StoreRenewalBackend;
-use crate::accounting::{CdrRecord, ListenerType};
+use crate::accounting::ListenerType;
 use crate::acme::dns::PublicDnsPrerequisite;
 use crate::acme::scheduler::RenewalScheduler;
 use crate::ca::LocalCa;
@@ -69,12 +68,9 @@ async fn run_restartable<F, Fut>(
                 info!("listener `{name}` restarting: dropping its connections and rebinding {bind_pattern}");
             }
         }
-        // The dropped round force-cancelled its connection tasks, so their
-        // track_end cleanup never ran; remove their tracker entries here.
-        let purged = crate::active_tracker::purge_listener(&name).await;
-        if purged > 0 {
-            info!("listener `{name}` restart dropped {purged} active connections");
-        }
+        // The dropped round force-cancelled its connection tasks; each task's
+        // ConnGuard cleans up its tracker entry and active count in Drop, so no
+        // explicit purge is needed here.
         let mut rebound = None;
         for _ in 0..20 {
             match bind(&bind_pattern).await {
@@ -134,7 +130,7 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
     if let Some(accounting) = &config.accounting {
         crate::accounting::init(accounting).await?;
     }
-    crate::active_tracker::reset().await;
+    crate::active_tracker::reset();
     crate::events_hub::reset().await;
     restart_senders().write().await.clear();
     crate::forward::reset().await;
@@ -397,8 +393,8 @@ async fn run_tls_listener(
         let task_cache = cache.clone();
         let connection_controller = Arc::new(RwLock::new(controller.child()));
         drop(controller.spawn(async move {
-            track_start(&request_id, &task_name, remote, &task_stats).await;
-            let result: Result<ListenerType> = async {
+            let _guard = crate::dataplane::ConnGuard::start(request_id.clone(), task_name.clone(), remote, task_stats.clone(), ListenerType::TlsPassthrough);
+            let result: Result<()> = async {
                 let mut client = client;
                 let hello = crate::tls_header::read_client_hello(&mut client, Duration::from_secs(5), crate::tls_header::DEFAULT_MAX_CLIENT_HELLO_SIZE).await?;
                 let action = task_config.ordinary_traffic.select_route(&hello.sni_host).cloned().context("SNI denied by listener policy")?;
@@ -407,13 +403,14 @@ async fn run_tls_listener(
                     TlsRouteAction::Terminate { .. } | TlsRouteAction::ReverseProxy { .. } => ListenerType::TlsTerminate,
                     TlsRouteAction::Reject => ListenerType::TlsPassthrough,
                 };
+                crate::active_tracker::set_listener_type(&request_id, listener_type);
                 crate::listener::default::dispatch_non_control(
                     crate::listener::default::ConnectionRoute::Ordinary { sni: hello.sni_host.clone(), action },
                     hello, client, remote, task_name.clone(), &task_config, task_stats.clone(), connection_controller, task_ca, task_cache, fallback,
                 ).await?;
-                Ok(listener_type)
+                Ok(())
             }.await;
-            track_end(&request_id, &task_name, &task_stats, result, ListenerType::TlsPassthrough).await;
+            if let Err(cause) = &result { warn!("listener {task_name} connection failed: {cause:#}"); }
         }));
     }
 }
@@ -437,20 +434,21 @@ async fn run_http_listener(name: String, listener: TcpListener, config: HostRout
         let (task_name, task_stats) = (name.clone(), stats.clone());
         let connection_controller = Arc::new(RwLock::new(controller.child()));
         drop(controller.spawn(async move {
-            track_start(&request_id, &task_name, remote, &task_stats).await;
-            let result: Result<ListenerType> = async {
+            let _guard = crate::dataplane::ConnGuard::start(request_id.clone(), task_name.clone(), remote, task_stats.clone(), ListenerType::HttpPassthrough);
+            crate::active_tracker::set_listener_type(&request_id, ListenerType::HttpPassthrough);
+            let result: Result<()> = async {
                 let mut client = client;
                 let head = crate::http_header::read_http_head(&mut client, Duration::from_secs(10), crate::http_header::DEFAULT_MAX_HTTP_HEADER_SIZE).await?;
                 let action = task_config.select_route(&head.host).cloned().context("HTTP host denied by reverse-proxy listener policy")?;
                 if action.behavior == crate::runtime_config::HttpBehavior::RedirectHttps {
                     crate::listener::http_passthrough::redirect_https(client, head, action.redirect.as_ref(), task_config.redirect_https_port).await?;
-                    return Ok(ListenerType::HttpPassthrough);
+                    return Ok(());
                 }
                 let route_key = format!("{task_name}:{}", head.host.to_ascii_lowercase());
                 crate::listener::http_passthrough::run(task_name.clone(), client, remote, task_legacy, task_stats.clone(), connection_controller, Some(head), Some((route_key, action)), false, None).await?;
-                Ok(ListenerType::HttpPassthrough)
+                Ok(())
             }.await;
-            track_end(&request_id, &task_name, &task_stats, result, ListenerType::HttpPassthrough).await;
+            if let Err(cause) = &result { warn!("listener {task_name} connection failed: {cause:#}"); }
         }));
     }
 }
@@ -473,49 +471,13 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
         let (task_name, task_stats) = (name.clone(), stats.clone());
         let connection_controller = Arc::new(RwLock::new(controller.child()));
         drop(controller.spawn(async move {
-            track_start(&request_id, &task_name, remote, &task_stats).await;
-            let result = crate::listener::forward::run(task_name.clone(), client, task_legacy, task_stats.clone(), connection_controller, remote.ip(), task_load_balancing).await.map(|_| ListenerType::PortForward);
-            track_end(&request_id, &task_name, &task_stats, result, ListenerType::PortForward).await;
+            let _guard = crate::dataplane::ConnGuard::start(request_id.clone(), task_name.clone(), remote, task_stats.clone(), ListenerType::PortForward);
+            crate::active_tracker::set_listener_type(&request_id, ListenerType::PortForward);
+            if let Err(cause) = crate::listener::forward::run(task_name.clone(), client, task_legacy, task_stats.clone(), connection_controller, remote.ip(), task_load_balancing).await {
+                warn!("listener {task_name} connection failed: {cause:#}");
+            }
         }));
     }
 }
 
 fn empty_rules() -> Rules { Rules { static_hosts: Vec::new(), patterns: Vec::new() } }
-
-async fn track_start(id: &RequestId, name: &str, remote: SocketAddr, stats: &ListenerStats) {
-    crate::active_tracker::put(id, name, remote).await;
-    stats.increase_conn_count();
-}
-
-async fn track_end(
-    id: &RequestId,
-    name: &str,
-    stats: &ListenerStats,
-    result: Result<ListenerType>,
-    fallback_type: ListenerType,
-) {
-    let listener_type = result.as_ref().copied().unwrap_or(fallback_type);
-    if let Err(cause) = result { warn!("listener {name} connection failed: {cause:#}"); }
-    let closed = crate::active_tracker::remove(id).await;
-    if let Some(closed) = closed.filter(|_| crate::accounting::enabled()) {
-        let end_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
-        crate::accounting::submit(CdrRecord {
-            listener_type,
-            connection_id: id.to_string(),
-            listener_name: name.to_owned(),
-            sni: closed.sni,
-            target_host: closed.target_host,
-            target_endpoint: closed.target_endpoint,
-            remote_address: closed.remote_address.to_string(),
-            status: closed.status,
-            uploaded_bytes: closed.uploaded_bytes,
-            downloaded_bytes: closed.downloaded_bytes,
-            start_unix_ms: closed.started_at_unix_ms,
-            end_unix_ms,
-        });
-    }
-    stats.decrease_conn_count();
-}

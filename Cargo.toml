@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 anyhow = "1"
 arc-swap = "1"
+named_queue = "0.2"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

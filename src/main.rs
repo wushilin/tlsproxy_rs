@@ -15,6 +15,7 @@ pub mod certificate;
 pub mod config;
 pub mod controller;
 pub mod control_api;
+pub mod dataplane;
 pub mod extensible;
 pub mod events_hub;
 pub mod forward;

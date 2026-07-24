@@ -109,9 +109,9 @@ where
         return Err(anyhow!("HTTPS SNI `{}` does not match HTTP Host `{}`", expected_sni.unwrap_or_default(), head.host));
     }
     info!("{conn_id} http host is {}", head.host_raw);
-    active_tracker::set_sni(&conn_id, &head.host).await;
+    active_tracker::set_sni(&conn_id, &head.host);
     context.increase_uploaded_bytes(header_len);
-    active_tracker::add_uploaded(&conn_id, header_len as u64).await;
+    active_tracker::add_uploaded(&conn_id, header_len as u64);
     if route.is_none() {
         crate::relay::check_acl(&listener_config, &head.host, &conn_id).await?;
     }
@@ -165,7 +165,7 @@ where
             return Ok(());
         }
     };
-    active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint).await;
+    active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint);
     crate::relay::reject_obvious_self_connect(&listener_config, &selected.endpoint, &conn_id).await?;
     let upstream = match tokio::time::timeout(
         Duration::from_secs(5),
@@ -185,7 +185,7 @@ where
         }
     };
     info!("{conn_id} connected to http upstream {}", selected.endpoint);
-    active_tracker::set_status(&conn_id, ConnStatus::Ok).await;
+    active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(client);
     let prefix = head.body_prefix().to_vec();
     let mut rewritten = head.rewrite_for_proxy(remote_address.ip(), if client_tls { "https" } else { "http" }, host_header);

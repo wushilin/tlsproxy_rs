@@ -52,9 +52,9 @@ pub(crate) async fn run(
     let header_len = client_hello.buffered.len();
     let sni_target = client_hello.sni_host;
     info!("{conn_id} sni target is {sni_target}");
-    active_tracker::set_sni(&conn_id, &sni_target).await;
+    active_tracker::set_sni(&conn_id, &sni_target);
     context.increase_uploaded_bytes(header_len);
-    active_tracker::add_uploaded(&conn_id, header_len as u64).await;
+    active_tracker::add_uploaded(&conn_id, header_len as u64);
     let selected = match route_target {
         Some((target, target_port, load_balancing, client_ip)) => {
             crate::forward::select_routed_pool(
@@ -79,7 +79,7 @@ pub(crate) async fn run(
             .await?
         }
     };
-    active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint).await;
+    active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint);
     hello_cache::insert(client_hello.random);
     let upstream = tokio::time::timeout(
         Duration::from_secs(5),
@@ -87,7 +87,7 @@ pub(crate) async fn run(
     )
     .await??;
     info!("{conn_id} connected to TLS upstream {}", selected.endpoint);
-    active_tracker::set_status(&conn_id, ConnStatus::Ok).await;
+    active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(client);
     let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
     upstream_write.write_all(&client_hello.buffered).await?;

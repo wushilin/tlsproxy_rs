@@ -32,7 +32,7 @@ pub(crate) async fn run(
     let resolved = crate::forward::choose_online(&name, client_ip, load_balancing)
         .await
         .ok_or_else(|| anyhow!("no online forward backends"))?;
-    active_tracker::set_target(&conn_id, &resolved.tls_server_name, &resolved.endpoint).await;
+    active_tracker::set_target(&conn_id, &resolved.tls_server_name, &resolved.endpoint);
     // A raw forward listener connects upstream before reading any client
     // bytes, so a self-pointing target amplifies connections unboundedly
     // (accept -> connect -> accept -> ...). Loop markers cannot exist in an
@@ -44,7 +44,7 @@ pub(crate) async fn run(
     )
     .await??;
     info!("{conn_id} connected to forward upstream {}", resolved.endpoint);
-    active_tracker::set_status(&conn_id, ConnStatus::Ok).await;
+    active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(client);
     if listener_config.upstream_tls {
         let upstream = connect_trust_all_tls(upstream, &resolved.tls_server_name).await?;
