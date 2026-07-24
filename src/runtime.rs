@@ -230,6 +230,7 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
 
     let mut root = Controller::new();
     crate::events_hub::spawn_sampler(&mut root);
+    crate::events_hub::spawn_connection_reconciler(&mut root);
     ca.spawn_eviction_job(&mut root);
     crate::forward::spawn_global_health_checks(&mut root, store.clone());
     scheduler.spawn(&mut root);

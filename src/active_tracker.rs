@@ -82,8 +82,11 @@ pub fn put(request_id: &RequestId, listener: &str, addr: SocketAddr) {
     let global_now = w.len();
     let listener_now = w.values().filter(|active| active.listener == listener).count();
     drop(w);
+    // Coarse per-listener count → overview (global topic). The open event
+    // carries a connection_id and goes to both: the global count for the
+    // overview and the listener's topic to add the live-view row.
     crate::events_hub::publish_connection_count(listener, listener_was, listener_now);
-    crate::events_hub::publish(crate::events_hub::CONNECTION_COUNT_CHANGED, serde_json::json!({
+    crate::events_hub::publish_both(listener, crate::events_hub::CONNECTION_COUNT_CHANGED, serde_json::json!({
         "key": "__global__", "was": global_was, "now": global_now, "state": "open",
         "listener_name": listener, "connection_id": request_id.to_string(),
         "remote_address": addr.to_string(), "started_at_unix_ms": started_at_unix_ms,
@@ -110,7 +113,8 @@ pub fn set_sni(request_id: &RequestId, sni: &str) {
         connection.sni = sni.to_string();
         connection.listener.clone()
     };
-    crate::events_hub::publish(crate::events_hub::CONNECTION_HOST_CHANGED, serde_json::json!({
+    // Per-connection host detail → the listener's live view only.
+    crate::events_hub::publish_listener(&listener, crate::events_hub::CONNECTION_HOST_CHANGED, serde_json::json!({
         "key": format!("{listener}:{}", request_id), "listener_name": listener,
         "connection_id": request_id.to_string(), "host": sni
     }));
@@ -162,7 +166,7 @@ pub fn remove(request_id: &RequestId) -> Option<ClosedConnection> {
     let listener_now = w.values().filter(|active| active.listener == listener).count();
     drop(w);
     crate::events_hub::publish_connection_count(&listener, listener_was, listener_now);
-    crate::events_hub::publish(crate::events_hub::CONNECTION_COUNT_CHANGED, serde_json::json!({
+    crate::events_hub::publish_both(&listener, crate::events_hub::CONNECTION_COUNT_CHANGED, serde_json::json!({
         "key": "__global__", "was": global_was, "now": global_now, "state": "closed",
         "listener_name": listener, "connection_id": request_id.to_string(),
         "remote_address": active.remote_address.to_string(),
@@ -273,7 +277,7 @@ mod tests {
         // No global reset here: the tracker is shared process state and a
         // reset wipes entries of concurrently running tests. The assertions
         // use a listener name unique to this test instead.
-        let events = crate::events_hub::subscribe();
+        let events = crate::events_hub::subscribe_global();
         let request_id = RequestId::new();
         put(&request_id, "events-listener", "127.0.0.1:12345".parse().unwrap());
         let listener_open = next_matching(&events, |payload| payload["key"] == "events-listener" && payload["now"] == 1).await;

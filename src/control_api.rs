@@ -332,7 +332,7 @@ async fn events_websocket(State(state): State<ControlState>, Extension(session_h
 }
 
 async fn events_snapshot() -> Json<Vec<crate::events_hub::Event>> {
-    Json(crate::events_hub::snapshot_events().await)
+    Json(crate::events_hub::snapshot_global().await)
 }
 
 async fn listener_events_websocket(State(state): State<ControlState>, Extension(session_hash): Extension<String>, Path(listener): Path<String>, upgrade: WebSocketUpgrade) -> Response {
@@ -344,11 +344,14 @@ async fn stream_events(socket: WebSocket, listener: Option<String>, state: Contr
     let stream_id = NEXT_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     log::info!("event websocket {stream_id} opened; listener={listener:?}");
     let (mut outgoing, mut incoming) = socket.split();
-    let receiver = crate::events_hub::subscribe();
-    for event in crate::events_hub::snapshot_events().await {
-        let key = event.event_payload.get("key").and_then(|value| value.as_str()).unwrap_or_default();
-        let accepted = listener.as_deref().is_none_or(|listener| key == listener);
-        if !accepted { continue; }
+    // Subscribe to exactly the topic this socket needs: the global topic for
+    // the overview, or one listener's topic for a live view. The topic split
+    // means no per-event filtering is required below.
+    let (receiver, snapshot) = match &listener {
+        Some(name) => (crate::events_hub::subscribe_listener(name), crate::events_hub::snapshot_listener(name)),
+        None => (crate::events_hub::subscribe_global(), crate::events_hub::snapshot_global().await),
+    };
+    for event in snapshot {
         let Ok(encoded) = serde_json::to_string(&event) else { continue };
         if let Err(cause) = outgoing.send(Message::Text(encoded.into())).await {
             log::warn!("event websocket {stream_id} ended while sending initial snapshot: {cause}");
@@ -404,13 +407,8 @@ async fn stream_events(socket: WebSocket, listener: Option<String>, state: Contr
                     log::warn!("event websocket {stream_id} ended because the event hub closed");
                     break;
                 };
-                let key = event.event_payload.get("key").and_then(|value| value.as_str()).unwrap_or_default();
-                let event_listener = event.event_payload.get("listener_name").and_then(|value| value.as_str());
-                let accepted = match listener.as_deref() {
-                    Some(listener) => key == listener || event_listener == Some(listener),
-                    None => event.event_type != crate::events_hub::CONNECTION_BYTES_TRANSFERRED_CHANGED,
-                };
-                if !accepted { continue; }
+                // No filtering: the subscribed topic already carries exactly
+                // the events this socket should receive.
                 let Ok(encoded) = serde_json::to_string(&event) else { continue };
                 if let Err(cause) = outgoing.send(Message::Text(encoded.into())).await {
                     log::warn!("event websocket {stream_id} ended while publishing an event: {cause}");
