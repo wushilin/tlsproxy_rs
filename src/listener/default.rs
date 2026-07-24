@@ -95,7 +95,7 @@ pub async fn run(
 
 async fn handle_connection(
     name: Arc<String>,
-    mut client: Extensible<TcpStream>,
+    client: Extensible<TcpStream>,
     remote_address: SocketAddr,
     config: Arc<DefaultListenerConfig>,
     control_hostname: Option<String>,
@@ -122,12 +122,13 @@ async fn handle_connection(
     info!("{request_id} ({name}) default-listener connection from {remote_address}");
 
     let result: Result<()> = async {
-        let hello = crate::tls_header::read_client_hello(
-            &mut client,
-            Duration::from_secs(5),
-            crate::tls_header::DEFAULT_MAX_CLIENT_HELLO_SIZE,
-        )
-        .await?;
+        // The mandatory listener's single TLS interception. Its ClientHello
+        // artifact (SNI + ALPN) feeds `decide`, the classifier that routes ACME
+        // and control-plane traffic ahead of the data-plane interceptor stages.
+        let crate::dataplane::pipeline::Intercepted { artifact: hello, stream: client } =
+            crate::dataplane::tls::ClientHelloIntercept::new(client, Duration::from_secs(5))
+                .intercept()
+                .await?;
         crate::active_tracker::set_sni(&request_id, &hello.sni_host);
         let route = decide(
             &hello,
