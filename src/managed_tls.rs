@@ -26,7 +26,7 @@ fn auto_registration() -> &'static StdRwLock<Option<AutoRegistration>> {
 }
 
 pub fn configure_auto_registration(store: Store, request_scan: impl Fn() + Send + Sync + 'static) {
-    *auto_registration().write().expect("auto-certificate registration poisoned") = Some(AutoRegistration {
+    *auto_registration().write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AutoRegistration {
         store,
         request_scan: Arc::new(request_scan),
     });
@@ -54,12 +54,15 @@ const REGISTRATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// throttled per domain and run in the background so TLS handshakes are never
 /// delayed by DNS lookups or store writes.
 pub fn request_automatic_for_sni(sni: &str) {
+    if !crate::runtime_live::load().acme.enabled {
+        return;
+    }
     let Ok(domain) = normalize_domain(sni) else { return };
-    let Some(registration) = auto_registration().read().expect("auto-certificate registration poisoned").clone() else {
+    let Some(registration) = auto_registration().read().unwrap_or_else(std::sync::PoisonError::into_inner).clone() else {
         return;
     };
     {
-        let mut attempts = recent_registration_attempts().write().expect("registration throttle poisoned");
+        let mut attempts = recent_registration_attempts().write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if attempts.get(&domain).is_some_and(|last| last.elapsed() < REGISTRATION_RETRY_INTERVAL) {
             return;
         }

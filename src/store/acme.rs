@@ -143,6 +143,9 @@ impl Store {
     /// TLS-ALPN-01 certificate identifiers.
     pub fn ensure_automatic_certificates(&self, config: &RuntimeConfig) -> Result<usize> {
         use crate::runtime_config::{AdditionalListenerConfig, TlsRouteAction};
+        if !config.acme.enabled {
+            return Ok(0);
+        }
         let mut domains = std::collections::BTreeSet::new();
         let terminating = |action: &TlsRouteAction| matches!(action, TlsRouteAction::Terminate { .. } | TlsRouteAction::ReverseProxy { .. });
         for route in &config.default_listener.ordinary_traffic.routes {

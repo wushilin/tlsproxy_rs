@@ -653,6 +653,23 @@ mod tests {
     }
 
     #[test]
+    fn disabling_acme_stops_automatic_certificate_creation() {
+        use crate::runtime_config::{HostMatcher, TlsHostRoute, TlsRouteAction, UpstreamTransport};
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.ensure_builtin_providers().unwrap();
+        let mut config = RuntimeConfig::default();
+        config.acme.enabled = false;
+        config.default_listener.ordinary_traffic.routes.push(TlsHostRoute {
+            name: "automatic".into(),
+            matcher: HostMatcher { exact: vec!["auto.example".into()], ..Default::default() },
+            action: TlsRouteAction::Terminate { target_port: 443, target: None, upstream: UpstreamTransport::Plaintext, load_balancing: Default::default() },
+        });
+        assert_eq!(store.ensure_automatic_certificates(&config).unwrap(), 0);
+        assert!(store.certificate_for_domain("auto.example").unwrap().is_none());
+    }
+
+    #[test]
     fn exact_terminating_route_creates_protected_automatic_certificate() {
         use crate::runtime_config::{HostMatcher, TlsHostRoute, TlsRouteAction, UpstreamTransport};
         let directory = tempdir().unwrap();

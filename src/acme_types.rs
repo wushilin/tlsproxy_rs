@@ -39,6 +39,13 @@ fn default_public_resolvers() -> Vec<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcmeSettings {
+    /// Master switch for automatic certificate management. When false, no
+    /// automatic certificate records are created and no ACME orders or
+    /// renewals are placed; every terminating handshake without an active
+    /// managed certificate uses the certificate-fallback policy (by default
+    /// the local CA). Already-issued generations keep serving until expiry.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default = "default_renew_before_days")]
     pub renew_before_days: u16,
     #[serde(default = "default_scan_interval_hours")]
@@ -50,6 +57,7 @@ pub struct AcmeSettings {
 impl Default for AcmeSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             renew_before_days: default_renew_before_days(),
             scan_interval_hours: default_scan_interval_hours(),
             challenge_ttl_seconds: default_challenge_ttl_seconds(),

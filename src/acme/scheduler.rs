@@ -154,6 +154,10 @@ impl<B: RenewalBackend> RenewalScheduler<B> {
 
     pub async fn run_once(&self, trigger: ScanTrigger) -> Result<ScanSummary> {
         let _guard = self.exclusive.lock().await;
+        if !crate::runtime_live::load().acme.enabled {
+            info!("ACME scan skipped: automatic certificate management is disabled (trigger={})", trigger.as_str());
+            return Ok(ScanSummary::default());
+        }
         let started = Instant::now();
         info!("ACME scan triggered: trigger={}", trigger.as_str());
         let candidates = match tokio::time::timeout(

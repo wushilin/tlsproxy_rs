@@ -90,6 +90,14 @@ and AAAA records through the configured public resolvers.
 
 ## Automatic certificates
 
+Automatic certificate management can be turned off entirely with the
+"Automatic certificates (ACME)" switch on the settings page (`acme.enabled`
+in the configuration). While disabled, no automatic certificate records are
+created, no ACME orders or renewals are placed, and every terminating
+handshake without an active managed certificate uses the certificate
+fallback policy — by default the local CA. Already-issued generations keep
+serving until they expire.
+
 The Auto Certs page manages providers and exact single-domain certificates
 (one domain per certificate; multi-SAN is not supported). Built-in presets
 are provided for Let's Encrypt production and staging. Additional RFC
