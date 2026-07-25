@@ -38,13 +38,17 @@ tlsproxy run \
 `--port` is an alias for `--setup-port`; it is not the proxy listener port.
 After setup it, setup-token, and setup-bind options are ignored. Operational
 configuration comes from RocksDB. The mandatory public TLS listener always
-uses port 443 and cannot be deleted or stopped.
+uses port 443 and cannot be deleted or stopped; its bind address may be
+changed, but never its port.
 
 Setup asks for:
 
 - the first administrator and a password of at least 12 characters;
 - a dedicated control hostname such as `tls.example.com`;
-- public IPv4/IPv6 addresses expected in public DNS; and
+- public DNS resolvers used for ACME prerequisite checks (required,
+  defaulting to `1.1.1.1` and `8.8.8.8`);
+- public IPv4/IPv6 addresses expected in public DNS (optional, but required
+  before certificates can issue); and
 - an initial ACME provider.
 
 The control hostname is reserved for the form-login administration service and
@@ -58,13 +62,27 @@ Every TLS listener supports ordered per-host routes. A route can:
 
 - pass TLS through unchanged;
 - terminate TLS and forward plaintext;
-- terminate TLS and establish TLS to the upstream; or
+- terminate TLS and establish TLS to the upstream;
+- terminate TLS and reverse-proxy HTTP/1.1 at layer 7; or
 - reject the connection.
+
+The layer-7 reverse proxy selects per-request path routes by longest
+matching prefix, optionally stripping the prefix, and each path can proxy to
+a backend pool, serve static files (with configurable index and directory
+listing), or require HTTP Basic Auth. Proxied requests get `X-Forwarded-*`
+headers and an optional `Host` override. Plain HTTP listeners route by
+`Host` with the same path routing, or redirect to HTTPS (301/308, optional
+fixed hostname and port); a dedicated redirect listener protocol also
+exists. Raw forward listeners do not have hostname routing.
+
+Backend pools support round-robin and client-IP-hash load balancing. A
+global health checker probes every backend endpoint every five seconds over
+TCP — plus an HTTP `GET /` for HTTP backends — and routing prefers online
+endpoints; results are visible in the control plane.
 
 The mandatory listener additionally intercepts only exact `acme-tls/1`
 connections with an active exact-SNI challenge. Unmatched ACME ALPN is closed
-and never reaches an upstream. Plain HTTP listeners route by `Host`; raw
-forward listeners do not have hostname routing.
+and never reaches an upstream.
 
 DNS overrides are applied after route selection to both inferred and explicit
 targets. ACME prerequisites deliberately bypass those overrides and query A
@@ -72,9 +90,10 @@ and AAAA records through the configured public resolvers.
 
 ## Automatic certificates
 
-The Auto Certs page manages providers and exact-domain or multi-SAN
-certificates. Built-in presets are provided for Let's Encrypt production and
-staging. Additional RFC 8555-compatible providers can be configured manually.
+The Auto Certs page manages providers and exact single-domain certificates
+(one domain per certificate; multi-SAN is not supported). Built-in presets
+are provided for Let's Encrypt production and staging. Additional RFC
+8555-compatible providers can be configured manually.
 When a provider requires External Account Binding, its HMAC is never returned
 by the admin API and is erased from provider metadata after account binding.
 Wildcard certificates are rejected because TLS-ALPN-01 cannot validate them,
@@ -84,13 +103,14 @@ never issue for a single label.
 Certificates also register themselves: when a terminating route accepts a
 concrete SNI (exact, suffix, or regex match), the domain is registered
 automatically after the public-DNS prerequisite confirms it resolves to the
-configured self IPs. Registration runs in the background, is throttled per
-domain, and never delays TLS handshakes.
+configured self IPs. Registration runs in the background, is throttled to
+one attempt per domain per ten minutes, and never delays TLS handshakes.
 
 The scheduler:
 
 - performs one immediate startup scan and scans on a fixed 12-hour cadence
-  by default; saving a certificate or provider triggers a scan immediately;
+  by default (configurable via `scan_interval_hours`); saving a certificate
+  triggers a scan immediately;
 - never overlaps scans, but renews up to four certificates concurrently
   within a scan so one slow certificate cannot block the others;
 - renews normally 15 days before expiry with a five-minute deadline per
@@ -113,8 +133,10 @@ available in the control plane.
 A certificate that has never issued — or whose issuance has expired — is
 just a pending request and can always be deleted, even an automatic one
 whose route is still active (the next matching handshake simply re-registers
-it). An issued and still-valid Let's Encrypt certificate cannot be deleted,
-which protects against accidental re-issuance into CA rate limits.
+it). Once issued and still valid, a Let's Encrypt certificate cannot be
+deleted — protecting against accidental re-issuance into CA rate limits —
+and an automatic certificate of any provider cannot be deleted while a TLS
+route still uses its domain.
 
 Active generations are parsed into an atomically replaced exact-SNI cache.
 TLS termination and the control hostname prefer this cache, then apply the
@@ -125,12 +147,20 @@ configured `local_ca` or `reject` fallback.
 The control hostname serves HTTPS directly on the mandatory listener without
 a loopback proxy hop. Authentication uses Argon2id password hashes, opaque
 random sessions stored by token hash, `Secure`/`HttpOnly`/`SameSite=Strict`
-cookies, CSRF tokens for mutations, and login throttling. Provider secret
-fields are redacted. Configuration writes use revisions and cause an orderly
-listener reload; a failed apply is automatically rolled back.
+cookies, CSRF tokens for mutations, and login throttling. Sessions last 12
+hours by default; the login form offers a 30-day remember-me. Provider
+secret fields are redacted.
+
+Configuration writes use revisions. Changes limited to listener-internal
+settings are hot-applied without rebuilding sockets; anything touching
+bind addresses, protocols, or global settings causes an orderly listener
+reload, and a failed apply is automatically rolled back to the last known
+good revision (which also absorbs successful hot applies).
 
 The UI also shows runtime/certificate status, DNS diagnostics, recent audits,
-configuration history, and rollback controls.
+configuration history, and rollback controls. Administrators can export the
+database as JSON and import it back with merge or clear-and-import modes,
+optionally scoped to selected column families; imports are audited.
 
 ## Certificate publication
 
@@ -146,8 +176,10 @@ The JSON response contains stable `certificate_id` and changing
 `If-None-Match` with the returned ETag for efficient polling. Add
 `?private_key=true` only when both the certificate policy and retrieval token
 permit key export. Retrieval tokens are independently scoped and expiring;
-only their SHA-256 hashes are stored. Requests are rate-limited and audited,
-and local-CA fallback identities can never be published.
+lookups are authenticated by SHA-256 token hash, and the bearer value is
+deliberately kept recoverable so an administrator can copy an existing token
+again. Requests are rate-limited and audited, and local-CA fallback
+identities can never be published.
 
 ## Operations
 
