@@ -959,4 +959,47 @@ mod tests {
         assert_eq!(summary.sessions, 1);
         assert!(store.session(&crate::auth::token_hash("old")).unwrap().is_none());
     }
+
+    #[test]
+    fn retention_keeps_active_and_only_two_newest_inactive_generations() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let now = OffsetDateTime::now_utc();
+        for number in 1..=4 {
+            store.activate_generation(
+                &CertificateGeneration {
+                    id: format!("generation-{number}"),
+                    certificate_id: "example.com".into(),
+                    issued_at: Some(now + time::Duration::minutes(number)),
+                    ..Default::default()
+                },
+                &RenewalState {
+                    certificate_id: "example.com".into(),
+                    ..Default::default()
+                },
+            ).unwrap();
+        }
+
+        let summary = store.cleanup_retention(now, 3, 90).unwrap();
+        assert_eq!(summary.generations, 1);
+        assert_eq!(
+            store.active_generation("example.com").unwrap().unwrap().id,
+            "generation-4"
+        );
+
+        let generations = store.cf(CF_GENERATIONS).unwrap();
+        let retained = store.db.iterator_cf(&generations, rocksdb::IteratorMode::Start)
+            .map(|item| {
+                let (_, value) = item.unwrap();
+                serde_json::from_slice::<CertificateGeneration>(&value).unwrap().id
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            retained,
+            ["generation-2", "generation-3", "generation-4"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
 }
