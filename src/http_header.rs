@@ -254,8 +254,8 @@ impl HttpHead {
                     let parsed = value
                         .parse::<u64>()
                         .map_err(|_| anyhow!("invalid Content-Length `{value}`"))?;
-                    if content_length.is_some_and(|previous| previous != parsed) {
-                        bail!("conflicting Content-Length headers");
+                    if content_length.is_some() {
+                        bail!("duplicate Content-Length headers");
                     }
                     content_length = Some(parsed);
                 }
@@ -316,6 +316,23 @@ impl HttpHead {
         upstream_host: Option<&str>,
         loop_token: &str,
     ) -> Vec<u8> {
+        let upgrade_requested = self.upgrade_requested();
+        // RFC 9110 §7.6.1: hop-by-hop headers, plus every field named as a
+        // token in the client's own Connection header, terminate at this hop.
+        let mut hop_by_hop: Vec<String> = ["keep-alive", "te", "trailer", "proxy-authorization", "proxy-connection"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        if let Some(connection) = self.header_value("connection") {
+            hop_by_hop.extend(
+                connection
+                    .split(',')
+                    .map(|token| token.trim().to_ascii_lowercase())
+                    // `close` names no header, and an honored `upgrade` must
+                    // stay on the wire for the upstream to switch protocols.
+                    .filter(|token| !token.is_empty() && token != "close" && !(token == "upgrade" && upgrade_requested)),
+            );
+        }
         let head = String::from_utf8_lossy(&self.buffered[..self.head_len]);
         let mut lines = head
             .split('\n')
@@ -362,6 +379,17 @@ impl HttpHead {
                         continue;
                     }
                     "x-forwarded-host" | "x-forwarded-proto" | "connection" => {
+                        skipping_folds = true;
+                        continue;
+                    }
+                    // An Upgrade header without the Connection token is not an
+                    // upgrade request; forwarding it dangling would be
+                    // contradictory next to our own Connection header.
+                    "upgrade" if !upgrade_requested => {
+                        skipping_folds = true;
+                        continue;
+                    }
+                    name if hop_by_hop.iter().any(|token| token == name) => {
                         skipping_folds = true;
                         continue;
                     }
@@ -547,6 +575,26 @@ mod tests {
             DEFAULT_MAX_HTTP_HEADER_SIZE,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn hop_by_hop_headers_terminate_at_this_proxy() {
+        let head = parse(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, X-Hop-Token\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\nTrailer: Expires\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nX-Hop-Token: secret\r\nUpgrade: h2c\r\nAccept: text/html\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let rewritten = String::from_utf8(head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None, "cafe")).unwrap();
+        let lower = rewritten.to_ascii_lowercase();
+        assert!(!lower.contains("keep-alive: timeout"));
+        assert!(!lower.contains("\nte:"));
+        assert!(!lower.contains("trailer:"));
+        assert!(!lower.contains("proxy-authorization:"));
+        assert!(!lower.contains("proxy-connection:"));
+        assert!(!lower.contains("x-hop-token:"), "headers named in Connection are dropped");
+        assert!(!lower.contains("upgrade: h2c"), "unhonored Upgrade is dropped");
+        assert!(rewritten.contains("Accept: text/html\r\n"), "end-to-end headers pass through");
+        assert!(rewritten.contains("Connection: close\r\n"));
     }
 
     #[tokio::test]

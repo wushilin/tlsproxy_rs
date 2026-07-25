@@ -309,7 +309,7 @@ where
     client.unread(&prefix);
     let (base_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, mut upstream_write): (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>) = if upstream_tls {
-        let upstream = connect_trust_all_tls(upstream, &tls_server_name).await?;
+        let upstream = tokio::time::timeout(std::time::Duration::from_secs(10), connect_trust_all_tls(upstream, &tls_server_name)).await.map_err(|_| anyhow!("upstream TLS handshake timed out"))??;
         let (read, write) = tokio::io::split(upstream);
         (Box::new(read), Box::new(write))
     } else {

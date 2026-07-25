@@ -96,7 +96,32 @@ struct MonitorGroup {
     owner: Owner,
     endpoints: RwLock<Vec<EndpointState>>,
     last_activity_ms: RwLock<u128>,
-    rng_state: AtomicU64,
+    sequence: AtomicU64,
+}
+
+/// How a caller wants a member picked from a candidate set: spread load
+/// sequentially or stay sticky to a client address. Sticky selection uses
+/// rendezvous (highest-random-weight) hashing so removing one member only
+/// remaps the clients that were pinned to it, instead of reshuffling
+/// everyone the way modulo hashing does.
+#[derive(Clone, Copy)]
+pub(crate) enum Pick {
+    Sequential,
+    Sticky(IpAddr),
+}
+
+fn rendezvous_index<T>(items: &[T], member_key: impl Fn(&T) -> &str, client_ip: IpAddr) -> usize {
+    items
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, item)| {
+            let mut hasher = DefaultHasher::new();
+            client_ip.hash(&mut hasher);
+            member_key(item).hash(&mut hasher);
+            hasher.finish()
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
 }
 
 impl MonitorGroup {
@@ -123,7 +148,7 @@ impl MonitorGroup {
             owner,
             endpoints: RwLock::new(Vec::new()),
             last_activity_ms: RwLock::new(now),
-            rng_state: AtomicU64::new(now as u64),
+            sequence: AtomicU64::new(now as u64),
         });
         group.reconcile_endpoints().await;
         group
@@ -138,7 +163,7 @@ impl MonitorGroup {
             && now.saturating_sub(*self.last_activity_ms.read().await) > RUNTIME_TTL_MS
     }
 
-    async fn choose_endpoint(&self) -> Option<SelectedTarget> {
+    async fn choose_endpoint(&self, pick: Pick) -> Option<SelectedTarget> {
         let endpoints = self.endpoints.read().await;
         let online: Vec<_> = endpoints
             .iter()
@@ -169,7 +194,10 @@ impl MonitorGroup {
         } else {
             return None;
         };
-        let index = (self.next_random() as usize) % candidates.len();
+        let index = match pick {
+            Pick::Sequential => (self.sequence.fetch_add(1, Ordering::Relaxed) as usize) % candidates.len(),
+            Pick::Sticky(client_ip) => rendezvous_index(&candidates, |endpoint| endpoint.endpoint.as_str(), client_ip),
+        };
         Some(SelectedTarget {
             endpoint: candidates[index].endpoint.clone(),
             tls_server_name: self.tls_server_name.clone(),
@@ -258,27 +286,6 @@ impl MonitorGroup {
         }
     }
 
-    fn next_random(&self) -> u64 {
-        let mut value = self.rng_state.load(Ordering::Relaxed);
-        loop {
-            let mut next = value;
-            next ^= next << 13;
-            next ^= next >> 7;
-            next ^= next << 17;
-            if next == 0 {
-                next = 0x9e37_79b9_7f4a_7c15;
-            }
-            match self.rng_state.compare_exchange_weak(
-                value,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return next,
-                Err(observed) => value = observed,
-            }
-        }
-    }
 }
 
 pub async fn register_forward_listener(
@@ -397,6 +404,7 @@ pub async fn select_http_backend(
         return Ok((select_routed_target(host, action.target.as_deref(), action.target_port, tls).await?, tls));
     }
     let mut available = Vec::new();
+    let mut down = Vec::new();
     for backend in &action.backends {
         let requested: HostAndPort = backend.address.parse()
             .map_err(|cause| anyhow!("invalid HTTP backend `{}`: {cause}", backend.address))?;
@@ -407,50 +415,69 @@ pub async fn select_http_backend(
         let endpoints = group.endpoints.read().await;
         if endpoints.iter().any(|item| item.online == Some(true)) || endpoints.iter().any(|item| item.online.is_none()) {
             available.push((Arc::clone(&group), tls));
+        } else if !endpoints.is_empty() {
+            down.push((Arc::clone(&group), tls));
         }
     }
-    if available.is_empty() { return Err(anyhow!("no healthy reverse-proxy backends for `{host}`")); }
-    let index = match action.load_balancing {
-        HttpLoadBalancing::ClientIpHash => {
-            let mut hasher = DefaultHasher::new();
-            client_ip.hash(&mut hasher);
-            (hasher.finish() as usize) % available.len()
-        }
+    // Health state is eventually consistent; when everything is marked down,
+    // trying a down backend beats failing fast (it may have just recovered).
+    let available = if available.is_empty() { down } else { available };
+    if available.is_empty() { return Err(anyhow!("no reverse-proxy backends for `{host}`")); }
+    let (index, pick) = match action.load_balancing {
+        HttpLoadBalancing::ClientIpHash => (
+            rendezvous_index(&available, |(group, _)| group.requested_target.as_str(), client_ip),
+            Pick::Sticky(client_ip),
+        ),
         HttpLoadBalancing::RoundRobin => {
             let mut cursors = HTTP_ROUTE_CURSORS.write().await;
-            let cursor = cursors.entry(route_key.to_string()).or_default();
+            let cursor = cursors.entry(route_key.to_string()).or_insert_with(random_cursor_seed);
             let index = (*cursor as usize) % available.len();
             *cursor = cursor.wrapping_add(1);
-            index
+            (index, Pick::Sequential)
         }
     };
     let (group, tls) = &available[index];
-    let selected = group.choose_endpoint().await.ok_or_else(|| anyhow!("no healthy reverse-proxy endpoints for `{host}`"))?;
+    let selected = group.choose_endpoint(pick).await.ok_or_else(|| anyhow!("no healthy reverse-proxy endpoints for `{host}`"))?;
     Ok((selected, *tls))
 }
 
 pub async fn choose_online(listener_name: &str, client_ip: IpAddr, load_balancing: crate::runtime_config::HttpLoadBalancing) -> Option<SelectedTarget> {
     let groups = GROUPS.read().await;
     let keys = FORWARD_LISTENERS.read().await.get(listener_name).cloned();
-    let mut selected = Vec::new();
+    let mut members = Vec::new();
     if let Some(keys) = keys {
         for key in keys {
             if let Some(group) = groups.get(&key) {
-                if let Some(endpoint) = group.choose_endpoint().await {
-                    selected.push(endpoint);
-                }
+                members.push(Arc::clone(group));
             }
         }
     }
     drop(groups);
-    if selected.is_empty() {
+    if members.is_empty() {
         return None;
     }
-    let index = match load_balancing {
-        crate::runtime_config::HttpLoadBalancing::ClientIpHash => { let mut hasher=DefaultHasher::new(); client_ip.hash(&mut hasher); (hasher.finish() as usize)%selected.len() }
-        crate::runtime_config::HttpLoadBalancing::RoundRobin => { let mut cursors=HTTP_ROUTE_CURSORS.write().await; let cursor=cursors.entry(listener_name.to_string()).or_default(); let index=(*cursor as usize)%selected.len(); *cursor=cursor.wrapping_add(1); index }
+    let (index, pick) = match load_balancing {
+        crate::runtime_config::HttpLoadBalancing::ClientIpHash => (
+            rendezvous_index(&members, |group| group.requested_target.as_str(), client_ip),
+            Pick::Sticky(client_ip),
+        ),
+        crate::runtime_config::HttpLoadBalancing::RoundRobin => {
+            let mut cursors = HTTP_ROUTE_CURSORS.write().await;
+            let cursor = cursors.entry(listener_name.to_string()).or_insert_with(random_cursor_seed);
+            let index = (*cursor as usize) % members.len();
+            *cursor = cursor.wrapping_add(1);
+            (index, Pick::Sequential)
+        }
     };
-    selected.get(index).cloned()
+    // Fall through the member ring so one down group does not blackhole its
+    // cursor/hash slot.
+    for offset in 0..members.len() {
+        let member = &members[(index + offset) % members.len()];
+        if let Some(endpoint) = member.choose_endpoint(pick).await {
+            return Some(endpoint);
+        }
+    }
+    None
 }
 
 pub async fn select_runtime_target(
@@ -471,7 +498,7 @@ pub async fn select_runtime_target(
     .await?;
     group.touch().await;
     let mut selected = group
-        .choose_endpoint()
+        .choose_endpoint(Pick::Sequential)
         .await
         .ok_or_else(|| anyhow!("no available upstream endpoint for {}", group.key.target))?;
     selected.tls_server_name = tls_server_name.to_string();
@@ -505,7 +532,7 @@ pub async fn select_routed_target(
     .await?;
     group.touch().await;
     let mut selected = group
-        .choose_endpoint()
+        .choose_endpoint(Pick::Sequential)
         .await
         .ok_or_else(|| anyhow!("no available upstream endpoint for {}", group.key.target))?;
     selected.tls_server_name = sni_host.to_string();
@@ -556,21 +583,20 @@ pub async fn select_routed_pool(
     if available.is_empty() {
         return Err(anyhow!("no available upstream endpoint for route `{route_key}`"));
     }
-    let index = match load_balancing {
-        HttpLoadBalancing::ClientIpHash => {
-            let mut hasher = DefaultHasher::new();
-            client_ip.hash(&mut hasher);
-            (hasher.finish() as usize) % available.len()
-        }
+    let (index, pick) = match load_balancing {
+        HttpLoadBalancing::ClientIpHash => (
+            rendezvous_index(&available, |group| group.requested_target.as_str(), client_ip),
+            Pick::Sticky(client_ip),
+        ),
         HttpLoadBalancing::RoundRobin => {
             let mut cursors = HTTP_ROUTE_CURSORS.write().await;
-            let cursor = cursors.entry(route_key.to_string()).or_default();
+            let cursor = cursors.entry(route_key.to_string()).or_insert_with(random_cursor_seed);
             let index = (*cursor as usize) % available.len();
             *cursor = cursor.wrapping_add(1);
-            index
+            (index, Pick::Sequential)
         }
     };
-    let mut selected = available[index].choose_endpoint().await
+    let mut selected = available[index].choose_endpoint(pick).await
         .ok_or_else(|| anyhow!("no available upstream endpoint for route `{route_key}`"))?;
     selected.tls_server_name = sni_host.to_string();
     Ok(selected)
@@ -791,6 +817,13 @@ impl rustls::client::danger::ServerCertVerifier for TrustAllVerifier {
     }
 }
 
+/// Seeds new round-robin cursors randomly so a configuration reload does not
+/// bias the first request of every route onto the first backend.
+fn random_cursor_seed() -> u64 {
+    use rand::Rng as _;
+    rand::rng().random()
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -833,8 +866,62 @@ mod tests {
             owner,
             endpoints: RwLock::new(endpoints),
             last_activity_ms: RwLock::new(now_ms()),
-            rng_state: AtomicU64::new(1),
+            sequence: AtomicU64::new(0),
         }
+    }
+
+    #[tokio::test]
+    async fn sequential_pick_cycles_all_online_endpoints() {
+        let now = now_ms();
+        let endpoint = |addr: &str| EndpointState {
+            endpoint: addr.into(),
+            online: Some(true),
+            since_ms: now,
+            last_checked_ms: now,
+        };
+        let group = test_group(
+            Owner::Runtime,
+            "pool.example:443",
+            vec![endpoint("10.0.0.1:443"), endpoint("10.0.0.2:443"), endpoint("10.0.0.3:443")],
+        );
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            seen.insert(group.choose_endpoint(Pick::Sequential).await.unwrap().endpoint);
+        }
+        assert_eq!(seen.len(), 3, "three sequential picks cover all three endpoints");
+    }
+
+    #[tokio::test]
+    async fn sticky_pick_is_stable_and_survives_unrelated_member_loss() {
+        let now = now_ms();
+        let endpoint = |addr: &str, online: bool| EndpointState {
+            endpoint: addr.into(),
+            online: Some(online),
+            since_ms: now,
+            last_checked_ms: now,
+        };
+        let client: IpAddr = "203.0.113.7".parse().unwrap();
+        let group = test_group(
+            Owner::Runtime,
+            "pool.example:443",
+            vec![endpoint("10.0.0.1:443", true), endpoint("10.0.0.2:443", true), endpoint("10.0.0.3:443", true)],
+        );
+        let first = group.choose_endpoint(Pick::Sticky(client)).await.unwrap().endpoint;
+        for _ in 0..5 {
+            assert_eq!(group.choose_endpoint(Pick::Sticky(client)).await.unwrap().endpoint, first);
+        }
+        // Rendezvous hashing: removing a member the client was NOT pinned to
+        // must not move the client.
+        let survivors: Vec<EndpointState> = ["10.0.0.1:443", "10.0.0.2:443", "10.0.0.3:443"]
+            .iter()
+            .filter(|addr| **addr != first)
+            .map(|addr| endpoint(addr, true))
+            .collect();
+        let victim = survivors[0].endpoint.clone();
+        let remaining: Vec<EndpointState> = [endpoint(&first, true), endpoint(&survivors[1].endpoint, true)].into();
+        let _ = victim;
+        let shrunk = test_group(Owner::Runtime, "pool.example:443", remaining);
+        assert_eq!(shrunk.choose_endpoint(Pick::Sticky(client)).await.unwrap().endpoint, first);
     }
 
     #[tokio::test]
@@ -859,7 +946,7 @@ mod tests {
         );
 
         let selected = group
-            .choose_endpoint()
+            .choose_endpoint(Pick::Sequential)
             .await
             .expect("stale down status should not block all candidates");
 
@@ -870,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn choose_endpoint_returns_none_only_when_no_endpoints_exist() {
         let group = test_group(Owner::Runtime, "example.com:443", Vec::new());
-        assert!(group.choose_endpoint().await.is_none());
+        assert!(group.choose_endpoint(Pick::Sequential).await.is_none());
     }
 
     #[tokio::test]
@@ -887,7 +974,7 @@ mod tests {
         );
 
         let selected = group
-            .choose_endpoint()
+            .choose_endpoint(Pick::Sequential)
             .await
             .expect("stale down status should not block configured forward candidates");
 

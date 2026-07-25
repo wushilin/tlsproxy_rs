@@ -23,11 +23,6 @@ impl IdleTracker {
         self.last_active = Instant::now();
         return result;
     }
-
-    pub fn max_idle(&self) -> Duration {
-        self.max_idle
-    }
-
     pub fn is_expired(&self) -> bool {
         return self.last_active.elapsed() > self.max_idle;
     }

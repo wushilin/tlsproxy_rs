@@ -197,7 +197,7 @@ where
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(tls_stream);
     if upstream_tls {
-        let upstream = connect_trust_all_tls(upstream, &sni_target).await?;
+        let upstream = tokio::time::timeout(std::time::Duration::from_secs(10), connect_trust_all_tls(upstream, &sni_target)).await.map_err(|_| anyhow!("upstream TLS handshake timed out"))??;
         info!(
             "{conn_id} wrapped upstream {} in trust-all TLS",
             selected.endpoint

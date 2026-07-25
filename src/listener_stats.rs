@@ -3,7 +3,6 @@ use std::sync::{
     Arc, OnceLock,
 };
 
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub struct ListenerStats {
@@ -16,26 +15,6 @@ pub struct ListenerStats {
     transfer: OnceLock<Arc<crate::events_hub::TransferTotals>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StatsSerde {
-    pub name: String,
-    pub total: usize,
-    pub active: usize,
-    pub downloaded_bytes: usize,
-    pub uploaded_bytes: usize,
-}
-
-impl StatsSerde {
-    pub fn from(input: &ListenerStats) -> Self {
-        Self {
-            name: input.name.clone(),
-            total: input.total_count(),
-            active: input.active_count(),
-            downloaded_bytes: input.downloaded_bytes_count(),
-            uploaded_bytes: input.uploaded_bytes_count(),
-        }
-    }
-}
 
 impl ListenerStats {
     fn newau() -> Arc<AtomicUsize> {
@@ -65,14 +44,6 @@ impl ListenerStats {
 
     pub fn decrease_conn_count(&self) -> usize {
         self.active.fetch_sub(1, Ordering::SeqCst) - 1
-    }
-
-    pub fn total_count(&self) -> usize {
-        self.total.load(Ordering::SeqCst)
-    }
-
-    pub fn active_count(&self) -> usize {
-        self.active.load(Ordering::SeqCst)
     }
 
     pub fn increase_uploaded_bytes(&self, count: usize) -> usize {

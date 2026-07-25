@@ -133,18 +133,7 @@ impl<T> ConnStream<T> {
             "stream pushback exceeds {MAX_PUSHBACK} bytes"
         );
         self.pushback.splice(0..0, bytes.iter().copied());
-    }
-
-    /// Unwraps the inner stream. Any unread pushback is discarded, so this is
-    /// only sound before `unread` or after the pushback has been drained.
-    pub fn unwrap(self) -> T {
-        debug_assert!(
-            self.pushback_offset == self.pushback.len(),
-            "unwrapping a stream with pending pushback discards bytes"
-        );
-        self.inner
-    }
-}
+    }}
 
 #[cfg(test)]
 mod tests {

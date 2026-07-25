@@ -41,7 +41,7 @@ pub(crate) async fn run(
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(client);
     if policy.upstream_tls {
-        let upstream = connect_trust_all_tls(upstream, &resolved.tls_server_name).await?;
+        let upstream = tokio::time::timeout(std::time::Duration::from_secs(10), connect_trust_all_tls(upstream, &resolved.tls_server_name)).await.map_err(|_| anyhow!("upstream TLS handshake timed out"))??;
         info!(
             "{conn_id} wrapped forward upstream {} in trust-all TLS",
             resolved.endpoint
