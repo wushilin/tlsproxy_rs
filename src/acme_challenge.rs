@@ -73,7 +73,7 @@ pub struct ChallengeGuard {
 
 impl Drop for ChallengeGuard {
     fn drop(&mut self) {
-        let mut entries = self.registry.inner.lock().expect("challenge lock poisoned");
+        let mut entries = self.registry.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if entries
             .get(&self.domain)
             .is_some_and(|entry| entry.nonce == self.nonce)
@@ -92,7 +92,7 @@ impl ChallengeRegistry {
     ) -> Result<ChallengeGuard> {
         let domain = normalize_domain(domain)?;
         let certificate = Arc::new(make_challenge_certificate(&domain, key_authorization)?);
-        let mut entries = self.inner.lock().expect("challenge lock poisoned");
+        let mut entries = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = entries
             .get(&domain)
             .map_or(1, |entry| entry.nonce.wrapping_add(1));
@@ -113,7 +113,7 @@ impl ChallengeRegistry {
 
     pub fn resolve(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
         let domain = normalize_domain(domain).ok()?;
-        let mut entries = self.inner.lock().expect("challenge lock poisoned");
+        let mut entries = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = entries.get(&domain)?.clone();
         if entry.expires_at <= Instant::now() {
             entries.remove(&domain);
@@ -126,7 +126,7 @@ impl ChallengeRegistry {
         let now = Instant::now();
         self.inner
             .lock()
-            .expect("challenge lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|_, entry| entry.expires_at > now);
     }
 

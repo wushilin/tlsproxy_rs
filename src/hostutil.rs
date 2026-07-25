@@ -10,10 +10,10 @@ pub struct HostAndPort {
 
 lazy_static! {
     static ref SUPPORTED_REGEX_LIST: Arc<Vec<Regex>> = Arc::new(vec![
-        Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*,\s*port\s*=\s*(\d+)\s*$").unwrap(),
-        Regex::new(r"(?i)^\s*(\S+)\s*:\s*(\d+)\s*$").unwrap(),
-        Regex::new(r"(?i)^\s*(\S+)\s*@\s*(\d+)\s*$").unwrap(),
-        Regex::new(r"(?i)^\s*(\S+)\s*\|\s*(\d+)\s*$").unwrap(),
+        Regex::new(r"(?i)^\s*host\s*=\s*(\S+)\s*,\s*port\s*=\s*(\d+)\s*$").expect("hostutil regex is a valid constant"),
+        Regex::new(r"(?i)^\s*(\S+)\s*:\s*(\d+)\s*$").expect("hostutil regex is a valid constant"),
+        Regex::new(r"(?i)^\s*(\S+)\s*@\s*(\d+)\s*$").expect("hostutil regex is a valid constant"),
+        Regex::new(r"(?i)^\s*(\S+)\s*\|\s*(\d+)\s*$").expect("hostutil regex is a valid constant"),
     ]);
 }
 

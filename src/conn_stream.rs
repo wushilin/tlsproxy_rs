@@ -128,10 +128,14 @@ impl<T> ConnStream<T> {
         }
         self.pushback.drain(..self.pushback_offset);
         self.pushback_offset = 0;
-        assert!(
-            self.pushback.len() + bytes.len() <= MAX_PUSHBACK,
-            "stream pushback exceeds {MAX_PUSHBACK} bytes"
-        );
+        // Every caller pushes back a bounded, previously-read artifact (a
+        // ≤64 KiB ClientHello or a ≤256 KiB HTTP head), so this cap cannot be
+        // reached from network input. If a future caller breaks that, accept
+        // the bytes anyway — dropping them would corrupt the stream — and
+        // emit the error loudly instead of panicking.
+        if self.pushback.len() + bytes.len() > MAX_PUSHBACK {
+            log::error!("stream pushback exceeds {MAX_PUSHBACK} bytes; a caller is unreading unbounded data");
+        }
         self.pushback.splice(0..0, bytes.iter().copied());
     }}
 

@@ -61,7 +61,12 @@ async fn run_restartable<F, Fut>(
     restart_senders().write().await.insert(name.clone(), sender);
     let mut socket = Some(socket);
     loop {
-        let active = socket.take().expect("restartable listener socket is bound");
+        // Every path back to the loop top refills the socket; if that
+        // invariant ever breaks, stop this listener instead of panicking.
+        let Some(active) = socket.take() else {
+            log::error!("listener `{name}` lost its socket; it stays down until the next configuration reload");
+            return;
+        };
         tokio::select! {
             _ = run(active, controller.child()) => return,
             _ = restart.recv() => {
@@ -200,7 +205,9 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
     );
     let scheduler = RenewalScheduler::with_timing(
         backend,
-        Duration::from_secs(u64::from(config.acme.scan_interval_hours) * 3600),
+        // validate() rejects zero; the clamp keeps the scheduler constructor's
+        // non-zero contract satisfiable even if a future entry path skips it.
+        Duration::from_secs(u64::from(config.acme.scan_interval_hours).max(1) * 3600),
         crate::acme::scheduler::DEFAULT_RENEWAL_DEADLINE,
     );
     let scheduler_for_routes = scheduler.clone();
@@ -359,7 +366,10 @@ async fn bind(pattern: &str) -> Result<TcpListener> {
             }
         }
     }
-    Err(last.expect("bind attempted").into())
+    match last {
+        Some(cause) => Err(cause.into()),
+        None => Err(anyhow::anyhow!("failed to bind {address}: no attempt was made")),
+    }
 }
 
 async fn run_tls_listener(

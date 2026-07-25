@@ -70,7 +70,13 @@ fn send_to(topic: &str, event: Event) {
         return;
     }
     ensure_topic(topic);
-    let sender = named_queue::acquire_sender::<Event>(topic).expect("topic is registered");
+    let sender = match named_queue::acquire_sender::<Event>(topic) {
+        Ok(sender) => sender,
+        Err(cause) => {
+            log::warn!("event topic `{topic}` unavailable; dropping event: {cause:?}");
+            return;
+        }
+    };
     let _ = sender.send(event);
     senders().write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(topic.to_owned(), sender);
 }
@@ -123,16 +129,18 @@ pub fn transfer_totals(listener: &str) -> Arc<TransferTotals> {
 /// Subscribes to the global (overview) topic. Each call is an independent
 /// broadcast stream; callers must not clone the receiver to fan out (clones
 /// share one subscription) — subscribe again instead.
-pub fn subscribe_global() -> EventReceiver {
+pub fn subscribe_global() -> anyhow::Result<EventReceiver> {
     ensure_topic(GLOBAL_TOPIC);
-    named_queue::acquire_receiver::<Event>(GLOBAL_TOPIC).expect("global topic is registered")
+    named_queue::acquire_receiver::<Event>(GLOBAL_TOPIC)
+        .map_err(|cause| anyhow::anyhow!("global event topic unavailable: {cause:?}"))
 }
 
 /// Subscribes to one listener's topic (its per-connection events + snapshots).
-pub fn subscribe_listener(listener: &str) -> EventReceiver {
+pub fn subscribe_listener(listener: &str) -> anyhow::Result<EventReceiver> {
     let topic = listener_topic(listener);
     ensure_topic(&topic);
-    named_queue::acquire_receiver::<Event>(&topic).expect("listener topic is registered")
+    named_queue::acquire_receiver::<Event>(&topic)
+        .map_err(|cause| anyhow::anyhow!("event topic for listener `{listener}` unavailable: {cause:?}"))
 }
 
 /// Publishes a coarse aggregate to the global (overview) topic.
@@ -311,14 +319,14 @@ mod tests {
 
         // The listener topic's first event is the fine one: the coarse count
         // published earlier went to the global topic only, proving the split.
-        let first = listener.recv_async().await.unwrap();
+        let first = listener.unwrap().recv_async().await.unwrap();
         assert_eq!(first.event_type, CONNECTION_HOST_CHANGED);
         assert_eq!(first.event_payload["connection_id"], "rc1");
 
         // The global topic carries the coarse count. Match by key to ignore
         // events other parallel tests publish to the shared global topic.
         loop {
-            let event = global.recv_async().await.unwrap();
+            let event = global.as_ref().unwrap().recv_async().await.unwrap();
             if event.event_payload["key"] == listener_name {
                 assert_eq!(event.event_type, CONNECTION_COUNT_CHANGED);
                 break;

@@ -71,14 +71,14 @@ lazy_static! {
 
 /// Records a ClientHello random that is about to be forwarded upstream.
 pub fn insert(random: [u8; 32]) {
-    SEEN.lock().unwrap().insert(random, DEFAULT_TTL);
+    SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(random, DEFAULT_TTL);
 }
 
 /// Returns true when this proxy recently forwarded a ClientHello with this
 /// random, meaning the inbound connection is a self-connection loop.
 /// A hit consumes the entry.
 pub fn is_looped(random: &[u8; 32]) -> bool {
-    SEEN.lock().unwrap().is_looped(random)
+    SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_looped(random)
 }
 
 /// Records a request token injected into a proxied plaintext HTTP request.
@@ -92,14 +92,14 @@ pub fn mint_request_token() -> String {
 }
 
 pub fn insert_request_token(token: String) {
-    SEEN_TOKENS.lock().unwrap().insert(token, DEFAULT_TTL);
+    SEEN_TOKENS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(token, DEFAULT_TTL);
 }
 
 /// Returns true when this proxy recently injected this token into an
 /// upstream HTTP request, meaning the inbound request is a self-connection
 /// loop. A hit consumes the entry.
 pub fn request_token_is_looped(token: &str) -> bool {
-    SEEN_TOKENS.lock().unwrap().is_looped(&token.to_owned())
+    SEEN_TOKENS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_looped(&token.to_owned())
 }
 
 #[cfg(test)]

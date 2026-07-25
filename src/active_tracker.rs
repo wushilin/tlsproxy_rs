@@ -277,7 +277,7 @@ mod tests {
         // No global reset here: the tracker is shared process state and a
         // reset wipes entries of concurrently running tests. The assertions
         // use a listener name unique to this test instead.
-        let events = crate::events_hub::subscribe_global();
+        let events = crate::events_hub::subscribe_global().unwrap();
         let request_id = RequestId::new();
         put(&request_id, "events-listener", "127.0.0.1:12345".parse().unwrap());
         let listener_open = next_matching(&events, |payload| payload["key"] == "events-listener" && payload["now"] == 1).await;

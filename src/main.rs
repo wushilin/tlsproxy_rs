@@ -100,7 +100,7 @@ impl Default for RunArgs {
         Self {
             runtime_dir: DEFAULT_RUNTIME_DIR.into(),
             setup_port: None,
-            setup_bind: "127.0.0.1".parse().unwrap(),
+            setup_bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             setup_token: None,
             setup_token_file: None,
         }
@@ -220,7 +220,9 @@ async fn run(args: RunArgs) -> Result<()> {
                     .to_owned(),
             ),
             (None, None) => None,
-            _ => unreachable!("clap enforces setup token conflicts"),
+            (Some(_), Some(_)) => {
+                anyhow::bail!("--setup-token and --setup-token-file are mutually exclusive")
+            }
         };
         let setup = bootstrap::SetupServer::prepare(
             store.clone(),

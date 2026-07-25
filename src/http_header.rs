@@ -287,6 +287,12 @@ impl HttpHead {
         let new_target = if stripped.is_empty() { "/" } else { stripped };
         let head = String::from_utf8_lossy(&self.buffered[..self.head_len]);
         if let Some(line_end) = head.find('\n') {
+            // Lossy decoding can expand invalid bytes, shifting string
+            // indexes past the byte head; a first line that only terminates
+            // there is malformed anyway, so leave the head untouched.
+            if line_end + 1 > self.head_len {
+                return;
+            }
             let first = head[..line_end].trim_end_matches('\r');
             let mut parts = first.split_ascii_whitespace();
             let method = parts.next().unwrap_or(&self.method);
@@ -294,10 +300,13 @@ impl HttpHead {
             let version = parts.next().unwrap_or("HTTP/1.1");
             let ending = if head.as_bytes().get(line_end.wrapping_sub(1)) == Some(&b'\r') { "\r\n" } else { "\n" };
             let mut rebuilt = format!("{method} {new_target} {version}{ending}").into_bytes();
+            // Only the first line changed, so the head terminator moves by
+            // exactly the difference between the new and old first-line
+            // lengths — no re-scan (and no unreachable failure arm) needed.
+            let rebuilt_head_len = rebuilt.len() + (self.head_len - (line_end + 1));
             rebuilt.extend_from_slice(&self.buffered[line_end + 1..]);
             self.buffered = rebuilt;
-            self.head_len = find_head_end(&self.buffered)
-                .expect("rewriting a complete HTTP head preserves its terminator");
+            self.head_len = rebuilt_head_len;
             self.target = new_target.to_string();
         }
     }
@@ -551,7 +560,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for ChunkedBodyReader<R> {
                     line.push(byte);
                 }
             }
-            ChunkedState::Done => unreachable!("Done returns before reading"),
+            // Unreachable: Done returns before reading. Report the message
+            // boundary again instead of forwarding stray bytes.
+            ChunkedState::Done => return Poll::Ready(Ok(())),
         }
         buffer.put_slice(filled);
         Poll::Ready(Ok(()))

@@ -47,7 +47,11 @@ pub fn parse_sans(san: &[String]) -> Result<Vec<SanType>> {
         }
     }
     if sans.is_empty() {
-        sans.push(SanType::DnsName("localhost".try_into().unwrap()));
+        sans.push(SanType::DnsName(
+            "localhost"
+                .try_into()
+                .map_err(|_| anyhow!("`localhost` was rejected as a certificate DNS name"))?,
+        ));
     }
     Ok(sans)
 }

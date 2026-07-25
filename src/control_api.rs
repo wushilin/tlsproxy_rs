@@ -351,6 +351,13 @@ async fn stream_events(socket: WebSocket, listener: Option<String>, state: Contr
         Some(name) => (crate::events_hub::subscribe_listener(name), crate::events_hub::snapshot_listener(name)),
         None => (crate::events_hub::subscribe_global(), crate::events_hub::snapshot_global().await),
     };
+    let receiver = match receiver {
+        Ok(receiver) => receiver,
+        Err(cause) => {
+            log::warn!("event websocket {stream_id} closed: {cause:#}");
+            return;
+        }
+    };
     for event in snapshot {
         let Ok(encoded) = serde_json::to_string(&event) else { continue };
         if let Err(cause) = outgoing.send(Message::Text(encoded.into())).await {

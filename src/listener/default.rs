@@ -186,14 +186,12 @@ pub fn decide(
     ) {
         DefaultRoute::AcmeChallenge { domain } => ConnectionRoute::AcmeChallenge { domain },
         DefaultRoute::ControlPlane { hostname } => ConnectionRoute::ControlPlane { hostname },
-        DefaultRoute::Proxy { sni } => {
-            let action = config
-                .ordinary_traffic
-                .select_route(&sni)
-                .expect("classifier only returns Proxy for an available route")
-                .clone();
-            ConnectionRoute::Ordinary { sni, action }
-        }
+        DefaultRoute::Proxy { sni } => match config.ordinary_traffic.select_route(&sni) {
+            Some(action) => ConnectionRoute::Ordinary { sni, action: action.clone() },
+            // The classifier only returns Proxy for an available route; if
+            // the tables disagree, reject the connection instead of panicking.
+            None => ConnectionRoute::Reject(RejectReason::PolicyDenied),
+        },
         DefaultRoute::Reject(reason) => ConnectionRoute::Reject(reason),
     }
 }

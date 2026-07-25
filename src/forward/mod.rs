@@ -809,11 +809,12 @@ impl rustls::client::danger::ServerCertVerifier for TrustAllVerifier {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
+    // The provider is installed at startup; an empty scheme list fails the
+    // handshake with a TLS error instead of panicking if it ever is not.
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::CryptoProvider::get_default()
-            .expect("rustls crypto provider is installed")
-            .signature_verification_algorithms
-            .supported_schemes()
+            .map(|provider| provider.signature_verification_algorithms.supported_schemes())
+            .unwrap_or_default()
     }
 }
 

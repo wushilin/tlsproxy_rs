@@ -273,7 +273,9 @@ pub fn compress_file(path: &Path, compression: Compression) -> io::Result<()> {
         Compression::Zstd => {
             zstd::stream::copy_encode(input, File::create(&output_path)?, 0)?;
         }
-        Compression::None => unreachable!("extension() returned Some"),
+        // Only reachable if a caller ignores `extension()` returning None;
+        // leave the file untouched rather than delete it uncompressed.
+        Compression::None => return Ok(()),
     }
     fs::remove_file(path)?;
     Ok(())

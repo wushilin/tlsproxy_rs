@@ -71,9 +71,9 @@ pub fn take_last_good() -> Option<StoredConfig> {
 /// and background services. Bind/protocol/start-state or global changes still
 /// use the normal revision reload path.
 pub fn listener_settings_only(old: &RuntimeConfig, new: &RuntimeConfig) -> bool {
-    fn topology(config: &RuntimeConfig) -> serde_json::Value {
-        let mut value = serde_json::to_value(config).expect("runtime config serializes");
-        let object = value.as_object_mut().expect("runtime config is an object");
+    fn topology(config: &RuntimeConfig) -> Option<serde_json::Value> {
+        let mut value = serde_json::to_value(config).ok()?;
+        let object = value.as_object_mut()?;
         if let Some(default) = object.get_mut("default_listener").and_then(|v| v.as_object_mut()) {
             default.remove("ordinary_traffic");
         }
@@ -84,9 +84,14 @@ pub fn listener_settings_only(old: &RuntimeConfig, new: &RuntimeConfig) -> bool 
                 *listener = serde_json::json!({"protocol": protocol, "bind": bind});
             }
         }
-        value
+        Some(value)
     }
-    topology(old) == topology(new)
+    // An unserializable config cannot be proven topology-equal; fall back to
+    // the conservative full reload path.
+    match (topology(old), topology(new)) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

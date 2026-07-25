@@ -77,7 +77,7 @@ impl LocalCa {
 
     pub fn evict_expiring(&self) {
         let now = OffsetDateTime::now_utc();
-        let mut cache = self.inner.cache.lock().expect("CA cache lock poisoned");
+        let mut cache = self.inner.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let expired_keys: Vec<String> = cache
             .iter()
             .filter(|(_, identity)| {
@@ -107,7 +107,7 @@ impl LocalCa {
     }
 
     fn get_cached(&self, key: &str) -> Option<Arc<CertifiedKey>> {
-        let mut cache = self.inner.cache.lock().expect("CA cache lock poisoned");
+        let mut cache = self.inner.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let identity = cache.get(key)?;
         if identity.expires_at - OffsetDateTime::now_utc()
             <= time::Duration::hours(EVICT_WITHIN_HOURS)
@@ -134,7 +134,7 @@ impl LocalCa {
             "certificate cache miss for ad-hoc identity `{cache_key}`; minting new leaf certificate"
         );
         let minted = {
-            let issuer = self.inner.issuer.lock().expect("CA issuer lock poisoned");
+            let issuer = self.inner.issuer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             certificate::mint_leaf(
                 &issuer,
                 &self.inner.ca_chain,
@@ -144,7 +144,7 @@ impl LocalCa {
             )?
         };
         let key = Arc::new(minted.certified_key);
-        let mut cache = self.inner.cache.lock().expect("CA cache lock poisoned");
+        let mut cache = self.inner.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.put(
             cache_key.to_string(),
             CachedIdentity {
