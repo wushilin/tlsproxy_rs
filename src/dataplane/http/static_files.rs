@@ -431,14 +431,82 @@ async fn listing_response<S: AsyncWrite + Unpin>(stream: &mut S, body: &[u8], he
     Ok(())
 }
 
-async fn response<S: AsyncWrite + Unpin>(stream:&mut S,status:u16,content_type:&str,body:&[u8],head_only:bool)->Result<()> { let reason=match status{200=>"OK",400=>"Bad Request",403=>"Forbidden",404=>"Not Found",405=>"Method Not Allowed",500=>"Internal Server Error",_=>"Error"}; let header=format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",body.len()); stream.write_all(header.as_bytes()).await?; if !head_only{stream.write_all(body).await?;} stream.shutdown().await?; Ok(()) }
-fn content_type(path:&Path)->&'static str { match path.extension().and_then(|v|v.to_str()).unwrap_or("").to_ascii_lowercase().as_str(){"html"|"htm"=>"text/html; charset=utf-8","css"=>"text/css; charset=utf-8","js"=>"text/javascript; charset=utf-8","json"=>"application/json","svg"=>"image/svg+xml","png"=>"image/png","jpg"|"jpeg"=>"image/jpeg","gif"=>"image/gif","webp"=>"image/webp","txt"|"md"=>"text/plain; charset=utf-8","pdf"=>"application/pdf",_=>"application/octet-stream"} }
-fn html_escape(value:&str)->String{value.replace('&',"&amp;").replace('<',"&lt;").replace('>',"&gt;").replace('"',"&quot;")}
-fn url_escape(value:&str)->String{value.bytes().map(|b|if b.is_ascii_alphanumeric()||b"-._~".contains(&b){(b as char).to_string()}else{format!("%{b:02X}")}).collect()}
+async fn response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    head_only: bool,
+) -> Result<()> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        _ => "Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    if !head_only {
+        stream.write_all(body).await?;
+    }
+    stream.shutdown().await?;
+    Ok(())
+}
 
-#[cfg(test)] mod tests {
+fn content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn url_escape(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
-    #[test] fn traversal_is_rejected_after_decoding(){assert!(decode_path("../secret").is_err());assert!(decode_path("%2e%2e/secret").is_err());assert!(decode_path("assets/app.js").is_ok());assert!(decode_path("a%00b").is_err());}
+    #[test]
+    fn traversal_is_rejected_after_decoding() {
+        assert!(decode_path("../secret").is_err());
+        assert!(decode_path("%2e%2e/secret").is_err());
+        assert!(decode_path("assets/app.js").is_ok());
+        assert!(decode_path("a%00b").is_err());
+    }
 
     #[test]
     fn range_parsing_covers_bounded_open_and_suffix_forms() {
