@@ -25,25 +25,37 @@ use crate::request_id::RequestId;
 use crate::upstream_tls::connect_trust_all_tls;
 use crate::tls_header::ClientHello;
 
+/// A terminate route already selected by the dispatcher: where the decrypted
+/// bytes go and how the upstream leg is secured.
+pub(crate) struct TerminateRoute {
+    pub target: Option<String>,
+    pub target_port: u16,
+    pub upstream_tls: bool,
+    pub load_balancing: crate::runtime_config::HttpLoadBalancing,
+}
+
+/// The routed form `run_stream` verifies against the completed handshake.
+struct InspectedRoute {
+    expected_sni: String,
+    client_ip: IpAddr,
+    route: TerminateRoute,
+}
+
 /// Terminates a connection whose ClientHello was consumed by the mandatory
 /// listener dispatcher. The buffered bytes are replayed into rustls and the
 /// already-selected route controls both destination and upstream TLS mode.
 pub(crate) async fn run_inspected(
     ctx: crate::dataplane::ConnCtx,
-    listener_config: Arc<RelayPolicy>,
+    policy: Arc<RelayPolicy>,
     ca: LocalCa,
-    client: ConnStream<TcpStream>,
+    mut client: ConnStream<TcpStream>,
     hello: ClientHello,
-    target: Option<String>,
-    target_port: u16,
-    upstream_tls: bool,
-    load_balancing: crate::runtime_config::HttpLoadBalancing,
+    route: TerminateRoute,
     certified_key: Arc<rustls::sign::CertifiedKey>,
 ) -> Result<()> {
-    let crate::dataplane::ConnCtx { name, stats: context, controller, remote } = ctx;
+    let crate::dataplane::ConnCtx { name, stats, controller, remote } = ctx;
     let conn_id = client.request_id();
-    let expected_sni = hello.sni_host.clone();
-    let mut client = client;
+    let inspected = InspectedRoute { expected_sni: hello.sni_host.clone(), client_ip: remote.ip(), route };
     // Restore the peeked ClientHello so the TLS acceptor sees the pristine
     // wire stream.
     client.unread(hello.buffered);
@@ -51,11 +63,11 @@ pub(crate) async fn run_inspected(
         name,
         client,
         conn_id,
-        listener_config,
-        context,
+        policy,
+        stats,
         controller,
         ca,
-        Some((expected_sni, target, target_port, upstream_tls, load_balancing, remote.ip())),
+        Some(inspected),
         Some(certified_key),
     )
     .await
@@ -102,11 +114,11 @@ async fn run_stream<S>(
     name: Arc<String>,
     client: S,
     conn_id: Arc<RequestId>,
-    listener_config: Arc<RelayPolicy>,
-    context: Arc<ListenerStats>,
+    policy: Arc<RelayPolicy>,
+    stats: Arc<ListenerStats>,
     controller: Arc<RwLock<Controller>>,
     ca: LocalCa,
-    route: Option<(String, Option<String>, u16, bool, crate::runtime_config::HttpLoadBalancing, IpAddr)>,
+    route: Option<InspectedRoute>,
     certified_key: Option<Arc<rustls::sign::CertifiedKey>>,
 ) -> Result<()>
 where
@@ -125,7 +137,7 @@ where
         .to_string();
     if route
         .as_ref()
-        .is_some_and(|(expected, ..)| expected != &sni_target)
+        .is_some_and(|inspected| inspected.expected_sni != sni_target)
     {
         return Err(anyhow!("TLS SNI changed between inspection and handshake"));
     }
@@ -133,20 +145,20 @@ where
     active_tracker::set_sni(&conn_id, &sni_target);
     let upstream_tls = route
         .as_ref()
-        .map_or(listener_config.upstream_tls, |(_, _, _, tls, _, _)| *tls);
+        .map_or(policy.upstream_tls, |inspected| inspected.route.upstream_tls);
     let selected = match route.as_ref() {
-        Some((_, target, target_port, _, load_balancing, client_ip)) => crate::forward::select_routed_pool(
+        Some(inspected) => crate::forward::select_routed_pool(
             &name,
             &sni_target,
-            target.as_deref(),
-            *target_port,
+            inspected.route.target.as_deref(),
+            inspected.route.target_port,
             upstream_tls,
-            *client_ip,
-            *load_balancing,
+            inspected.client_ip,
+            inspected.route.load_balancing,
         )
         .await?,
         None => crate::relay::resolve_target(
-            &listener_config,
+            &policy,
             &sni_target,
             upstream_tls,
             &sni_target,
@@ -173,7 +185,7 @@ where
     .await
     .map_err(|_| anyhow!("TLS handshake timed out"))??;
     if upstream_tls {
-        crate::relay::reject_obvious_self_connect(&listener_config, &selected.endpoint, &conn_id)
+        crate::relay::reject_obvious_self_connect(&policy, &selected.endpoint, &conn_id)
             .await?;
     }
     let upstream = tokio::time::timeout(
@@ -192,7 +204,7 @@ where
         );
         let (upstream_read, upstream_write) = tokio::io::split(upstream);
         crate::relay::relay(
-            crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: 0 },
+            crate::relay::RelayContext { id: conn_id, policy, stats, controller, initial_uploaded: 0 },
             client_read,
             client_write,
             upstream_read,
@@ -202,7 +214,7 @@ where
     } else {
         let (upstream_read, upstream_write) = tokio::io::split(upstream);
         crate::relay::relay(
-            crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: 0 },
+            crate::relay::RelayContext { id: conn_id, policy, stats, controller, initial_uploaded: 0 },
             client_read,
             client_write,
             upstream_read,

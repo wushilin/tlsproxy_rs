@@ -48,14 +48,12 @@ pub trait ControlPlaneService: Send + Sync + 'static {
 /// use an ephemeral port without a find-then-bind race.
 pub async fn run(
     listener: tokio::net::TcpListener,
-    _config: Arc<DefaultListenerConfig>,
     control_hostname: Option<String>,
     stats: Arc<ListenerStats>,
     mut listener_controller: Controller,
     ca: LocalCa,
     control_service: Arc<dyn ControlPlaneService>,
     certificate_cache: crate::managed_tls::ManagedCertificateCache,
-    _certificate_fallback: crate::runtime_config::CertificateFallbackPolicy,
 ) -> Result<()> {
     let name = Arc::new(crate::runtime_config::DEFAULT_LISTENER_NAME.to_owned());
     loop {
@@ -228,16 +226,15 @@ pub(crate) async fn dispatch_non_control(
                 warn!("inbound ClientHello was recently forwarded by this proxy; closing self-connection loop");
                 bail!("detected self-connection loop");
             }
-            let limits = crate::dataplane::RelayPolicy::for_tls_route(config, &action);
+            let policy = crate::dataplane::RelayPolicy::for_tls_route(config, &action);
             match action {
                 TlsRouteAction::Passthrough { target_port, target, load_balancing } => {
-                    let client_ip = ctx.remote.ip();
                     crate::dataplane::tls::passthrough::run(
                         ctx,
-                        limits,
+                        policy,
                         client,
                         Some(hello),
-                        Some((target, target_port, load_balancing, client_ip)),
+                        Some(crate::dataplane::tls::passthrough::PassthroughRoute { target, target_port, load_balancing }),
                     )
                     .await
                 }
@@ -253,14 +250,16 @@ pub(crate) async fn dispatch_non_control(
                         .await?;
                     crate::dataplane::tls::terminate::run_inspected(
                         ctx,
-                        limits,
+                        policy,
                         tls.ca,
                         client,
                         hello,
-                        target,
-                        target_port,
-                        upstream == UpstreamTransport::Tls,
-                        load_balancing,
+                        crate::dataplane::tls::terminate::TerminateRoute {
+                            target,
+                            target_port,
+                            upstream_tls: upstream == UpstreamTransport::Tls,
+                            load_balancing,
+                        },
                         certified_key,
                     )
                     .await
@@ -271,7 +270,7 @@ pub(crate) async fn dispatch_non_control(
                         .resolve_with_fallback(&hello.sni_host, &tls.ca, tls.fallback)
                         .await?;
                     crate::dataplane::tls::terminate::run_reverse_proxy(
-                        ctx, limits, client, hello, certified_key, action,
+                        ctx, policy, client, hello, certified_key, action,
                     ).await
                 }
                 TlsRouteAction::Reject => bail!("default-listener route explicitly rejected SNI"),

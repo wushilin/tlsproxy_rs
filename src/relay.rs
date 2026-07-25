@@ -1,6 +1,5 @@
-//! Shared connection admission, target selection, and bidirectional relay.
-//! Listener implementations depend on this layer rather than the legacy
-//! listener lifecycle in `Runner`.
+//! Shared connection admission, target selection, and the bidirectional
+//! byte relay every data-plane backend hands its stream pairs to.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,8 +20,8 @@ use crate::idle_tracker::IdleTracker;
 use crate::listener_stats::ListenerStats;
 use crate::request_id::RequestId;
 
-pub async fn reject_obvious_self_connect(listener: &RelayPolicy, resolved: &str, id: &RequestId) -> Result<()> {
-    let own_bind = crate::bindaddr::resolve_bind_addr(&listener.bind)
+pub async fn reject_obvious_self_connect(policy: &RelayPolicy, resolved: &str, id: &RequestId) -> Result<()> {
+    let own_bind = crate::bindaddr::resolve_bind_addr(&policy.bind)
         .ok()
         .and_then(|value| value.parse::<SocketAddr>().ok());
     let Ok(upstream_addrs) = tokio::net::lookup_host(resolved).await else { return Ok(()); };
@@ -69,8 +68,8 @@ fn upstream_lands_on(
     }
 }
 
-pub async fn resolve_target(listener: &RelayPolicy, sni: &str, upstream_tls: bool, tls_name: &str, id: &RequestId) -> Result<crate::forward::SelectedTarget> {
-    let selected = crate::forward::select_runtime_target(sni, listener.target_port, upstream_tls, tls_name).await?;
+pub async fn resolve_target(policy: &RelayPolicy, sni: &str, upstream_tls: bool, tls_name: &str, id: &RequestId) -> Result<crate::forward::SelectedTarget> {
+    let selected = crate::forward::select_runtime_target(sni, policy.target_port, upstream_tls, tls_name).await?;
     info!("{id} final target: {}", selected.endpoint);
     Ok(selected)
 }
@@ -87,11 +86,11 @@ pub struct RelayContext {
 
 pub async fn relay<CR, CW, UR, UW>(relay_ctx: RelayContext, client_read: CR, client_write: CW, upstream_read: UR, upstream_write: UW) -> Result<()>
 where CR: AsyncRead + Unpin + Send + 'static, CW: AsyncWrite + Unpin + Send + 'static, UR: AsyncRead + Unpin + Send + 'static, UW: AsyncWrite + Unpin + Send + 'static {
-    let RelayContext { id, policy: listener, stats, controller, initial_uploaded } = relay_ctx;
+    let RelayContext { id, policy, stats, controller, initial_uploaded } = relay_ctx;
     let idle = Arc::new(Mutex::new(IdleTracker::new(stats.idle_timeout_ms())));
     let uploaded = Arc::new(AtomicU64::new(initial_uploaded));
     let downloaded = Arc::new(AtomicU64::new(0));
-    let limiter = Limiter::new(listener.speed_limit());
+    let limiter = Limiter::new(policy.speed_limit());
     let upload = pipe(id.clone(), client_read, upstream_write, stats.clone(), idle.clone(), true, uploaded.clone(), controller.clone(), limiter.clone()).await;
     let download = pipe(id.clone(), upstream_read, client_write, stats, idle.clone(), false, downloaded.clone(), controller.clone(), limiter).await;
     // After the request side has finished, a response that makes no progress

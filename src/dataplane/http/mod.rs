@@ -15,7 +15,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use base64::Engine;
 use subtle::ConstantTimeEq;
 
+use crate::accounting::ConnStatus;
+use crate::active_tracker;
+use crate::conn_stream::ConnStream;
 use crate::dataplane::pipeline::{Intercept, Intercepted};
+use crate::dataplane::RelayPolicy;
+use crate::http_header;
+use crate::upstream_tls::connect_trust_all_tls;
 
 /// Interception point for an HTTP connection: its request head. The
 /// continuation stream is the same connection, positioned at the message body
@@ -54,13 +60,6 @@ where
         })
     }
 }
-
-use crate::accounting::ConnStatus;
-use crate::active_tracker;
-use crate::dataplane::RelayPolicy;
-use crate::conn_stream::ConnStream;
-use crate::http_header;
-use crate::upstream_tls::connect_trust_all_tls;
 
 pub(crate) async fn redirect_https<S>(
     mut client: ConnStream<S>,
@@ -113,7 +112,7 @@ where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
 
 pub(crate) async fn run<S>(
     ctx: crate::dataplane::ConnCtx,
-    listener_config: Arc<RelayPolicy>,
+    policy: Arc<RelayPolicy>,
     mut client: ConnStream<S>,
     inspected: Option<http_header::HttpHead>,
     route: Option<(String, crate::runtime_config::HttpRouteAction)>,
@@ -123,7 +122,7 @@ pub(crate) async fn run<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let crate::dataplane::ConnCtx { name, remote: remote_address, stats: context, controller } = ctx;
+    let crate::dataplane::ConnCtx { name, remote: remote_address, stats, controller } = ctx;
     let conn_id = client.request_id();
     info!("{conn_id} {name} http worker started");
     let mut head = match inspected {
@@ -136,7 +135,7 @@ where
         .await?,
     };
     let header_len = admit(&conn_id, &name, &head, expected_sni.as_deref())?;
-    context.increase_uploaded_bytes(header_len);
+    stats.increase_uploaded_bytes(header_len);
     active_tracker::add_uploaded(&conn_id, header_len as u64);
 
     // Path routing may finish the request locally (static files, 401, 404)
@@ -172,7 +171,7 @@ where
         }
     };
     let (selected, upstream_tls, host_header) =
-        match select_backend(&route, &head, remote_address.ip(), &name, &listener_config).await {
+        match select_backend(&route, &head, remote_address.ip(), &name, &policy).await {
             Ok(selected) => selected,
             Err(cause) => {
                 log::warn!("{conn_id} reverse-proxy backend unavailable: {cause:#}");
@@ -181,7 +180,7 @@ where
             }
         };
     active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint);
-    crate::relay::reject_obvious_self_connect(&listener_config, &selected.endpoint, &conn_id).await?;
+    crate::relay::reject_obvious_self_connect(&policy, &selected.endpoint, &conn_id).await?;
     let upstream = match connect_backend(&conn_id, &selected.endpoint).await {
         Some(upstream) => upstream,
         None => {
@@ -194,8 +193,8 @@ where
 
     let relay_ctx = crate::relay::RelayContext {
         id: conn_id,
-        policy: listener_config,
-        stats: context,
+        policy,
+        stats,
         controller,
         initial_uploaded: header_len as u64,
     };

@@ -43,7 +43,7 @@ impl ListenerType {
 
 /// Connection outcome for the CDR. Defaults to `ConnectFailed`; workers
 /// upgrade it to `Ok` once the upstream socket is connected, or mark
-/// `Denied` on ACL rejection.
+/// `Denied` on admission rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnStatus {
     Ok,

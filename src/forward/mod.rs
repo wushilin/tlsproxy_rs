@@ -1,3 +1,7 @@
+//! Backend endpoint groups: registration, DNS-cached resolution, and
+//! per-request selection with round-robin or client-IP-hash balancing.
+//! Active probing and health status views live in [`health`].
+
 use crate::dataplane::RelayPolicy;
 use crate::runtime_config::HttpLoadBalancing;
 use crate::controller::Controller;
@@ -39,33 +43,6 @@ lazy_static! {
         Arc::new(RwLock::new(HashMap::new()));
     static ref HTTP_ROUTE_CURSORS: Arc<RwLock<HashMap<String, u64>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    static ref HEALTH_BINDINGS: Arc<RwLock<Vec<HealthBinding>>> =
-        Arc::new(RwLock::new(Vec::new()));
-}
-
-#[derive(Debug, Clone)]
-struct HealthBinding {
-    group: GroupKey,
-    listener: String,
-    host: String,
-    path: String,
-    backend: String,
-    transport: String,
-    load_balancing: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct HealthCheckTarget {
-    pub listener: String,
-    pub host: String,
-    pub path: String,
-    pub backend: String,
-    pub endpoint: String,
-    pub transport: String,
-    pub load_balancing: String,
-    pub online: Option<bool>,
-    pub since_ms: u128,
-    pub last_checked_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -329,14 +306,6 @@ pub async fn register_forward_listener(
     Ok(())
 }
 
-pub async fn reconcile_forward_listener(
-    listener_name: String,
-    targets: &str,
-    upstream_tls: bool,
-) -> Result<()> {
-    register_forward_listener(listener_name, targets, upstream_tls).await
-}
-
 /// Explicit backends of an http listener, or None when it routes dynamically
 /// by Host header.
 pub fn http_listener_targets(listener: &RelayPolicy) -> Option<String> {
@@ -394,46 +363,12 @@ pub fn parse_http_targets(targets: &str) -> Result<String> {
     Ok(parsed.join(";"))
 }
 
-pub async fn clear_listener(listener_name: &str) {
-    LISTENER_BACKENDS.write().await.remove(listener_name);
-    FORWARD_LISTENERS.write().await.remove(listener_name);
-    prune_unreferenced_configured_groups().await;
-    publish_configured_statuses().await;
-}
-
 pub async fn reset() {
     LISTENER_BACKENDS.write().await.clear();
     FORWARD_LISTENERS.write().await.clear();
     GROUPS.write().await.clear();
     HTTP_ROUTE_CURSORS.write().await.clear();
-    HEALTH_BINDINGS.write().await.clear();
-}
-
-fn matcher_label(matcher: &crate::runtime_config::HostMatcher) -> String {
-    matcher.exact.iter().cloned()
-        .chain(matcher.suffix.iter().map(|value| format!("*.{}", value.trim_start_matches('.'))))
-        .chain(matcher.patterns.iter().map(|value| format!("/{value}/")))
-        .collect::<Vec<_>>().join(", ")
-}
-
-async fn bind_http_action(listener: &str, host: &str, path: &str, action: &crate::runtime_config::HttpRouteAction) -> Result<()> {
-    for backend in &action.backends {
-        let requested = HostAndPort::parse_or_default(&backend.address, action.target_port);
-        let tls = backend.transport == crate::runtime_config::UpstreamTransport::Tls;
-        let tls_name = backend.tls_server_name.clone().unwrap_or_else(|| requested.host().to_string());
-        let group = ensure_group(requested.to_string(), requested.host(), requested.port(), tls, true, tls_name, Owner::Configured).await?;
-        HEALTH_BINDINGS.write().await.push(HealthBinding {
-            group: group.key.clone(), listener: listener.into(), host: host.into(), path: path.into(),
-            backend: backend.address.clone(), transport: if tls { "tls" } else { "plaintext" }.into(),
-            load_balancing: match action.load_balancing { HttpLoadBalancing::RoundRobin => "round_robin", HttpLoadBalancing::ClientIpHash => "client_ip_hash" }.into(),
-        });
-    }
-    for route in &action.paths {
-        if let crate::runtime_config::HttpPathAction::ReverseProxy { action } = &route.action {
-            Box::pin(bind_http_action(listener, host, &route.prefix, action)).await?;
-        }
-    }
-    Ok(())
+    health::HEALTH_BINDINGS.write().await.clear();
 }
 
 pub async fn apply_hot_listener_settings(config: &crate::runtime_config::RuntimeConfig) -> Result<()> {
@@ -448,6 +383,8 @@ pub async fn apply_hot_listener_settings(config: &crate::runtime_config::Runtime
     configure_health_checks(config).await
 }
 
+/// Selects a healthy endpoint from a reverse-proxy route's backend pool.
+/// Legacy target/port routes remain supported when `backends` is empty.
 pub async fn select_http_backend(
     route_key: &str,
     host: &str,
@@ -723,20 +660,6 @@ fn excess_runtime_groups_to_evict(mut runtime_groups: Vec<(GroupKey, u128)>) -> 
         .collect()
 }
 
-async fn prune_unreferenced_configured_groups() {
-    let mut referenced: HashSet<GroupKey> = FORWARD_LISTENERS
-        .read()
-        .await
-        .values()
-        .flat_map(|keys| keys.iter().cloned())
-        .collect();
-    referenced.extend(HEALTH_BINDINGS.read().await.iter().map(|binding| binding.group.clone()));
-    GROUPS
-        .write()
-        .await
-        .retain(|key, group| group.owner == Owner::Runtime || referenced.contains(key));
-}
-
 async fn publish_configured_statuses() {
     let listener_groups = FORWARD_LISTENERS.read().await.clone();
     let groups = GROUPS.read().await;
@@ -886,24 +809,7 @@ fn state_name(online: Option<bool>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[tokio::test]
-    async fn http_probe_accepts_authentication_challenge_as_healthy() {
-        let (mut probe_side, mut backend_side) = tokio::io::duplex(1024);
-        let backend = tokio::spawn(async move {
-            let mut request = [0u8; 1024];
-            let count = backend_side.read(&mut request).await.unwrap();
-            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET / HTTP/1.1\r\n"));
-            backend_side
-                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await
-                .unwrap();
-        });
-
-        assert!(health::probe_http(&mut probe_side, "vpnman.local").await);
-        backend.await.unwrap();
-    }
 
     fn test_group(owner: Owner, target: &str, endpoints: Vec<EndpointState>) -> MonitorGroup {
         MonitorGroup {

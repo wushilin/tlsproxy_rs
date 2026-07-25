@@ -259,14 +259,12 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
     }
 
     let default_idle_ms = config.default_listener.ordinary_traffic.max_idle_time_ms.unwrap_or(u64::MAX);
-    let default_config = Arc::new(config.default_listener.clone());
     let control_hostname = (!config.control_plane.hostname.is_empty())
         .then(|| config.control_plane.hostname.clone());
     let default_bind = config.default_listener.bind.clone();
     let default_child = root.child();
     let default_ca = ca.clone();
     let default_cache = cache.clone();
-    let fallback = config.certificate_fallback;
     drop(root.spawn(async move {
         run_restartable(
             DEFAULT_LISTENER_NAME.to_string(),
@@ -274,7 +272,6 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
             default_listener,
             default_child,
             move |socket, controller| {
-                let config = default_config.clone();
                 let hostname = control_hostname.clone();
                 let ca = default_ca.clone();
                 let service = control_service.clone();
@@ -285,7 +282,7 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
                     let stats = Arc::new(ListenerStats::new(DEFAULT_LISTENER_NAME, default_idle_ms));
                     crate::events_hub::register_listener(&stats).await;
                     if let Err(cause) = crate::listener::default::run(
-                        socket, config, hostname, stats, controller, ca, service, cache, fallback,
+                        socket, hostname, stats, controller, ca, service, cache,
                     )
                     .await
                     {
@@ -434,7 +431,7 @@ async fn run_http_listener(name: String, listener: TcpListener, config: HostRout
             _ => None,
         }).unwrap_or_else(|| config.clone());
         stats.set_idle_timeout_ms(task_config.max_idle_time_ms.unwrap_or(u64::MAX));
-        let task_legacy = Arc::new(RelayPolicy { bind: task_config.bind.clone(), target: None, target_port: 80, speed_limit: task_config.speed_limit, upstream_tls: false });
+        let task_policy = Arc::new(RelayPolicy { bind: task_config.bind.clone(), target: None, target_port: 80, speed_limit: task_config.speed_limit, upstream_tls: false });
         let (task_name, task_stats) = (name.clone(), stats.clone());
         let connection_controller = Arc::new(RwLock::new(controller.child()));
         drop(controller.spawn(async move {
@@ -450,7 +447,7 @@ async fn run_http_listener(name: String, listener: TcpListener, config: HostRout
                 }
                 let route_key = format!("{task_name}:{}", head.host.to_ascii_lowercase());
                 let ctx = crate::dataplane::ConnCtx { name: task_name.clone(), remote, stats: task_stats.clone(), controller: connection_controller };
-                crate::dataplane::http::run(ctx, task_legacy, client, Some(head), Some((route_key, action)), false, None).await?;
+                crate::dataplane::http::run(ctx, task_policy, client, Some(head), Some((route_key, action)), false, None).await?;
                 Ok(())
             }.await;
             if let Err(cause) = &result { warn!("listener {task_name} connection failed: {cause:#}"); }
@@ -463,7 +460,7 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
     crate::events_hub::register_listener(&stats).await;
     let load_balancing = config.load_balancing;
     let configured_idle_ms = config.max_idle_time_ms;
-    let legacy = Arc::new(RelayPolicy { bind: config.bind, target: Some(config.targets), target_port: 0, speed_limit: config.speed_limit, upstream_tls: config.upstream_tls });
+    let policy = Arc::new(RelayPolicy { bind: config.bind, target: Some(config.targets), target_port: 0, speed_limit: config.speed_limit, upstream_tls: config.upstream_tls });
     let name = Arc::new(name);
     loop {
         let Ok((socket, remote)) = listener.accept().await else { continue };
@@ -473,13 +470,13 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
         let live_forward = live.additional_listeners.get(name.as_str()).and_then(|listener| match listener { AdditionalListenerConfig::Forward(config) => Some(config), _ => None });
         let task_load_balancing = live_forward.map(|config| config.load_balancing).unwrap_or(load_balancing);
         stats.set_idle_timeout_ms(live_forward.map(|config| config.max_idle_time_ms).unwrap_or(configured_idle_ms).unwrap_or(u64::MAX));
-        let task_legacy = live_forward.map(|config| Arc::new(RelayPolicy { bind: config.bind.clone(), target: Some(config.targets.clone()), target_port: 0, speed_limit: config.speed_limit, upstream_tls: config.upstream_tls })).unwrap_or_else(|| legacy.clone());
+        let task_policy = live_forward.map(|config| Arc::new(RelayPolicy { bind: config.bind.clone(), target: Some(config.targets.clone()), target_port: 0, speed_limit: config.speed_limit, upstream_tls: config.upstream_tls })).unwrap_or_else(|| policy.clone());
         let (task_name, task_stats) = (name.clone(), stats.clone());
         let connection_controller = Arc::new(RwLock::new(controller.child()));
         drop(controller.spawn(async move {
             let _guard = crate::dataplane::ConnGuard::start(request_id.clone(), task_name.clone(), remote, task_stats.clone(), ListenerType::PortForward);
             crate::active_tracker::set_listener_type(&request_id, ListenerType::PortForward);
-            if let Err(cause) = crate::dataplane::l4::run(task_name.clone(), client, task_legacy, task_stats.clone(), connection_controller, remote.ip(), task_load_balancing).await {
+            if let Err(cause) = crate::dataplane::l4::run(crate::dataplane::ConnCtx { name: task_name.clone(), remote, stats: task_stats.clone(), controller: connection_controller }, task_policy, client, task_load_balancing).await {
                 warn!("listener {task_name} connection failed: {cause:#}");
             }
         }));

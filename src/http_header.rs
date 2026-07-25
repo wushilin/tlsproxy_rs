@@ -306,10 +306,6 @@ impl HttpHead {
     /// the first request: the client is appended to `X-Forwarded-For` and
     /// `Forwarded`, while `X-Forwarded-Host` and `X-Forwarded-Proto` are set
     /// to this hop's values. Bytes past the header block pass through as-is.
-    pub fn with_forwarded_headers(&self, client_ip: IpAddr) -> Vec<u8> {
-        self.rewrite_for_proxy(client_ip, "http", None, &crate::hello_cache::mint_request_token())
-    }
-
     /// Pure rewrite: mint the loop token via
     /// `hello_cache::mint_request_token` and pass it in; this function only
     /// formats bytes and never touches process-wide state.
@@ -677,7 +673,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let rewritten = head.with_forwarded_headers("192.0.2.7".parse::<IpAddr>().unwrap());
+        let rewritten = head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None, &crate::hello_cache::mint_request_token());
         let text = String::from_utf8(rewritten).unwrap();
         assert!(text.starts_with("GET /path HTTP/1.1\r\n"));
         assert!(text.contains("Host: app.example:8080\r\n"));
@@ -697,7 +693,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(head.loop_tokens, vec!["feedface".to_string()]);
-        let rewritten = String::from_utf8(head.with_forwarded_headers("192.0.2.7".parse::<IpAddr>().unwrap())).unwrap();
+        let rewritten = String::from_utf8(head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None, &crate::hello_cache::mint_request_token())).unwrap();
         // the upstream hop's token is preserved so the originating instance
         // can still recognize it in a multi-instance loop
         assert!(rewritten.contains("X-Tlsproxy-Rid: feedface\r\n"));
@@ -755,7 +751,7 @@ mod tests {
         let head = parse("POST / HTTP/1.1\r\nHost: v6.example\r\nContent-Length: 4\r\n\r\nbody")
             .await
             .unwrap();
-        let rewritten = head.with_forwarded_headers("2001:db8::1".parse::<IpAddr>().unwrap());
+        let rewritten = head.rewrite_for_proxy("2001:db8::1".parse::<IpAddr>().unwrap(), "http", None, &crate::hello_cache::mint_request_token());
         let text = String::from_utf8(rewritten).unwrap();
         assert!(text.contains("X-Forwarded-For: 2001:db8::1\r\n"));
         assert!(text.contains("Forwarded: for=\"[2001:db8::1]\";host=v6.example;proto=http\r\n"));

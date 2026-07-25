@@ -5,6 +5,64 @@
 
 use super::*;
 
+lazy_static! {
+    pub(super) static ref HEALTH_BINDINGS: Arc<RwLock<Vec<HealthBinding>>> =
+        Arc::new(RwLock::new(Vec::new()));
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct HealthBinding {
+    pub(super) group: GroupKey,
+    listener: String,
+    host: String,
+    path: String,
+    backend: String,
+    transport: String,
+    load_balancing: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthCheckTarget {
+    pub listener: String,
+    pub host: String,
+    pub path: String,
+    pub backend: String,
+    pub endpoint: String,
+    pub transport: String,
+    pub load_balancing: String,
+    pub online: Option<bool>,
+    pub since_ms: u128,
+    pub last_checked_ms: u128,
+}
+
+fn matcher_label(matcher: &crate::runtime_config::HostMatcher) -> String {
+    matcher.exact.iter().cloned()
+        .chain(matcher.suffix.iter().map(|value| format!("*.{}", value.trim_start_matches('.'))))
+        .chain(matcher.patterns.iter().map(|value| format!("/{value}/")))
+        .collect::<Vec<_>>().join(", ")
+}
+
+async fn bind_http_action(listener: &str, host: &str, path: &str, action: &crate::runtime_config::HttpRouteAction) -> Result<()> {
+    for backend in &action.backends {
+        let requested = HostAndPort::parse_or_default(&backend.address, action.target_port);
+        let tls = backend.transport == crate::runtime_config::UpstreamTransport::Tls;
+        let tls_name = backend.tls_server_name.clone().unwrap_or_else(|| requested.host().to_string());
+        let group = ensure_group(requested.to_string(), requested.host(), requested.port(), tls, true, tls_name, Owner::Configured).await?;
+        HEALTH_BINDINGS.write().await.push(HealthBinding {
+            group: group.key.clone(), listener: listener.into(), host: host.into(), path: path.into(),
+            backend: backend.address.clone(), transport: if tls { "tls" } else { "plaintext" }.into(),
+            load_balancing: match action.load_balancing { HttpLoadBalancing::RoundRobin => "round_robin", HttpLoadBalancing::ClientIpHash => "client_ip_hash" }.into(),
+        });
+    }
+    for route in &action.paths {
+        if let crate::runtime_config::HttpPathAction::ReverseProxy { action } = &route.action {
+            Box::pin(bind_http_action(listener, host, &route.prefix, action)).await?;
+        }
+    }
+    Ok(())
+}
+
+
 pub async fn configure_health_checks(config: &crate::runtime_config::RuntimeConfig) -> Result<()> {
     HEALTH_BINDINGS.write().await.clear();
     for route in &config.default_listener.ordinary_traffic.routes {
@@ -52,8 +110,8 @@ pub async fn health_check_targets() -> Vec<HealthCheckTarget> {
     values
 }
 
-/// Selects a healthy endpoint from a reverse-proxy route's backend pool.
-/// Legacy target/port routes remain supported when `backends` is empty.
+/// Spawns the background probe loop that keeps every registered endpoint
+/// group's online/offline state fresh and persists status samples.
 pub fn spawn_global_health_checks(controller: &mut Controller, store: crate::store::Store) {
     let health_controller = controller.child();
     controller.spawn(async move {
@@ -61,7 +119,7 @@ pub fn spawn_global_health_checks(controller: &mut Controller, store: crate::sto
     });
 }
 
-pub async fn check_all_once(check_controller: &mut Controller, store: &crate::store::Store) {
+async fn check_all_once(check_controller: &mut Controller, store: &crate::store::Store) {
     evict_expired_runtime_groups().await;
     evict_excess_runtime_groups().await;
     let groups: Vec<_> = GROUPS.read().await.values().cloned().collect();
@@ -143,15 +201,6 @@ async fn check_jobs(jobs: Vec<(Arc<MonitorGroup>, String)>, check_controller: &m
     publish_configured_statuses().await;
 }
 
-pub async fn statuses(listener_name: &str) -> Vec<BackendStatusSerde> {
-    LISTENER_BACKENDS
-        .read()
-        .await
-        .get(listener_name)
-        .cloned()
-        .unwrap_or_default()
-}
-
 async fn probe(endpoint: &str, upstream_tls: bool, http_health: bool, tls_server_name: &str) -> bool {
     let mut stream = match TcpStream::connect(endpoint).await {
         Ok(stream) => stream,
@@ -188,3 +237,25 @@ pub(super) async fn probe_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite +
     (100..500).contains(&status)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn http_probe_accepts_authentication_challenge_as_healthy() {
+        let (mut probe_side, mut backend_side) = tokio::io::duplex(1024);
+        let backend = tokio::spawn(async move {
+            let mut request = [0u8; 1024];
+            let count = backend_side.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET / HTTP/1.1\r\n"));
+            backend_side
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        assert!(probe_http(&mut probe_side, "vpnman.local").await);
+        backend.await.unwrap();
+    }
+}

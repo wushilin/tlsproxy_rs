@@ -1,31 +1,26 @@
 //! Raw layer-4 forwarding handler for non-system listeners.
 
 use std::sync::Arc;
-use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use log::info;
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
 
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
 use crate::dataplane::RelayPolicy;
-use crate::controller::Controller;
 use crate::conn_stream::ConnStream;
-use crate::listener_stats::ListenerStats;
 use crate::upstream_tls::connect_trust_all_tls;
 
 pub(crate) async fn run(
-    name: Arc<String>,
+    ctx: crate::dataplane::ConnCtx,
+    policy: Arc<RelayPolicy>,
     client: ConnStream<TcpStream>,
-    listener_config: Arc<RelayPolicy>,
-    context: Arc<ListenerStats>,
-    controller: Arc<RwLock<Controller>>,
-    client_ip: IpAddr,
     load_balancing: crate::runtime_config::HttpLoadBalancing,
 ) -> Result<()> {
+    let crate::dataplane::ConnCtx { name, stats, controller, remote } = ctx;
+    let client_ip = remote.ip();
     let conn_id = client.request_id();
     info!("{conn_id} {name} forward worker started");
     let resolved = crate::forward::choose_online(&name, client_ip, load_balancing)
@@ -36,7 +31,7 @@ pub(crate) async fn run(
     // bytes, so a self-pointing target amplifies connections unboundedly
     // (accept -> connect -> accept -> ...). Loop markers cannot exist in an
     // opaque byte stream, so the address check is the only guard here.
-    crate::relay::reject_obvious_self_connect(&listener_config, &resolved.endpoint, &conn_id).await?;
+    crate::relay::reject_obvious_self_connect(&policy, &resolved.endpoint, &conn_id).await?;
     let upstream = tokio::time::timeout(
         Duration::from_secs(5),
         TcpStream::connect(&resolved.endpoint),
@@ -45,7 +40,7 @@ pub(crate) async fn run(
     info!("{conn_id} connected to forward upstream {}", resolved.endpoint);
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(client);
-    if listener_config.upstream_tls {
+    if policy.upstream_tls {
         let upstream = connect_trust_all_tls(upstream, &resolved.tls_server_name).await?;
         info!(
             "{conn_id} wrapped forward upstream {} in trust-all TLS",
@@ -53,7 +48,7 @@ pub(crate) async fn run(
         );
         let (upstream_read, upstream_write) = tokio::io::split(upstream);
         crate::relay::relay(
-            crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: 0 },
+            crate::relay::RelayContext { id: conn_id, policy: policy, stats, controller, initial_uploaded: 0 },
             client_read,
             client_write,
             upstream_read,
@@ -63,7 +58,7 @@ pub(crate) async fn run(
     } else {
         let (upstream_read, upstream_write) = tokio::io::split(upstream);
         crate::relay::relay(
-            crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: 0 },
+            crate::relay::RelayContext { id: conn_id, policy: policy, stats, controller, initial_uploaded: 0 },
             client_read,
             client_write,
             upstream_read,

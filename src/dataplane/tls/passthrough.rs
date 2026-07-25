@@ -4,7 +4,6 @@
 //! not know about the control hostname or ACME ALPN.
 
 use std::sync::Arc;
-use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -19,14 +18,21 @@ use crate::conn_stream::ConnStream;
 use crate::hello_cache;
 use crate::tls_header::{self, ClientHello};
 
+/// A passthrough route already selected by the dispatcher.
+pub(crate) struct PassthroughRoute {
+    pub target: Option<String>,
+    pub target_port: u16,
+    pub load_balancing: crate::runtime_config::HttpLoadBalancing,
+}
+
 pub(crate) async fn run(
     ctx: crate::dataplane::ConnCtx,
-    listener_config: Arc<RelayPolicy>,
+    policy: Arc<RelayPolicy>,
     mut client: ConnStream<TcpStream>,
     inspected: Option<ClientHello>,
-    route_target: Option<(Option<String>, u16, crate::runtime_config::HttpLoadBalancing, IpAddr)>,
+    route: Option<PassthroughRoute>,
 ) -> Result<()> {
-    let crate::dataplane::ConnCtx { name, stats: context, controller, remote: _ } = ctx;
+    let crate::dataplane::ConnCtx { name, stats, controller, remote } = ctx;
     let conn_id = client.request_id();
     info!("{conn_id} {name} passthrough worker started");
     let client_hello = match inspected {
@@ -48,24 +54,24 @@ pub(crate) async fn run(
     let sni_target = client_hello.sni_host;
     info!("{conn_id} sni target is {sni_target}");
     active_tracker::set_sni(&conn_id, &sni_target);
-    context.increase_uploaded_bytes(header_len);
+    stats.increase_uploaded_bytes(header_len);
     active_tracker::add_uploaded(&conn_id, header_len as u64);
-    let selected = match route_target {
-        Some((target, target_port, load_balancing, client_ip)) => {
+    let selected = match route {
+        Some(route) => {
             crate::forward::select_routed_pool(
                 &name,
                 &sni_target,
-                target.as_deref(),
-                target_port,
+                route.target.as_deref(),
+                route.target_port,
                 true,
-                client_ip,
-                load_balancing,
+                remote.ip(),
+                route.load_balancing,
             )
             .await?
         }
         None => {
             crate::relay::resolve_target(
-                &listener_config,
+                &policy,
                 &sni_target,
                 true,
                 &sni_target,
@@ -87,7 +93,7 @@ pub(crate) async fn run(
     let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
     upstream_write.write_all(&client_hello.buffered).await?;
     crate::relay::relay(
-        crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: header_len as u64 },
+        crate::relay::RelayContext { id: conn_id, policy, stats, controller, initial_uploaded: header_len as u64 },
         client_read,
         client_write,
         upstream_read,

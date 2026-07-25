@@ -667,3 +667,30 @@ impl Store {
             .context("certificate generation database task failed")?
     }
 }
+
+/// Serializes managed-certificate check-then-write sequences within this
+/// process; RocksDB batches are atomic but not conditional.
+fn certificate_gate() -> &'static std::sync::Mutex<()> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn automatic_domain_is_in_use(config: &RuntimeConfig, domain: &str) -> bool {
+    use crate::runtime_config::{AdditionalListenerConfig, TlsRouteAction};
+    let terminating = |action: &TlsRouteAction| matches!(action, TlsRouteAction::Terminate { .. } | TlsRouteAction::ReverseProxy { .. });
+    let normalized_hostname = normalize_domain(&config.control_plane.hostname);
+    if normalize_domain(domain).is_ok_and(|domain| normalized_hostname.is_ok_and(|hostname| hostname == domain)) { return true; }
+    if config.default_listener.ordinary_traffic.routes.iter().any(|route| route.matcher.matches(domain) && terminating(&route.action)) { return true; }
+    config.additional_listeners.values().any(|listener| match listener {
+        AdditionalListenerConfig::Tls(listener) => listener.routing.routes.iter().any(|route| route.matcher.matches(domain) && terminating(&route.action)),
+        _ => false,
+    })
+}
+
+fn generation_key(certificate_id: &str, generation_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(certificate_id.len() + generation_id.len() + 1);
+    key.extend_from_slice(certificate_id.as_bytes());
+    key.push(0);
+    key.extend_from_slice(generation_id.as_bytes());
+    key
+}
