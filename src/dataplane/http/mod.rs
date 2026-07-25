@@ -224,14 +224,14 @@ where
     info!("{conn_id} connected to http upstream {}", selected.endpoint);
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let upgrade = head.upgrade_requested();
-    let (client_read, mut client_write) = tokio::io::split(client);
     let prefix = head.body_prefix().to_vec();
     let mut rewritten = head.rewrite_for_proxy(remote_address.ip(), if client_tls { "https" } else { "http" }, host_header);
     // rewrite_for_proxy appends the buffered body prefix; the body is instead
-    // delivered through the framing-bounded reader below.
+    // restored onto the stream and delivered through the framing-bounded
+    // reader below.
     rewritten.truncate(rewritten.len() - prefix.len());
-    let body_start = std::io::Cursor::new(prefix);
-    let base_read = tokio::io::AsyncReadExt::chain(body_start, client_read);
+    client.unread(&prefix);
+    let (base_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, mut upstream_write): (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>) = if upstream_tls {
         let upstream = connect_trust_all_tls(upstream, &selected.tls_server_name).await?;
         let (read, write) = tokio::io::split(upstream);

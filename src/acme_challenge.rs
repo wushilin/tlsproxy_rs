@@ -65,8 +65,9 @@ where
 }
 
 /// Replays bytes consumed during protocol inspection before reading from the
-/// underlying stream. The default listener uses this for both ACME and normal
-/// TLS termination so a ClientHello is inspected exactly once at its edge.
+/// underlying stream. Only `accept_buffered` still needs this generic
+/// wrapper; interception layers on `Extensible` streams use
+/// `Extensible::unread` instead.
 pub(crate) struct ReplayStream<S> {
     prefix: std::io::Cursor<Vec<u8>>,
     inner: S,

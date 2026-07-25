@@ -272,10 +272,13 @@ pub(crate) async fn dispatch_non_control(
                         .await?;
                     let sni = hello.sni_host.clone();
                     let request_id = client.request_id();
-                    let replay = crate::acme_challenge::ReplayStream::new(hello.buffered, client);
+                    let mut client = client;
+                    // Restore the peeked ClientHello so the TLS acceptor sees
+                    // the pristine wire stream.
+                    client.unread(hello.buffered);
                     let acceptor = tokio_rustls::LazyConfigAcceptor::new(
                         rustls::server::Acceptor::default(),
-                        replay,
+                        client,
                     );
                     let start = tokio::time::timeout(Duration::from_secs(5), acceptor).await??;
                     let mut server = rustls::ServerConfig::builder()

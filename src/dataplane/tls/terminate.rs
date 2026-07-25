@@ -42,10 +42,13 @@ pub(crate) async fn run_inspected(
     let crate::dataplane::ConnCtx { name, stats: context, controller, remote } = ctx;
     let conn_id = client.request_id();
     let expected_sni = hello.sni_host.clone();
-    let replay = crate::acme_challenge::ReplayStream::new(hello.buffered, client);
+    let mut client = client;
+    // Restore the peeked ClientHello so the TLS acceptor sees the pristine
+    // wire stream.
+    client.unread(hello.buffered);
     run_stream(
         name,
-        replay,
+        client,
         conn_id,
         listener_config,
         context,

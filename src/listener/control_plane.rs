@@ -51,10 +51,13 @@ impl AxumControlPlaneService {
                 certified_key,
             )));
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let replay = crate::acme_challenge::ReplayStream::new(hello.buffered, client);
+        let mut client = client;
+        // Restore the peeked ClientHello so the TLS acceptor sees the
+        // pristine wire stream.
+        client.unread(hello.buffered);
         let acceptor = tokio_rustls::LazyConfigAcceptor::new(
             rustls::server::Acceptor::default(),
-            replay,
+            client,
         );
         let start = tokio::time::timeout(Duration::from_secs(5), acceptor)
             .await
