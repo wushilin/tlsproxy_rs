@@ -200,6 +200,29 @@ pub enum BodyFraming {
 impl HttpHead {
     pub fn consume_authorization(&mut self) { self.strip_authorization = true; }
 
+    /// True when the request asks to switch protocols: `Connection` lists the
+    /// `upgrade` token and an `Upgrade` header names the target protocol
+    /// (for example WebSocket).
+    pub fn upgrade_requested(&self) -> bool {
+        self.header_value("connection")
+            .is_some_and(|value| value.split(',').any(|token| token.trim().eq_ignore_ascii_case("upgrade")))
+            && self.header_value("upgrade").is_some()
+    }
+
+    /// Returns the value of the first header with the given name
+    /// (case-insensitive), trimmed of surrounding whitespace.
+    pub fn header_value(&self, name: &str) -> Option<String> {
+        let head = String::from_utf8_lossy(&self.buffered[..self.head_len]);
+        for line in head.lines().skip(1) {
+            if let Some((key, value)) = line.split_once(':') {
+                if key.trim().eq_ignore_ascii_case(name) {
+                    return Some(value.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+
     /// Bytes read past the request head (the start of the body, and possibly
     /// pipelined data beyond it).
     pub fn body_prefix(&self) -> &[u8] { &self.buffered[self.head_len..] }
@@ -378,8 +401,16 @@ impl HttpHead {
         push_header("X-Tlsproxy-Rid", &loop_token);
         // The current data plane selects a path backend once per connection.
         // Closing after the response guarantees every subsequent request is
-        // independently routed, including clients that otherwise use keep-alive.
-        push_header("Connection", "close");
+        // independently routed, including clients that otherwise use
+        // keep-alive. An Upgrade request is the exception: it must keep the
+        // upgrade intent on the wire or the upstream would refuse the
+        // protocol switch, and after a successful switch the connection is a
+        // tunnel, not a request stream.
+        if self.upgrade_requested() {
+            push_header("Connection", "upgrade");
+        } else {
+            push_header("Connection", "close");
+        }
         if let Some(host) = upstream_host {
             push_header("Host", host);
         }
@@ -521,6 +552,27 @@ mod tests {
             DEFAULT_MAX_HTTP_HEADER_SIZE,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn upgrade_requests_keep_upgrade_intent_in_the_rewritten_head() {
+        let head = parse(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: abc\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert!(head.upgrade_requested());
+        let rewritten = String::from_utf8(head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "https", None)).unwrap();
+        assert!(rewritten.contains("Connection: upgrade\r\n"));
+        assert!(!rewritten.contains("Connection: close"));
+        assert!(rewritten.contains("Upgrade: websocket\r\n"));
+        assert!(rewritten.contains("Sec-WebSocket-Key: abc\r\n"));
+
+        let plain = parse("GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n").await.unwrap();
+        // Upgrade without the Connection token is not an upgrade request.
+        assert!(!plain.upgrade_requested());
+        let rewritten = String::from_utf8(plain.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None)).unwrap();
+        assert!(rewritten.contains("Connection: close\r\n"));
     }
 
     #[tokio::test]

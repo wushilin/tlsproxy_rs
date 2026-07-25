@@ -223,37 +223,119 @@ where
     };
     info!("{conn_id} connected to http upstream {}", selected.endpoint);
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
-    let (client_read, client_write) = tokio::io::split(client);
+    let upgrade = head.upgrade_requested();
+    let (client_read, mut client_write) = tokio::io::split(client);
     let prefix = head.body_prefix().to_vec();
     let mut rewritten = head.rewrite_for_proxy(remote_address.ip(), if client_tls { "https" } else { "http" }, host_header);
     // rewrite_for_proxy appends the buffered body prefix; the body is instead
     // delivered through the framing-bounded reader below.
     rewritten.truncate(rewritten.len() - prefix.len());
     let body_start = std::io::Cursor::new(prefix);
+    let base_read = tokio::io::AsyncReadExt::chain(body_start, client_read);
+    let (mut upstream_read, mut upstream_write): (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>) = if upstream_tls {
+        let upstream = connect_trust_all_tls(upstream, &selected.tls_server_name).await?;
+        let (read, write) = tokio::io::split(upstream);
+        (Box::new(read), Box::new(write))
+    } else {
+        let (read, write) = tokio::io::split(upstream);
+        (Box::new(read), Box::new(write))
+    };
+    upstream_write.write_all(&rewritten).await?;
+
+    if upgrade {
+        // An Upgrade request (for example WebSocket) is decided by the
+        // upstream's response head: `101 Switching Protocols` turns the
+        // connection into an unbounded bidirectional tunnel. Any other
+        // status keeps the normal framing-bounded relay so a refused
+        // upgrade cannot be used to push further, unrouted requests.
+        let response_head = match read_response_head(&mut upstream_read).await {
+            Ok(head) => head,
+            Err(cause) => {
+                log::warn!("{conn_id} upstream upgrade response failed: {cause:#}");
+                bad_gateway_split(&mut client_write).await?;
+                return Ok(());
+            }
+        };
+        context.increase_downloaded_bytes(response_head.len());
+        active_tracker::add_downloaded(&conn_id, response_head.len() as u64);
+        client_write.write_all(&response_head).await?;
+        if response_status(&response_head) == Some(101) {
+            info!("{conn_id} upgrade accepted by upstream; relaying as a bidirectional tunnel");
+            return crate::relay::relay(conn_id, base_read, client_write, upstream_read, upstream_write, listener_config, context, controller, header_len as u64).await;
+        }
+    }
+
     let client_read: Box<dyn AsyncRead + Send + Unpin> = match framing {
         crate::http_header::BodyFraming::Length(length) => {
-            Box::new(tokio::io::AsyncReadExt::take(tokio::io::AsyncReadExt::chain(body_start, client_read), length))
+            Box::new(tokio::io::AsyncReadExt::take(base_read, length))
         }
         crate::http_header::BodyFraming::Chunked => {
-            Box::new(crate::http_header::ChunkedBodyReader::new(tokio::io::AsyncReadExt::chain(body_start, client_read)))
+            Box::new(crate::http_header::ChunkedBodyReader::new(base_read))
         }
     };
-    if upstream_tls {
-        let upstream = connect_trust_all_tls(upstream, &selected.tls_server_name).await?;
-        let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
-        upstream_write.write_all(&rewritten).await?;
-        crate::relay::relay(conn_id, client_read, client_write, upstream_read, upstream_write, listener_config, context, controller, header_len as u64).await
-    } else {
-        let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
-        upstream_write.write_all(&rewritten).await?;
-        crate::relay::relay(conn_id, client_read, client_write, upstream_read, upstream_write, listener_config, context, controller, header_len as u64).await
+    crate::relay::relay(conn_id, client_read, client_write, upstream_read, upstream_write, listener_config, context, controller, header_len as u64).await
+}
+
+/// Reads an HTTP response head (through the blank line) from the upstream,
+/// returning every byte read — including any body bytes that arrived in the
+/// same segments — so the caller can forward them verbatim.
+async fn read_response_head<R: AsyncRead + Send + Unpin>(upstream: &mut R) -> Result<Vec<u8>> {
+    const MAX_RESPONSE_HEAD: usize = 64 * 1024;
+    let mut buffer = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = tokio::time::timeout(Duration::from_secs(30), tokio::io::AsyncReadExt::read(upstream, &mut chunk))
+            .await
+            .map_err(|_| anyhow!("upstream response head timed out"))??;
+        if count == 0 {
+            anyhow::bail!("upstream closed before sending a response head");
+        }
+        buffer.extend_from_slice(&chunk[..count]);
+        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(buffer);
+        }
+        if buffer.len() > MAX_RESPONSE_HEAD {
+            anyhow::bail!("upstream response head exceeds {MAX_RESPONSE_HEAD} bytes");
+        }
     }
+}
+
+fn response_status(head: &[u8]) -> Option<u16> {
+    let first_line = head.split(|byte| *byte == b'\n').next()?;
+    let text = std::str::from_utf8(first_line).ok()?;
+    if !text.starts_with("HTTP/1.") { return None; }
+    text.split_ascii_whitespace().nth(1)?.parse().ok()
+}
+
+async fn bad_gateway_split<W: AsyncWrite + Unpin>(client: &mut W) -> Result<()> {
+    client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\n\r\nBad Gateway\n").await?;
+    client.shutdown().await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn upgrade_response_head_is_read_through_blank_line_with_early_body_bytes() {
+        let (mut upstream, mut proxy_side) = tokio::io::duplex(2048);
+        upstream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n\x81\x05hello")
+            .await
+            .unwrap();
+        let head = read_response_head(&mut proxy_side).await.unwrap();
+        assert_eq!(response_status(&head), Some(101));
+        // Bytes past the blank line (an early WebSocket frame) ride along.
+        assert!(head.ends_with(b"\x81\x05hello"));
+
+        let (mut upstream, mut proxy_side) = tokio::io::duplex(2048);
+        upstream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        let head = read_response_head(&mut proxy_side).await.unwrap();
+        assert_eq!(response_status(&head), Some(400));
+        assert_eq!(response_status(b"garbage\r\n\r\n"), None);
+    }
 
     #[tokio::test]
     async fn head_intercept_yields_head_and_keeps_body_prefix() {
