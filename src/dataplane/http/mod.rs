@@ -135,20 +135,12 @@ where
         )
         .await?,
     };
-    if head.loop_tokens.iter().any(|token| crate::hello_cache::request_token_is_looped(token)) {
-        log::warn!("{conn_id} {name} inbound request carries a loop token this proxy recently forwarded; closing self-connection loop");
-        return Err(anyhow!("detected self-connection loop"));
-    }
-    // Count only the request head here; buffered body-prefix bytes are
-    // counted by the relay pipe when the framing-bounded reader replays them.
-    let header_len = head.buffered.len() - head.body_prefix().len();
-    if expected_sni.as_deref().is_some_and(|sni| !sni.trim_end_matches('.').eq_ignore_ascii_case(head.host.trim_end_matches('.'))) {
-        return Err(anyhow!("HTTPS SNI `{}` does not match HTTP Host `{}`", expected_sni.unwrap_or_default(), head.host));
-    }
-    info!("{conn_id} http host is {}", head.host_raw);
-    active_tracker::set_sni(&conn_id, &head.host);
+    let header_len = admit(&conn_id, &name, &head, expected_sni.as_deref())?;
     context.increase_uploaded_bytes(header_len);
     active_tracker::add_uploaded(&conn_id, header_len as u64);
+
+    // Path routing may finish the request locally (static files, 401, 404)
+    // or refine the route to a per-path backend pool.
     let mut route = route;
     if let Some((_, host_action)) = &route {
         if let Some(path_route) = host_action.select_path(&head.target).cloned() {
@@ -166,7 +158,8 @@ where
             return crate::dataplane::http::static_files::not_found(client, head.method == "HEAD").await;
         }
     }
-    // Only the first request's head has passed authentication, ACL, and path
+
+    // Only the first request's head has passed authentication and path
     // routing, so only that request's body may be relayed. Determining the
     // body's wire framing up front lets the upload side end exactly at the
     // message boundary; pipelined bytes beyond it are never forwarded.
@@ -178,51 +171,135 @@ where
             return Ok(());
         }
     };
-    let selected_result: Result<_> = async {
-        Ok(if let Some((route_key, action)) = &route {
-            let (selected, tls) = crate::forward::select_http_backend(route_key, &head.host, remote_address.ip(), action).await?;
-            (selected, tls, action.host_header.as_deref())
-        } else if crate::forward::http_listener_targets(&listener_config).is_some() {
-            (crate::forward::choose_online(&name, remote_address.ip(), crate::runtime_config::HttpLoadBalancing::RoundRobin)
-                .await
-                .ok_or_else(|| anyhow!("no online http backends"))?, listener_config.upstream_tls, None)
-        } else {
-            let port = head.port.unwrap_or(listener_config.target_port);
-            (crate::forward::select_runtime_target(&head.host, port, false, &head.host).await?, false, None)
-        })
-    }.await;
-    let (selected, upstream_tls, host_header) = match selected_result {
-        Ok(selected) => selected,
-        Err(cause) => {
-            log::warn!("{conn_id} reverse-proxy backend unavailable: {cause:#}");
-            bad_gateway(&mut client).await?;
-            return Ok(());
-        }
-    };
+    let (selected, upstream_tls, host_header) =
+        match select_backend(&route, &head, remote_address.ip(), &name, &listener_config).await {
+            Ok(selected) => selected,
+            Err(cause) => {
+                log::warn!("{conn_id} reverse-proxy backend unavailable: {cause:#}");
+                bad_gateway(&mut client).await?;
+                return Ok(());
+            }
+        };
     active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint);
     crate::relay::reject_obvious_self_connect(&listener_config, &selected.endpoint, &conn_id).await?;
-    let upstream = match tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(&selected.endpoint),
-    )
-    .await {
-        Ok(Ok(upstream)) => upstream,
-        Ok(Err(cause)) => {
-            log::warn!("{conn_id} failed to connect to reverse-proxy backend {}: {cause}", selected.endpoint);
-            bad_gateway(&mut client).await?;
-            return Ok(());
-        }
-        Err(_) => {
-            log::warn!("{conn_id} timed out connecting to reverse-proxy backend {}", selected.endpoint);
+    let upstream = match connect_backend(&conn_id, &selected.endpoint).await {
+        Some(upstream) => upstream,
+        None => {
             bad_gateway(&mut client).await?;
             return Ok(());
         }
     };
     info!("{conn_id} connected to http upstream {}", selected.endpoint);
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
+
+    let relay_ctx = crate::relay::RelayContext {
+        id: conn_id,
+        policy: listener_config,
+        stats: context,
+        controller,
+        initial_uploaded: header_len as u64,
+    };
+    let plan = ForwardPlan {
+        head,
+        framing,
+        scheme: if client_tls { "https" } else { "http" },
+        client_ip: remote_address.ip(),
+        host_header,
+        upstream_tls,
+        tls_server_name: selected.tls_server_name,
+    };
+    exchange(relay_ctx, client, upstream, plan).await
+}
+
+/// Validates a parsed request head for proxying: no self-connection loop and
+/// (behind TLS) a Host that matches the routed SNI. Returns the head's wire
+/// length for upload accounting; buffered body-prefix bytes are counted by
+/// the relay pipe when the framing-bounded reader replays them.
+fn admit(
+    conn_id: &crate::request_id::RequestId,
+    name: &str,
+    head: &http_header::HttpHead,
+    expected_sni: Option<&str>,
+) -> Result<usize> {
+    if head.loop_tokens.iter().any(|token| crate::hello_cache::request_token_is_looped(token)) {
+        log::warn!("{conn_id} {name} inbound request carries a loop token this proxy recently forwarded; closing self-connection loop");
+        return Err(anyhow!("detected self-connection loop"));
+    }
+    if expected_sni.is_some_and(|sni| !sni.trim_end_matches('.').eq_ignore_ascii_case(head.host.trim_end_matches('.'))) {
+        return Err(anyhow!("HTTPS SNI `{}` does not match HTTP Host `{}`", expected_sni.unwrap_or_default(), head.host));
+    }
+    info!("{conn_id} http host is {}", head.host_raw);
+    active_tracker::set_sni(conn_id, &head.host);
+    Ok(head.buffered.len() - head.body_prefix().len())
+}
+
+/// Picks the upstream for this request: the routed per-path backend pool, the
+/// listener's configured backends, or dynamic Host-header resolution.
+async fn select_backend(
+    route: &Option<(String, crate::runtime_config::HttpRouteAction)>,
+    head: &http_header::HttpHead,
+    client_ip: std::net::IpAddr,
+    listener_name: &str,
+    policy: &RelayPolicy,
+) -> Result<(crate::forward::SelectedTarget, bool, Option<String>)> {
+    if let Some((route_key, action)) = route {
+        let (selected, tls) = crate::forward::select_http_backend(route_key, &head.host, client_ip, action).await?;
+        return Ok((selected, tls, action.host_header.clone()));
+    }
+    if crate::forward::http_listener_targets(policy).is_some() {
+        let selected = crate::forward::choose_online(listener_name, client_ip, crate::runtime_config::HttpLoadBalancing::RoundRobin)
+            .await
+            .ok_or_else(|| anyhow!("no online http backends"))?;
+        return Ok((selected, policy.upstream_tls, None));
+    }
+    let port = head.port.unwrap_or(policy.target_port);
+    let selected = crate::forward::select_runtime_target(&head.host, port, false, &head.host).await?;
+    Ok((selected, false, None))
+}
+
+/// Connects to the chosen backend with a bounded timeout, logging failures;
+/// the caller answers the client with 502 when this returns `None`.
+async fn connect_backend(conn_id: &crate::request_id::RequestId, endpoint: &str) -> Option<TcpStream> {
+    match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(endpoint)).await {
+        Ok(Ok(upstream)) => Some(upstream),
+        Ok(Err(cause)) => {
+            log::warn!("{conn_id} failed to connect to reverse-proxy backend {endpoint}: {cause}");
+            None
+        }
+        Err(_) => {
+            log::warn!("{conn_id} timed out connecting to reverse-proxy backend {endpoint}");
+            None
+        }
+    }
+}
+
+/// Everything decided about a request before its bytes start moving.
+struct ForwardPlan {
+    head: http_header::HttpHead,
+    framing: http_header::BodyFraming,
+    scheme: &'static str,
+    client_ip: std::net::IpAddr,
+    host_header: Option<String>,
+    upstream_tls: bool,
+    tls_server_name: String,
+}
+
+/// Forwards the rewritten request and relays the response according to the
+/// plan: a `101 Switching Protocols` answer to an Upgrade request becomes an
+/// unbounded bidirectional tunnel, anything else the framing-bounded relay.
+async fn exchange<S>(
+    relay_ctx: crate::relay::RelayContext,
+    mut client: ConnStream<S>,
+    upstream: TcpStream,
+    plan: ForwardPlan,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let ForwardPlan { head, framing, scheme, client_ip, host_header, upstream_tls, tls_server_name } = plan;
     let upgrade = head.upgrade_requested();
     let prefix = head.body_prefix().to_vec();
-    let mut rewritten = head.rewrite_for_proxy(remote_address.ip(), if client_tls { "https" } else { "http" }, host_header, &crate::hello_cache::mint_request_token());
+    let mut rewritten = head.rewrite_for_proxy(client_ip, scheme, host_header.as_deref(), &crate::hello_cache::mint_request_token());
     // rewrite_for_proxy appends the buffered body prefix; the body is instead
     // restored onto the stream and delivered through the framing-bounded
     // reader below.
@@ -230,7 +307,7 @@ where
     client.unread(&prefix);
     let (base_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, mut upstream_write): (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>) = if upstream_tls {
-        let upstream = connect_trust_all_tls(upstream, &selected.tls_server_name).await?;
+        let upstream = connect_trust_all_tls(upstream, &tls_server_name).await?;
         let (read, write) = tokio::io::split(upstream);
         (Box::new(read), Box::new(write))
     } else {
@@ -248,17 +325,17 @@ where
         let response_head = match read_response_head(&mut upstream_read).await {
             Ok(head) => head,
             Err(cause) => {
-                log::warn!("{conn_id} upstream upgrade response failed: {cause:#}");
+                log::warn!("{} upstream upgrade response failed: {cause:#}", relay_ctx.id);
                 bad_gateway_split(&mut client_write).await?;
                 return Ok(());
             }
         };
-        context.increase_downloaded_bytes(response_head.len());
-        active_tracker::add_downloaded(&conn_id, response_head.len() as u64);
+        relay_ctx.stats.increase_downloaded_bytes(response_head.len());
+        active_tracker::add_downloaded(&relay_ctx.id, response_head.len() as u64);
         client_write.write_all(&response_head).await?;
         if response_status(&response_head) == Some(101) {
-            info!("{conn_id} upgrade accepted by upstream; relaying as a bidirectional tunnel");
-            return crate::relay::relay(crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: header_len as u64 }, base_read, client_write, upstream_read, upstream_write).await;
+            info!("{} upgrade accepted by upstream; relaying as a bidirectional tunnel", relay_ctx.id);
+            return crate::relay::relay(relay_ctx, base_read, client_write, upstream_read, upstream_write).await;
         }
     }
 
@@ -270,7 +347,7 @@ where
             Box::new(crate::http_header::ChunkedBodyReader::new(base_read))
         }
     };
-    crate::relay::relay(crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: header_len as u64 }, client_read, client_write, upstream_read, upstream_write).await
+    crate::relay::relay(relay_ctx, client_read, client_write, upstream_read, upstream_write).await
 }
 
 /// Reads an HTTP response head (through the blank line) from the upstream,
