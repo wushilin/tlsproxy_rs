@@ -2,6 +2,7 @@
 //! serving, and HTTPS redirects. Reached both by a plain-HTTP listener and by
 //! the TLS terminate backend re-intercepting a decrypted stream as HTTP.
 
+pub mod error_pages;
 pub mod static_files;
 
 use std::sync::Arc;
@@ -91,23 +92,25 @@ where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         candidate.len() == expected.len() && bool::from(candidate.ct_eq(expected.as_bytes()))
     }));
     if allowed { head.consume_authorization(); return Ok(true); }
-    client.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"tlsproxy\", charset=\"UTF-8\"\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\nConnection: close\r\n\r\nUnauthorized\n").await?;
+    let body = error_pages::render(401, "Unauthorized", error_pages::default_detail(401));
+    let header = format!(
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"tlsproxy\", charset=\"UTF-8\"\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    client.write_all(header.as_bytes()).await?;
+    client.write_all(body.as_bytes()).await?;
     client.shutdown().await?;
     Ok(false)
 }
 
 async fn bad_gateway<S>(client: &mut ConnStream<S>) -> Result<()>
 where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
-    client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\n\r\nBad Gateway\n").await?;
-    client.shutdown().await?;
-    Ok(())
+    static_files::error_response(client, 502, false).await
 }
 
 async fn bad_request<S>(client: &mut ConnStream<S>) -> Result<()>
 where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
-    client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\n\r\nBad Request\n").await?;
-    client.shutdown().await?;
-    Ok(())
+    static_files::error_response(client, 400, false).await
 }
 
 pub(crate) async fn run<S>(
@@ -381,9 +384,7 @@ fn response_status(head: &[u8]) -> Option<u16> {
 }
 
 async fn bad_gateway_split<W: AsyncWrite + Unpin>(client: &mut W) -> Result<()> {
-    client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\n\r\nBad Gateway\n").await?;
-    client.shutdown().await?;
-    Ok(())
+    static_files::error_response(client, 502, false).await
 }
 
 #[cfg(test)]
