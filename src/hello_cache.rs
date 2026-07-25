@@ -82,6 +82,15 @@ pub fn is_looped(random: &[u8; 32]) -> bool {
 }
 
 /// Records a request token injected into a proxied plaintext HTTP request.
+/// Mints and registers a fresh per-hop loop token in one step, so callers
+/// cannot forget the registration half.
+pub fn mint_request_token() -> String {
+    use rand::Rng as _;
+    let token = format!("{:032x}", rand::rng().random::<u128>());
+    insert_request_token(token.clone());
+    token
+}
+
 pub fn insert_request_token(token: String) {
     SEEN_TOKENS.lock().unwrap().insert(token, DEFAULT_TTL);
 }

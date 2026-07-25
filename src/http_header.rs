@@ -307,14 +307,18 @@ impl HttpHead {
     /// `Forwarded`, while `X-Forwarded-Host` and `X-Forwarded-Proto` are set
     /// to this hop's values. Bytes past the header block pass through as-is.
     pub fn with_forwarded_headers(&self, client_ip: IpAddr) -> Vec<u8> {
-        self.rewrite_for_proxy(client_ip, "http", None)
+        self.rewrite_for_proxy(client_ip, "http", None, &crate::hello_cache::mint_request_token())
     }
 
+    /// Pure rewrite: mint the loop token via
+    /// `hello_cache::mint_request_token` and pass it in; this function only
+    /// formats bytes and never touches process-wide state.
     pub fn rewrite_for_proxy(
         &self,
         client_ip: IpAddr,
         scheme: &str,
         upstream_host: Option<&str>,
+        loop_token: &str,
     ) -> Vec<u8> {
         let head = String::from_utf8_lossy(&self.buffered[..self.head_len]);
         let mut lines = head
@@ -393,12 +397,7 @@ impl HttpHead {
         // Fresh loop token per hop; inbound tokens from other tlsproxy hops
         // were passed through above so a multi-instance loop is still caught
         // by whichever instance sees its own token return.
-        let loop_token = {
-            use rand::Rng as _;
-            format!("{:032x}", rand::rng().random::<u128>())
-        };
-        crate::hello_cache::insert_request_token(loop_token.clone());
-        push_header("X-Tlsproxy-Rid", &loop_token);
+        push_header("X-Tlsproxy-Rid", loop_token);
         // The current data plane selects a path backend once per connection.
         // Closing after the response guarantees every subsequent request is
         // independently routed, including clients that otherwise use
@@ -562,7 +561,7 @@ mod tests {
         .await
         .unwrap();
         assert!(head.upgrade_requested());
-        let rewritten = String::from_utf8(head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "https", None)).unwrap();
+        let rewritten = String::from_utf8(head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "https", None, "cafe")).unwrap();
         assert!(rewritten.contains("Connection: upgrade\r\n"));
         assert!(!rewritten.contains("Connection: close"));
         assert!(rewritten.contains("Upgrade: websocket\r\n"));
@@ -571,7 +570,7 @@ mod tests {
         let plain = parse("GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n").await.unwrap();
         // Upgrade without the Connection token is not an upgrade request.
         assert!(!plain.upgrade_requested());
-        let rewritten = String::from_utf8(plain.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None)).unwrap();
+        let rewritten = String::from_utf8(plain.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None, "cafe")).unwrap();
         assert!(rewritten.contains("Connection: close\r\n"));
     }
 

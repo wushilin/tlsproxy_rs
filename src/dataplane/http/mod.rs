@@ -225,7 +225,7 @@ where
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let upgrade = head.upgrade_requested();
     let prefix = head.body_prefix().to_vec();
-    let mut rewritten = head.rewrite_for_proxy(remote_address.ip(), if client_tls { "https" } else { "http" }, host_header);
+    let mut rewritten = head.rewrite_for_proxy(remote_address.ip(), if client_tls { "https" } else { "http" }, host_header, &crate::hello_cache::mint_request_token());
     // rewrite_for_proxy appends the buffered body prefix; the body is instead
     // restored onto the stream and delivered through the framing-bounded
     // reader below.
@@ -387,7 +387,7 @@ mod tests {
         let head = http_header::read_http_head(&mut server, Duration::from_secs(1), 2048).await.unwrap();
         let mut head = head;
         assert!(require_basic_auth(&mut ConnStream::of(server), &mut head, &auth).await.unwrap());
-        assert!(!String::from_utf8(head.rewrite_for_proxy("127.0.0.1".parse().unwrap(), "http", None)).unwrap().to_ascii_lowercase().contains("authorization:"));
+        assert!(!String::from_utf8(head.rewrite_for_proxy("127.0.0.1".parse().unwrap(), "http", None, "cafe")).unwrap().to_ascii_lowercase().contains("authorization:"));
 
         let (mut browser, mut server) = tokio::io::duplex(2048);
         browser.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic YWxpY2U6d3Jvbmc=\r\n\r\n").await.unwrap();
@@ -406,13 +406,13 @@ mod tests {
         browser.write_all(b"GET /processmaster/ HTTP/1.1\r\nHost: public.example\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\n\r\n").await.unwrap();
         let mut head = http_header::read_http_head(&mut server, Duration::from_secs(1), 2048).await.unwrap();
         assert!(require_basic_auth(&mut ConnStream::of(server), &mut head, &auth).await.unwrap());
-        let rewritten = String::from_utf8(head.rewrite_for_proxy("127.0.0.1".parse().unwrap(), "https", None)).unwrap();
+        let rewritten = String::from_utf8(head.rewrite_for_proxy("127.0.0.1".parse().unwrap(), "https", None, "cafe")).unwrap();
         assert!(rewritten.contains("GET /processmaster/ HTTP/1.1\r\n"));
         assert!(rewritten.contains("Authorization: Basic YWxpY2U6c2VjcmV0\r\n"));
         assert!(rewritten.contains("Host: public.example\r\n"));
 
         head.strip_path_prefix("/processmaster/");
-        let stripped = String::from_utf8(head.rewrite_for_proxy("127.0.0.1".parse().unwrap(), "https", Some("localhost:9001"))).unwrap();
+        let stripped = String::from_utf8(head.rewrite_for_proxy("127.0.0.1".parse().unwrap(), "https", Some("localhost:9001"), "cafe")).unwrap();
         assert!(stripped.contains("GET / HTTP/1.1\r\n"));
         assert!(stripped.contains("Host: localhost:9001\r\n"));
         assert!(stripped.contains("Authorization: Basic YWxpY2U6c2VjcmV0\r\n"));
