@@ -349,7 +349,32 @@ where
             Box::new(crate::http_header::ChunkedBodyReader::new(base_read))
         }
     };
+    // The framing-bounded reader reaches EOF the moment the request body is
+    // complete — while the client socket is still open. That EOF must not
+    // become a TCP FIN/close_notify to the upstream: servers without HTTP/1.1
+    // half-close support (hyper's default, so most Rust backends) treat it as
+    // a client abort and drop the connection without responding. The request
+    // is already delimited by its framing plus the `Connection: close` the
+    // rewrite always sends, so the upstream needs no FIN to answer.
+    let upstream_write = KeepWriteOpen(upstream_write);
     crate::relay::relay(relay_ctx, client_read, client_write, upstream_read, upstream_write).await
+}
+
+/// Suppresses `shutdown` on the wrapped writer, downgrading it to a flush.
+/// Used for the framed request relay above; the tunnel and raw relays keep
+/// real FIN propagation because their EOFs come from actual peer closes.
+struct KeepWriteOpen<W>(W);
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for KeepWriteOpen<W> {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
 }
 
 /// Reads an HTTP response head (through the blank line) from the upstream,
@@ -409,6 +434,67 @@ mod tests {
         let head = read_response_head(&mut proxy_side).await.unwrap();
         assert_eq!(response_status(&head), Some(400));
         assert_eq!(response_status(b"garbage\r\n\r\n"), None);
+    }
+
+    #[tokio::test]
+    async fn framed_relay_never_half_closes_upstream_before_the_response() {
+        // Mimics servers without HTTP/1.1 half-close support (hyper's
+        // default, e.g. rustfs): after reading the request they wait briefly,
+        // and if the client's FIN arrives before the response was written the
+        // connection is dropped without responding.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0u8; 4096];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0, "upstream saw EOF before the request completed");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            // A FIN arriving now is exactly the pre-fix proxy behavior.
+            match tokio::time::timeout(Duration::from_millis(500), socket.read(&mut buffer)).await {
+                Ok(Ok(0)) => return, // half-closed: abort without responding
+                Ok(Ok(_)) | Ok(Err(_)) => panic!("unexpected extra request bytes"),
+                Err(_) => {} // no FIN: answer normally
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let (mut browser, server) = tokio::io::duplex(4096);
+        browser.write_all(b"GET / HTTP/1.1\r\nHost: h.example\r\n\r\n").await.unwrap();
+        let client = ConnStream::of(server);
+        let Intercepted { artifact: head, stream: client } =
+            HeadIntercept::new(client, Duration::from_secs(1)).intercept().await.unwrap();
+        let framing = head.body_framing().unwrap();
+        let upstream = TcpStream::connect(endpoint).await.unwrap();
+        let relay_ctx = crate::relay::RelayContext {
+            id: Arc::new(crate::request_id::RequestId::new()),
+            policy: Arc::new(RelayPolicy { bind: "127.0.0.1:443".into(), target: None, target_port: 80, speed_limit: None, upstream_tls: false }),
+            stats: Arc::new(crate::listener_stats::ListenerStats::new("test", 5_000)),
+            controller: Arc::new(tokio::sync::RwLock::new(crate::controller::Controller::new())),
+            initial_uploaded: 0,
+        };
+        let plan = ForwardPlan {
+            head,
+            framing,
+            scheme: "http",
+            client_ip: "127.0.0.1".parse().unwrap(),
+            host_header: None,
+            upstream_tls: false,
+            tls_server_name: String::new(),
+        };
+        let exchange_task = tokio::spawn(exchange(relay_ctx, client, upstream, plan));
+
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut browser, &mut response).await.unwrap();
+        upstream_task.await.unwrap();
+        exchange_task.await.unwrap().unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "upstream dropped the request; got: {response:?}");
+        assert!(response.ends_with("ok"));
     }
 
     #[tokio::test]
