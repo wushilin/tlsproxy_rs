@@ -159,9 +159,10 @@ pub fn publish_connection_count(listener: &str, was: usize, now: usize) {
 }
 
 /// Builds the authoritative connection-list snapshot for one listener.
-fn listener_connections_event(listener: &str, connections: &[crate::active_tracker::ActiveConnectionSerde]) -> Event {
-    let items: Vec<_> = connections.iter().filter(|item| item.listener == listener).map(|item| serde_json::json!({
-        "connection_id": item.request_id, "remote_address": item.remote_address, "host": item.host,
+fn connections_event(listener: Option<&str>, connections: &[crate::active_tracker::ActiveConnectionSerde]) -> Event {
+    let items: Vec<_> = connections.iter().filter(|item| listener.is_none_or(|name| item.listener == name)).map(|item| serde_json::json!({
+        "connection_id": item.request_id, "listener_name": item.listener,
+        "remote_address": item.remote_address, "host": item.host,
         "started_at_unix_ms": item.started_at_unix_ms, "uploaded": item.uploaded_bytes, "downloaded": item.downloaded_bytes
     })).collect();
     Event { event_type: LISTENER_CONNECTIONS_SNAPSHOT, event_payload: serde_json::json!({
@@ -187,7 +188,7 @@ pub async fn snapshot_global() -> Vec<Event> {
     }
     let registered = listeners().read().await.clone();
     let totals = transferred().read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-    let mut events = Vec::new();
+    let mut events = vec![connections_event(None, &connections)];
     let mut global_uploaded = 0u64;
     let mut global_downloaded = 0u64;
     for (name, weak) in &registered {
@@ -219,7 +220,7 @@ pub fn snapshot_listener(listener: &str) -> Vec<Event> {
     let (uploaded, downloaded) = transferred().read().unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(listener).map(|totals| totals.snapshot()).unwrap_or_default();
     vec![
-        listener_connections_event(listener, &connections),
+        connections_event(Some(listener), &connections),
         Event { event_type: LISTENER_TRANSFERRED_CHANGED, event_payload: serde_json::json!({
             "key": listener, "uploaded": uploaded, "downloaded": downloaded, "snapshot": true
         }) },
@@ -236,9 +237,10 @@ pub fn spawn_connection_reconciler(controller: &mut crate::controller::Controlle
             interval.tick().await;
             let connections = crate::active_tracker::get_active_list();
             let registered = listeners().read().await.clone();
+            send_to(GLOBAL_TOPIC, connections_event(None, &connections));
             for (name, weak) in &registered {
                 if weak.strong_count() == 0 { continue; }
-                send_to(&listener_topic(name), listener_connections_event(name, &connections));
+                send_to(&listener_topic(name), connections_event(Some(name), &connections));
             }
         }
     });
