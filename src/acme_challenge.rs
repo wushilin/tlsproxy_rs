@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -10,7 +8,7 @@ use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub const TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
 pub const DEFAULT_GATE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -44,84 +42,25 @@ pub fn server_config(certificate: Arc<CertifiedKey>) -> Arc<rustls::ServerConfig
     Arc::new(config)
 }
 
-/// Completes a challenge handshake after a passthrough listener has already
-/// buffered the ClientHello for inspection.
+/// Completes a challenge handshake after a listener has already peeked the
+/// ClientHello for inspection. The peeked bytes are restored onto the stream
+/// so the TLS acceptor sees the pristine wire stream.
 pub async fn accept_buffered<S>(
     buffered: Vec<u8>,
-    stream: S,
+    mut stream: crate::extensible::Extensible<S>,
     certificate: Arc<CertifiedKey>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let replay = ReplayStream::new(buffered, stream);
-    let acceptor = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), replay);
+    stream.unread(buffered);
+    let acceptor = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
     let start = acceptor.await.context("invalid ACME TLS ClientHello")?;
     let _stream = start
         .into_stream(server_config(certificate))
         .await
         .context("ACME TLS-ALPN handshake failed")?;
     Ok(())
-}
-
-/// Replays bytes consumed during protocol inspection before reading from the
-/// underlying stream. Only `accept_buffered` still needs this generic
-/// wrapper; interception layers on `Extensible` streams use
-/// `Extensible::unread` instead.
-pub(crate) struct ReplayStream<S> {
-    prefix: std::io::Cursor<Vec<u8>>,
-    inner: S,
-}
-
-impl<S> ReplayStream<S> {
-    pub(crate) fn new(prefix: Vec<u8>, inner: S) -> Self {
-        Self {
-            prefix: std::io::Cursor::new(prefix),
-            inner,
-        }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for ReplayStream<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let position = self.prefix.position() as usize;
-        if position < self.prefix.get_ref().len() {
-            let remaining = &self.prefix.get_ref()[position..];
-            let count = remaining.len().min(buffer.remaining());
-            buffer.put_slice(&remaining[..count]);
-            self.prefix.set_position((position + count) as u64);
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.inner).poll_read(cx, buffer)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for ReplayStream<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        bytes: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, bytes)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
 }
 
 /// Removes exactly the registration it created. A later challenge for the
@@ -295,7 +234,7 @@ mod tests {
                 .alpn_protocols
                 .iter()
                 .any(|protocol| protocol == TLS_ALPN_PROTOCOL));
-            accept_buffered(hello.buffered, server_io, certificate)
+            accept_buffered(hello.buffered, crate::extensible::Extensible::of(server_io), certificate)
                 .await
                 .unwrap();
         });

@@ -18,8 +18,16 @@ pub struct Intercepted<Artifact, Stream> {
 
 /// A connection positioned at a protocol interception point. Consuming it
 /// parses up to and including that point and yields the artifact together with
-/// the continuation stream — the artifact's own bytes are either consumed from,
-/// or replayable at the head of, that stream as documented by each impl.
+/// the continuation stream.
+///
+/// Interception is *lossless*: an implementation must retain the exact bytes
+/// it consumed in the artifact (`ClientHello::buffered`, `HttpHead::buffered`)
+/// without altering them, so `Extensible::unread(artifact.buffered)` restores
+/// the byte-identical wire stream. This lets the next layer either work from
+/// the parsed artifact or take the pristine stream — a TLS acceptor, an h2
+/// engine, a raw relay — as if nothing had been peeked. Transformations
+/// (header rewriting, prefix stripping) belong to layers that have decided to
+/// own the request; once a transform mutates the artifact, the undo is gone.
 #[allow(async_fn_in_trait)]
 pub trait Intercept {
     /// The parsed protocol artifact (e.g. a ClientHello or an HTTP head).
