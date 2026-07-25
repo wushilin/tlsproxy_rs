@@ -77,23 +77,44 @@ certificates. Built-in presets are provided for Let's Encrypt production and
 staging. Additional RFC 8555-compatible providers can be configured manually.
 When a provider requires External Account Binding, its HMAC is never returned
 by the admin API and is erased from provider metadata after account binding.
-Wildcard certificates are rejected because TLS-ALPN-01 cannot validate them.
+Wildcard certificates are rejected because TLS-ALPN-01 cannot validate them,
+and hostnames without a dot are rejected at save time because public CAs
+never issue for a single label.
+
+Certificates also register themselves: when a terminating route accepts a
+concrete SNI (exact, suffix, or regex match), the domain is registered
+automatically after the public-DNS prerequisite confirms it resolves to the
+configured self IPs. Registration runs in the background, is throttled per
+domain, and never delays TLS handshakes.
 
 The scheduler:
 
-- performs one immediate startup scan;
-- scans on a fixed 12-hour cadence by default;
-- never overlaps scans or certificate operations;
-- renews sequentially, normally 15 days before expiry;
-- gives each certificate operation a five-minute deadline; and
+- performs one immediate startup scan and scans on a fixed 12-hour cadence
+  by default; saving a certificate or provider triggers a scan immediately;
+- never overlaps scans, but renews up to four certificates concurrently
+  within a scan so one slow certificate cannot block the others;
+- renews normally 15 days before expiry with a five-minute deadline per
+  certificate operation;
+- bounds every CA interaction: ARI refresh steps are limited to 30 seconds
+  each and scan preparation to ten minutes overall, so a dead CA connection
+  can never silently wedge the renewal loop; each scan logs its trigger
+  before any network work; and
 - atomically activates a validated generation while retaining the previous
   active certificate when renewal fails.
 
-Failed operations use exponential backoff with 20% jitter, capped at 12 hours.
-When a CA advertises RFC 9773 ACME Renewal Information, the suggested window is
-sampled and persisted; the configured 15-day threshold remains the fallback.
-Downloaded chains are checked for issuer ordering and signatures. Per-resolver
-DNS results and timestamps are available in the control plane.
+Failed operations use exponential backoff with 20% jitter, starting at five
+minutes and capped at 12 hours; a CA-provided Retry-After is honored but
+clamped to 48 hours. When a CA advertises RFC 9773 ACME Renewal Information,
+the suggested window is sampled and persisted; the configured 15-day
+threshold remains the fallback. Downloaded chains are checked for issuer
+ordering and signatures. Per-resolver DNS results and timestamps are
+available in the control plane.
+
+A certificate that has never issued — or whose issuance has expired — is
+just a pending request and can always be deleted, even an automatic one
+whose route is still active (the next matching handshake simply re-registers
+it). An issued and still-valid Let's Encrypt certificate cannot be deleted,
+which protects against accidental re-issuance into CA rate limits.
 
 Active generations are parsed into an atomically replaced exact-SNI cache.
 TLS termination and the control hostname prefer this cache, then apply the
