@@ -57,7 +57,7 @@ where
 
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
-use crate::config::Listener;
+use crate::dataplane::RelayPolicy;
 use crate::conn_stream::ConnStream;
 use crate::http_header;
 use crate::upstream_tls::connect_trust_all_tls;
@@ -113,7 +113,7 @@ where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
 
 pub(crate) async fn run<S>(
     ctx: crate::dataplane::ConnCtx,
-    listener_config: Arc<Listener>,
+    listener_config: Arc<RelayPolicy>,
     mut client: ConnStream<S>,
     inspected: Option<http_header::HttpHead>,
     route: Option<(String, crate::runtime_config::HttpRouteAction)>,
@@ -149,9 +149,6 @@ where
     active_tracker::set_sni(&conn_id, &head.host);
     context.increase_uploaded_bytes(header_len);
     active_tracker::add_uploaded(&conn_id, header_len as u64);
-    if route.is_none() {
-        crate::relay::check_acl(&listener_config, &head.host, &conn_id).await?;
-    }
     let mut route = route;
     if let Some((_, host_action)) = &route {
         if let Some(path_route) = host_action.select_path(&head.target).cloned() {

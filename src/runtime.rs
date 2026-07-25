@@ -12,7 +12,7 @@ use crate::accounting::ListenerType;
 use crate::acme::dns::PublicDnsPrerequisite;
 use crate::acme::scheduler::RenewalScheduler;
 use crate::ca::LocalCa;
-use crate::config::{Listener, ListenerMode, Policy, Rules};
+use crate::dataplane::RelayPolicy;
 use crate::controller::Controller;
 use crate::dataplane::pipeline::Intercept;
 use crate::conn_stream::ConnStream;
@@ -434,7 +434,7 @@ async fn run_http_listener(name: String, listener: TcpListener, config: HostRout
             _ => None,
         }).unwrap_or_else(|| config.clone());
         stats.set_idle_timeout_ms(task_config.max_idle_time_ms.unwrap_or(u64::MAX));
-        let task_legacy = Arc::new(Listener { bind: task_config.bind.clone(), target: None, target_port: 80, policy: Policy::DENY, rules: empty_rules(), max_idle_time_ms: task_config.max_idle_time_ms, speed_limit: task_config.speed_limit, mode: ListenerMode::Http, upstream_tls: false });
+        let task_legacy = Arc::new(RelayPolicy { bind: task_config.bind.clone(), target: None, target_port: 80, speed_limit: task_config.speed_limit, upstream_tls: false });
         let (task_name, task_stats) = (name.clone(), stats.clone());
         let connection_controller = Arc::new(RwLock::new(controller.child()));
         drop(controller.spawn(async move {
@@ -462,7 +462,8 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
     let stats = Arc::new(ListenerStats::new(&name, config.max_idle_time_ms.unwrap_or(u64::MAX)));
     crate::events_hub::register_listener(&stats).await;
     let load_balancing = config.load_balancing;
-    let legacy = Arc::new(Listener { bind: config.bind, target: Some(config.targets), target_port: 0, policy: Policy::DENY, rules: empty_rules(), max_idle_time_ms: config.max_idle_time_ms, speed_limit: config.speed_limit, mode: ListenerMode::Forward, upstream_tls: config.upstream_tls });
+    let configured_idle_ms = config.max_idle_time_ms;
+    let legacy = Arc::new(RelayPolicy { bind: config.bind, target: Some(config.targets), target_port: 0, speed_limit: config.speed_limit, upstream_tls: config.upstream_tls });
     let name = Arc::new(name);
     loop {
         let Ok((socket, remote)) = listener.accept().await else { continue };
@@ -471,8 +472,8 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
         let live = crate::runtime_live::load();
         let live_forward = live.additional_listeners.get(name.as_str()).and_then(|listener| match listener { AdditionalListenerConfig::Forward(config) => Some(config), _ => None });
         let task_load_balancing = live_forward.map(|config| config.load_balancing).unwrap_or(load_balancing);
-        stats.set_idle_timeout_ms(live_forward.map(|config| config.max_idle_time_ms).unwrap_or(legacy.max_idle_time_ms).unwrap_or(u64::MAX));
-        let task_legacy = live_forward.map(|config| Arc::new(Listener { bind: config.bind.clone(), target: Some(config.targets.clone()), target_port: 0, policy: Policy::DENY, rules: empty_rules(), max_idle_time_ms: config.max_idle_time_ms, speed_limit: config.speed_limit, mode: ListenerMode::Forward, upstream_tls: config.upstream_tls })).unwrap_or_else(|| legacy.clone());
+        stats.set_idle_timeout_ms(live_forward.map(|config| config.max_idle_time_ms).unwrap_or(configured_idle_ms).unwrap_or(u64::MAX));
+        let task_legacy = live_forward.map(|config| Arc::new(RelayPolicy { bind: config.bind.clone(), target: Some(config.targets.clone()), target_port: 0, speed_limit: config.speed_limit, upstream_tls: config.upstream_tls })).unwrap_or_else(|| legacy.clone());
         let (task_name, task_stats) = (name.clone(), stats.clone());
         let connection_controller = Arc::new(RwLock::new(controller.child()));
         drop(controller.spawn(async move {
@@ -485,4 +486,3 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
     }
 }
 
-fn empty_rules() -> Rules { Rules { static_hosts: Vec::new(), patterns: Vec::new() } }

@@ -1,4 +1,4 @@
-use crate::config::{Listener, ListenerMode};
+use crate::dataplane::RelayPolicy;
 use crate::runtime_config::HttpLoadBalancing;
 use crate::controller::Controller;
 use crate::hostutil::HostAndPort;
@@ -334,30 +334,9 @@ pub async fn reconcile_forward_listener(
     register_forward_listener(listener_name, targets, upstream_tls).await
 }
 
-pub async fn reconcile_configured_listeners(listeners: &HashMap<String, Listener>) -> Result<()> {
-    LISTENER_BACKENDS.write().await.clear();
-    FORWARD_LISTENERS.write().await.clear();
-    for (name, listener) in listeners {
-        if listener.mode == ListenerMode::Forward {
-            if let Some(targets) = listener.target.as_deref() {
-                register_forward_listener(name.clone(), targets, listener.upstream_tls).await?;
-            }
-        }
-        if listener.mode == ListenerMode::Http {
-            if let Some(targets) = http_listener_targets(listener) {
-                let normalized = parse_http_targets(&targets)?;
-                register_forward_listener(name.clone(), &normalized, false).await?;
-            }
-        }
-    }
-    prune_unreferenced_configured_groups().await;
-    publish_configured_statuses().await;
-    Ok(())
-}
-
 /// Explicit backends of an http listener, or None when it routes dynamically
 /// by Host header.
-pub fn http_listener_targets(listener: &Listener) -> Option<String> {
+pub fn http_listener_targets(listener: &RelayPolicy) -> Option<String> {
     listener
         .target
         .as_deref()

@@ -11,7 +11,7 @@ use log::{info, warn};
 
 use crate::acme_challenge::TLS_ALPN_PROTOCOL;
 use crate::ca::LocalCa;
-use crate::config::{Listener, ListenerMode, Policy, Rules};
+
 use crate::controller::Controller;
 use crate::conn_stream::ConnStream;
 use crate::listener_stats::ListenerStats;
@@ -228,7 +228,7 @@ pub(crate) async fn dispatch_non_control(
                 warn!("inbound ClientHello was recently forwarded by this proxy; closing self-connection loop");
                 bail!("detected self-connection loop");
             }
-            let limits = compatibility_listener(config, &action);
+            let limits = crate::dataplane::RelayPolicy::for_tls_route(config, &action);
             match action {
                 TlsRouteAction::Passthrough { target_port, target, load_balancing } => {
                     let client_ip = ctx.remote.ip();
@@ -314,33 +314,6 @@ pub(crate) async fn dispatch_non_control(
     }
 }
 
-pub(crate) fn compatibility_listener(
-    config: &DefaultListenerConfig,
-    action: &TlsRouteAction,
-) -> Arc<Listener> {
-    let (mode, upstream_tls) = match action {
-        TlsRouteAction::Passthrough { .. } => (ListenerMode::Passthrough, true),
-        TlsRouteAction::Terminate { upstream, .. } => {
-            (ListenerMode::Terminate, *upstream == UpstreamTransport::Tls)
-        }
-        TlsRouteAction::ReverseProxy { .. } => (ListenerMode::Http, false),
-        TlsRouteAction::Reject => (ListenerMode::Passthrough, false),
-    };
-    Arc::new(Listener {
-        bind: config.bind.clone(),
-        target: None,
-        target_port: action.target_port().unwrap_or(443),
-        policy: Policy::DENY,
-        rules: Rules {
-            static_hosts: Vec::new(),
-            patterns: Vec::new(),
-        },
-        max_idle_time_ms: config.ordinary_traffic.max_idle_time_ms,
-        speed_limit: config.ordinary_traffic.speed_limit,
-        mode,
-        upstream_tls,
-    })
-}
 
 /// Pure routing policy for the required public :443 listener.
 ///

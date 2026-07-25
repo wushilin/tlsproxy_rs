@@ -14,14 +14,14 @@ use tokio::net::TcpStream;
 
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
-use crate::config::Listener;
+use crate::dataplane::RelayPolicy;
 use crate::conn_stream::ConnStream;
 use crate::hello_cache;
 use crate::tls_header::{self, ClientHello};
 
 pub(crate) async fn run(
     ctx: crate::dataplane::ConnCtx,
-    listener_config: Arc<Listener>,
+    listener_config: Arc<RelayPolicy>,
     mut client: ConnStream<TcpStream>,
     inspected: Option<ClientHello>,
     route_target: Option<(Option<String>, u16, crate::runtime_config::HttpLoadBalancing, IpAddr)>,

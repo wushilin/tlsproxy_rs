@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
-use crate::config::Listener;
+use crate::dataplane::RelayPolicy;
 use crate::controller::Controller;
 use crate::conn_stream::ConnStream;
 use crate::listener_stats::ListenerStats;
@@ -20,7 +20,7 @@ use crate::upstream_tls::connect_trust_all_tls;
 pub(crate) async fn run(
     name: Arc<String>,
     client: ConnStream<TcpStream>,
-    listener_config: Arc<Listener>,
+    listener_config: Arc<RelayPolicy>,
     context: Arc<ListenerStats>,
     controller: Arc<RwLock<Controller>>,
     client_ip: IpAddr,

@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
 use crate::ca::LocalCa;
-use crate::config::Listener;
+use crate::dataplane::RelayPolicy;
 use crate::controller::Controller;
 use crate::conn_stream::ConnStream;
 use crate::listener_stats::ListenerStats;
@@ -29,7 +29,7 @@ use crate::tls_header::ClientHello;
 /// already-selected route controls both destination and upstream TLS mode.
 pub(crate) async fn run_inspected(
     ctx: crate::dataplane::ConnCtx,
-    listener_config: Arc<Listener>,
+    listener_config: Arc<RelayPolicy>,
     ca: LocalCa,
     client: ConnStream<TcpStream>,
     hello: ClientHello,
@@ -64,7 +64,7 @@ async fn run_stream<S>(
     name: Arc<String>,
     client: S,
     conn_id: Arc<RequestId>,
-    listener_config: Arc<Listener>,
+    listener_config: Arc<RelayPolicy>,
     context: Arc<ListenerStats>,
     controller: Arc<RwLock<Controller>>,
     ca: LocalCa,

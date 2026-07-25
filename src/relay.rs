@@ -14,15 +14,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::accounting::{ConnStatus};
 use crate::active_tracker;
-use crate::config::Listener;
+use crate::dataplane::RelayPolicy;
 use crate::controller::Controller;
 use crate::idle_tracker::IdleTracker;
 use crate::listener_stats::ListenerStats;
 use crate::request_id::RequestId;
 
-pub async fn reject_obvious_self_connect(listener: &Listener, resolved: &str, id: &RequestId) -> Result<()> {
+pub async fn reject_obvious_self_connect(listener: &RelayPolicy, resolved: &str, id: &RequestId) -> Result<()> {
     let own_bind = crate::bindaddr::resolve_bind_addr(&listener.bind)
         .ok()
         .and_then(|value| value.parse::<SocketAddr>().ok());
@@ -70,21 +69,13 @@ fn upstream_lands_on(
     }
 }
 
-pub async fn check_acl(listener: &Listener, host: &str, id: &RequestId) -> Result<()> {
-    if listener.is_allowed(host) { info!("{id} {host} allowed by ACL"); return Ok(()); }
-    info!("{id} {host} denied by ACL");
-    active_tracker::set_status(id, ConnStatus::Denied);
-    Err(anyhow!("{host} denied by ACL"))
-}
-
-pub async fn resolve_target(listener: &Listener, sni: &str, upstream_tls: bool, tls_name: &str, id: &RequestId) -> Result<crate::forward::SelectedTarget> {
-    check_acl(listener, sni, id).await?;
+pub async fn resolve_target(listener: &RelayPolicy, sni: &str, upstream_tls: bool, tls_name: &str, id: &RequestId) -> Result<crate::forward::SelectedTarget> {
     let selected = crate::forward::select_runtime_target(sni, listener.target_port, upstream_tls, tls_name).await?;
     info!("{id} final target: {}", selected.endpoint);
     Ok(selected)
 }
 
-pub async fn relay<CR, CW, UR, UW>(id: Arc<RequestId>, client_read: CR, client_write: CW, upstream_read: UR, upstream_write: UW, listener: Arc<Listener>, stats: Arc<ListenerStats>, controller: Arc<RwLock<Controller>>, initial_uploaded: u64) -> Result<()>
+pub async fn relay<CR, CW, UR, UW>(id: Arc<RequestId>, client_read: CR, client_write: CW, upstream_read: UR, upstream_write: UW, listener: Arc<RelayPolicy>, stats: Arc<ListenerStats>, controller: Arc<RwLock<Controller>>, initial_uploaded: u64) -> Result<()>
 where CR: AsyncRead + Unpin + Send + 'static, CW: AsyncWrite + Unpin + Send + 'static, UR: AsyncRead + Unpin + Send + 'static, UW: AsyncWrite + Unpin + Send + 'static {
     let idle = Arc::new(Mutex::new(IdleTracker::new(stats.idle_timeout_ms())));
     let uploaded = Arc::new(AtomicU64::new(initial_uploaded));
@@ -145,7 +136,6 @@ where R: AsyncRead + Send + Unpin + 'static, W: AsyncWrite + Send + Unpin + 'sta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ListenerMode, Policy, Rules};
 
     #[test]
     fn upstream_lands_on_matches_self_addresses_only_on_reachable_binds() {
@@ -182,15 +172,11 @@ mod tests {
         let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client);
         let (proxy_upstream_read, proxy_upstream_write) = tokio::io::split(proxy_upstream);
         let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
-        let listener = Arc::new(Listener {
+        let listener = Arc::new(RelayPolicy {
             bind: "127.0.0.1:443".into(),
             target: None,
             target_port: 80,
-            policy: Policy::ALLOW,
-            rules: Rules { static_hosts: Vec::new(), patterns: Vec::new() },
-            max_idle_time_ms: None,
             speed_limit: None,
-            mode: ListenerMode::Http,
             upstream_tls: false,
         });
         let stats = Arc::new(ListenerStats::new("test", 5_000));

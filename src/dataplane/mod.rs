@@ -14,9 +14,11 @@ pub mod l4;
 pub mod http;
 pub mod lifecycle;
 pub mod pipeline;
+pub mod policy;
 pub mod tls;
 
 pub use lifecycle::ConnGuard;
+pub use policy::RelayPolicy;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
