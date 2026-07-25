@@ -270,38 +270,8 @@ pub(crate) async fn dispatch_non_control(
                     let certified_key = tls.cache
                         .resolve_with_fallback(&hello.sni_host, &tls.ca, tls.fallback)
                         .await?;
-                    let sni = hello.sni_host.clone();
-                    let request_id = client.request_id();
-                    let mut client = client;
-                    // Restore the peeked ClientHello so the TLS acceptor sees
-                    // the pristine wire stream.
-                    client.unread(hello.buffered);
-                    let acceptor = tokio_rustls::LazyConfigAcceptor::new(
-                        rustls::server::Acceptor::default(),
-                        client,
-                    );
-                    let start = tokio::time::timeout(Duration::from_secs(5), acceptor).await??;
-                    let mut server = rustls::ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified_key)));
-                    server.alpn_protocols = vec![b"http/1.1".to_vec()];
-                    let tls_stream = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        start.into_stream(Arc::new(server)),
-                    ).await??;
-                    // Preserve the original connection id across the TLS
-                    // boundary onto the fresh decrypted stream.
-                    let client = ConnStream::with_request_id(tls_stream, request_id);
-                    // The decrypted stream is now re-intercepted as an HTTP
-                    // connection: same pipeline shape, next protocol layer.
-                    let crate::dataplane::pipeline::Intercepted { artifact: head, stream: client } =
-                        crate::dataplane::http::HeadIntercept::new(client, Duration::from_secs(10))
-                            .intercept()
-                            .await?;
-                    let route_key = format!("{}:{}", ctx.name, sni.to_ascii_lowercase());
-                    crate::dataplane::http::run(
-                        ctx, limits, client,
-                        Some(head), Some((route_key, action)), true, Some(sni),
+                    crate::dataplane::tls::terminate::run_reverse_proxy(
+                        ctx, limits, client, hello, certified_key, action,
                     ).await
                 }
                 TlsRouteAction::Reject => bail!("default-listener route explicitly rejected SNI"),

@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
 use crate::ca::LocalCa;
+use crate::dataplane::pipeline::Intercept;
 use crate::dataplane::RelayPolicy;
 use crate::controller::Controller;
 use crate::conn_stream::ConnStream;
@@ -58,6 +59,43 @@ pub(crate) async fn run_inspected(
         Some(certified_key),
     )
     .await
+}
+
+/// Terminates TLS for a ReverseProxy route and re-intercepts the decrypted
+/// stream as HTTP. The dispatcher resolves the certificate and hands the
+/// pristine wire stream over; this function owns the handshake and the
+/// protocol handoff.
+pub(crate) async fn run_reverse_proxy(
+    ctx: crate::dataplane::ConnCtx,
+    policy: Arc<RelayPolicy>,
+    mut client: ConnStream<TcpStream>,
+    hello: crate::tls_header::ClientHello,
+    certified_key: Arc<rustls::sign::CertifiedKey>,
+    action: crate::runtime_config::HttpRouteAction,
+) -> Result<()> {
+    let sni = hello.sni_host.clone();
+    let request_id = client.request_id();
+    // Restore the peeked ClientHello so the TLS acceptor sees the pristine
+    // wire stream.
+    client.unread(hello.buffered);
+    let acceptor = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client);
+    let start = tokio::time::timeout(Duration::from_secs(5), acceptor).await??;
+    let mut server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified_key)));
+    server.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls_stream = tokio::time::timeout(Duration::from_secs(5), start.into_stream(Arc::new(server))).await??;
+    // Preserve the original connection id across the TLS boundary onto the
+    // fresh decrypted stream.
+    let client = ConnStream::with_request_id(tls_stream, request_id);
+    // The decrypted stream is re-intercepted as an HTTP connection: same
+    // pipeline shape, next protocol layer.
+    let crate::dataplane::pipeline::Intercepted { artifact: head, stream: client } =
+        crate::dataplane::http::HeadIntercept::new(client, Duration::from_secs(10))
+            .intercept()
+            .await?;
+    let route_key = format!("{}:{}", ctx.name, sni.to_ascii_lowercase());
+    crate::dataplane::http::run(ctx, policy, client, Some(head), Some((route_key, action)), true, Some(sni)).await
 }
 
 async fn run_stream<S>(
