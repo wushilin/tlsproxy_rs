@@ -160,7 +160,7 @@ mod tests {
         let bytes = client_hello("undo.example");
         let (mut writer, reader) = tokio::io::duplex(bytes.len() * 2);
         writer.write_all(&bytes).await.unwrap();
-        let mut stream = crate::extensible::Extensible::of(reader);
+        let mut stream = crate::conn_stream::ConnStream::of(reader);
         let hello = read_client_hello(
             &mut stream,
             std::time::Duration::from_secs(1),

@@ -47,7 +47,7 @@ pub fn server_config(certificate: Arc<CertifiedKey>) -> Arc<rustls::ServerConfig
 /// so the TLS acceptor sees the pristine wire stream.
 pub async fn accept_buffered<S>(
     buffered: Vec<u8>,
-    mut stream: crate::extensible::Extensible<S>,
+    mut stream: crate::conn_stream::ConnStream<S>,
     certificate: Arc<CertifiedKey>,
 ) -> Result<()>
 where
@@ -234,7 +234,7 @@ mod tests {
                 .alpn_protocols
                 .iter()
                 .any(|protocol| protocol == TLS_ALPN_PROTOCOL));
-            accept_buffered(hello.buffered, crate::extensible::Extensible::of(server_io), certificate)
+            accept_buffered(hello.buffered, crate::conn_stream::ConnStream::of(server_io), certificate)
                 .await
                 .unwrap();
         });

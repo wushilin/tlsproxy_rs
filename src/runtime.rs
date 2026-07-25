@@ -15,7 +15,7 @@ use crate::ca::LocalCa;
 use crate::config::{Listener, ListenerMode, Policy, Rules};
 use crate::controller::Controller;
 use crate::dataplane::pipeline::Intercept;
-use crate::extensible::Extensible;
+use crate::conn_stream::ConnStream;
 use crate::listener_stats::ListenerStats;
 use crate::runtime_config::{
     AdditionalListenerConfig, DefaultListenerConfig, HostRoutedHttpListenerConfig,
@@ -380,7 +380,7 @@ async fn run_tls_listener(
     let name = Arc::new(name);
     loop {
         let Ok((socket, remote)) = listener.accept().await else { continue };
-        let client = Extensible::of(socket);
+        let client = ConnStream::of(socket);
        
         let request_id = client.request_id();
         let task_name = name.clone();
@@ -426,7 +426,7 @@ async fn run_http_listener(name: String, listener: TcpListener, config: HostRout
     let name = Arc::new(name);
     loop {
         let Ok((socket, remote)) = listener.accept().await else { continue };
-        let client = Extensible::of(socket);
+        let client = ConnStream::of(socket);
         let request_id = client.request_id();
         let live = crate::runtime_live::load();
         let task_config = live.additional_listeners.get(name.as_str()).and_then(|listener| match listener {
@@ -466,7 +466,7 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
     let name = Arc::new(name);
     loop {
         let Ok((socket, remote)) = listener.accept().await else { continue };
-        let client = Extensible::of(socket);
+        let client = ConnStream::of(socket);
         let request_id = client.request_id();
         let live = crate::runtime_live::load();
         let live_forward = live.additional_listeners.get(name.as_str()).and_then(|listener| match listener { AdditionalListenerConfig::Forward(config) => Some(config), _ => None });

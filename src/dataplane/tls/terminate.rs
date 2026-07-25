@@ -18,7 +18,7 @@ use crate::active_tracker;
 use crate::ca::LocalCa;
 use crate::config::Listener;
 use crate::controller::Controller;
-use crate::extensible::Extensible;
+use crate::conn_stream::ConnStream;
 use crate::listener_stats::ListenerStats;
 use crate::request_id::RequestId;
 use crate::upstream_tls::connect_trust_all_tls;
@@ -31,7 +31,7 @@ pub(crate) async fn run_inspected(
     ctx: crate::dataplane::ConnCtx,
     listener_config: Arc<Listener>,
     ca: LocalCa,
-    client: Extensible<TcpStream>,
+    client: ConnStream<TcpStream>,
     hello: ClientHello,
     target: Option<String>,
     target_port: u16,

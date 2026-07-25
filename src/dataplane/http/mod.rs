@@ -23,13 +23,13 @@ use crate::dataplane::pipeline::{Intercept, Intercepted};
 /// Reached both by a plain-HTTP listener and by the TLS terminate backend
 /// re-intercepting a decrypted stream as HTTP.
 pub struct HeadIntercept<S> {
-    stream: Extensible<S>,
+    stream: ConnStream<S>,
     timeout: Duration,
     max_size: usize,
 }
 
 impl<S> HeadIntercept<S> {
-    pub fn new(stream: Extensible<S>, timeout: Duration) -> Self {
+    pub fn new(stream: ConnStream<S>, timeout: Duration) -> Self {
         Self {
             stream,
             timeout,
@@ -43,9 +43,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     type Artifact = http_header::HttpHead;
-    type Stream = Extensible<S>;
+    type Stream = ConnStream<S>;
 
-    async fn intercept(mut self) -> Result<Intercepted<http_header::HttpHead, Extensible<S>>> {
+    async fn intercept(mut self) -> Result<Intercepted<http_header::HttpHead, ConnStream<S>>> {
         let artifact =
             http_header::read_http_head(&mut self.stream, self.timeout, self.max_size).await?;
         Ok(Intercepted {
@@ -58,12 +58,12 @@ where
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
 use crate::config::Listener;
-use crate::extensible::Extensible;
+use crate::conn_stream::ConnStream;
 use crate::http_header;
 use crate::upstream_tls::connect_trust_all_tls;
 
 pub(crate) async fn redirect_https<S>(
-    mut client: Extensible<S>,
+    mut client: ConnStream<S>,
     head: http_header::HttpHead,
     config: Option<&crate::runtime_config::HttpRedirectConfig>,
     default_port: u16,
@@ -82,7 +82,7 @@ where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     Ok(())
 }
 
-async fn require_basic_auth<S>(client: &mut Extensible<S>, head: &mut http_header::HttpHead, auth: &crate::runtime_config::HttpBasicAuth) -> Result<bool>
+async fn require_basic_auth<S>(client: &mut ConnStream<S>, head: &mut http_header::HttpHead, auth: &crate::runtime_config::HttpBasicAuth) -> Result<bool>
 where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     if !auth.enabled { return Ok(true); }
     let supplied = head.authorization.as_deref().and_then(|value| value.strip_prefix("Basic ").or_else(|| value.strip_prefix("basic ")))
@@ -97,14 +97,14 @@ where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     Ok(false)
 }
 
-async fn bad_gateway<S>(client: &mut Extensible<S>) -> Result<()>
+async fn bad_gateway<S>(client: &mut ConnStream<S>) -> Result<()>
 where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\n\r\nBad Gateway\n").await?;
     client.shutdown().await?;
     Ok(())
 }
 
-async fn bad_request<S>(client: &mut Extensible<S>) -> Result<()>
+async fn bad_request<S>(client: &mut ConnStream<S>) -> Result<()>
 where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\n\r\nBad Request\n").await?;
     client.shutdown().await?;
@@ -114,7 +114,7 @@ where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
 pub(crate) async fn run<S>(
     ctx: crate::dataplane::ConnCtx,
     listener_config: Arc<Listener>,
-    mut client: Extensible<S>,
+    mut client: ConnStream<S>,
     inspected: Option<http_header::HttpHead>,
     route: Option<(String, crate::runtime_config::HttpRouteAction)>,
     client_tls: bool,
@@ -344,7 +344,7 @@ mod tests {
             .write_all(b"POST /submit HTTP/1.1\r\nHost: h.example\r\nContent-Length: 4\r\n\r\nBODY")
             .await
             .unwrap();
-        let client = Extensible::of(server);
+        let client = ConnStream::of(server);
         let Intercepted { artifact: head, stream: _client } =
             HeadIntercept::new(client, Duration::from_secs(1)).intercept().await.unwrap();
         assert_eq!(head.host, "h.example");
@@ -359,7 +359,7 @@ mod tests {
         let (mut browser, mut server) = tokio::io::duplex(2048);
         browser.write_all(b"GET /app?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n").await.unwrap();
         let head = http_header::read_http_head(&mut server, Duration::from_secs(1), 2048).await.unwrap();
-        redirect_https(Extensible::of(server), head, None, 443).await.unwrap();
+        redirect_https(ConnStream::of(server), head, None, 443).await.unwrap();
         let mut response = String::new();
         browser.read_to_string(&mut response).await.unwrap();
         assert!(response.contains("HTTP/1.1 308 Permanent Redirect"));
@@ -372,7 +372,7 @@ mod tests {
         browser.write_all(b"GET /old HTTP/1.1\r\nHost: old.example\r\n\r\n").await.unwrap();
         let head = http_header::read_http_head(&mut server, Duration::from_secs(1), 2048).await.unwrap();
         let redirect = crate::runtime_config::HttpRedirectConfig { hostname: Some("new.example".into()), port: Some(8443), status: 301, preserve_host: false };
-        redirect_https(Extensible::of(server), head, Some(&redirect), 443).await.unwrap();
+        redirect_https(ConnStream::of(server), head, Some(&redirect), 443).await.unwrap();
         let mut response = String::new();
         browser.read_to_string(&mut response).await.unwrap();
         assert!(response.contains("HTTP/1.1 301 Moved Permanently"));
@@ -386,14 +386,14 @@ mod tests {
         browser.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\n\r\n").await.unwrap();
         let head = http_header::read_http_head(&mut server, Duration::from_secs(1), 2048).await.unwrap();
         let mut head = head;
-        assert!(require_basic_auth(&mut Extensible::of(server), &mut head, &auth).await.unwrap());
+        assert!(require_basic_auth(&mut ConnStream::of(server), &mut head, &auth).await.unwrap());
         assert!(!String::from_utf8(head.rewrite_for_proxy("127.0.0.1".parse().unwrap(), "http", None)).unwrap().to_ascii_lowercase().contains("authorization:"));
 
         let (mut browser, mut server) = tokio::io::duplex(2048);
         browser.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic YWxpY2U6d3Jvbmc=\r\n\r\n").await.unwrap();
         let head = http_header::read_http_head(&mut server, Duration::from_secs(1), 2048).await.unwrap();
         let mut head = head;
-        assert!(!require_basic_auth(&mut Extensible::of(server), &mut head, &auth).await.unwrap());
+        assert!(!require_basic_auth(&mut ConnStream::of(server), &mut head, &auth).await.unwrap());
         let mut response = String::new(); browser.read_to_string(&mut response).await.unwrap();
         assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
         assert!(response.contains("WWW-Authenticate: Basic"));
@@ -405,7 +405,7 @@ mod tests {
         let (mut browser, mut server) = tokio::io::duplex(2048);
         browser.write_all(b"GET /processmaster/ HTTP/1.1\r\nHost: public.example\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\n\r\n").await.unwrap();
         let mut head = http_header::read_http_head(&mut server, Duration::from_secs(1), 2048).await.unwrap();
-        assert!(require_basic_auth(&mut Extensible::of(server), &mut head, &auth).await.unwrap());
+        assert!(require_basic_auth(&mut ConnStream::of(server), &mut head, &auth).await.unwrap());
         let rewritten = String::from_utf8(head.rewrite_for_proxy("127.0.0.1".parse().unwrap(), "https", None)).unwrap();
         assert!(rewritten.contains("GET /processmaster/ HTTP/1.1\r\n"));
         assert!(rewritten.contains("Authorization: Basic YWxpY2U6c2VjcmV0\r\n"));

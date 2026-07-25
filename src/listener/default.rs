@@ -13,7 +13,7 @@ use crate::acme_challenge::TLS_ALPN_PROTOCOL;
 use crate::ca::LocalCa;
 use crate::config::{Listener, ListenerMode, Policy, Rules};
 use crate::controller::Controller;
-use crate::extensible::Extensible;
+use crate::conn_stream::ConnStream;
 use crate::listener_stats::ListenerStats;
 use crate::runtime_config::{DefaultListenerConfig, TlsRouteAction, UpstreamTransport};
 use crate::store::normalize_domain;
@@ -39,7 +39,7 @@ pub trait ControlPlaneService: Send + Sync + 'static {
         &'a self,
         hostname: String,
         hello: ClientHello,
-        client: Extensible<TcpStream>,
+        client: ConnStream<TcpStream>,
     ) -> ControlFuture<'a>;
 }
 
@@ -60,7 +60,7 @@ pub async fn run(
     let name = Arc::new(crate::runtime_config::DEFAULT_LISTENER_NAME.to_owned());
     loop {
         let (socket, remote_address) = listener.accept().await?;
-        let client = Extensible::of(socket);
+        let client = ConnStream::of(socket);
         let connection_controller = Arc::new(RwLock::new(listener_controller.child()));
         let task_name = Arc::clone(&name);
         let live = crate::runtime_live::load();
@@ -93,7 +93,7 @@ pub async fn run(
 
 async fn handle_connection(
     name: Arc<String>,
-    client: Extensible<TcpStream>,
+    client: ConnStream<TcpStream>,
     remote_address: SocketAddr,
     config: Arc<DefaultListenerConfig>,
     control_hostname: Option<String>,
@@ -208,7 +208,7 @@ pub(crate) async fn dispatch_non_control(
     tls: crate::dataplane::TlsCtx,
     route: ConnectionRoute,
     hello: ClientHello,
-    client: Extensible<TcpStream>,
+    client: ConnStream<TcpStream>,
     config: &DefaultListenerConfig,
 ) -> Result<()> {
     match route {
@@ -291,7 +291,7 @@ pub(crate) async fn dispatch_non_control(
                     ).await??;
                     // Preserve the original connection id across the TLS
                     // boundary onto the fresh decrypted stream.
-                    let client = Extensible::with_request_id(tls_stream, request_id);
+                    let client = ConnStream::with_request_id(tls_stream, request_id);
                     // The decrypted stream is now re-intercepted as an HTTP
                     // connection: same pipeline shape, next protocol layer.
                     let crate::dataplane::pipeline::Intercepted { artifact: head, stream: client } =

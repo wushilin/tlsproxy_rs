@@ -16,7 +16,7 @@ use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::dataplane::pipeline::{Intercept, Intercepted};
-use crate::extensible::Extensible;
+use crate::conn_stream::ConnStream;
 use crate::tls_header::{self, ClientHello};
 
 /// Interception point for an inbound TLS connection: its ClientHello. The
@@ -24,13 +24,13 @@ use crate::tls_header::{self, ClientHello};
 /// the hello (whose raw bytes are retained in [`ClientHello::buffered`] for
 /// replay by a terminating or passthrough backend).
 pub struct ClientHelloIntercept<S> {
-    stream: Extensible<S>,
+    stream: ConnStream<S>,
     timeout: Duration,
     max_size: usize,
 }
 
 impl<S> ClientHelloIntercept<S> {
-    pub fn new(stream: Extensible<S>, timeout: Duration) -> Self {
+    pub fn new(stream: ConnStream<S>, timeout: Duration) -> Self {
         Self {
             stream,
             timeout,
@@ -44,9 +44,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     type Artifact = ClientHello;
-    type Stream = Extensible<S>;
+    type Stream = ConnStream<S>;
 
-    async fn intercept(mut self) -> Result<Intercepted<ClientHello, Extensible<S>>> {
+    async fn intercept(mut self) -> Result<Intercepted<ClientHello, ConnStream<S>>> {
         let artifact =
             tls_header::read_client_hello(&mut self.stream, self.timeout, self.max_size).await?;
         Ok(Intercepted {

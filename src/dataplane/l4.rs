@@ -13,13 +13,13 @@ use crate::accounting::ConnStatus;
 use crate::active_tracker;
 use crate::config::Listener;
 use crate::controller::Controller;
-use crate::extensible::Extensible;
+use crate::conn_stream::ConnStream;
 use crate::listener_stats::ListenerStats;
 use crate::upstream_tls::connect_trust_all_tls;
 
 pub(crate) async fn run(
     name: Arc<String>,
-    client: Extensible<TcpStream>,
+    client: ConnStream<TcpStream>,
     listener_config: Arc<Listener>,
     context: Arc<ListenerStats>,
     controller: Arc<RwLock<Controller>>,

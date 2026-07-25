@@ -16,7 +16,7 @@ pub mod config;
 pub mod controller;
 pub mod control_api;
 pub mod dataplane;
-pub mod extensible;
+pub mod conn_stream;
 pub mod events_hub;
 pub mod forward;
 pub mod hello_cache;

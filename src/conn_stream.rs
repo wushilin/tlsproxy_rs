@@ -28,14 +28,14 @@ use crate::request_id::RequestId;
 /// bounded well below this, so hitting it indicates a logic error.
 const MAX_PUSHBACK: usize = 1024 * 1024;
 
-pub struct Extensible<T> {
+pub struct ConnStream<T> {
     inner: T,
     request_id: Arc<RequestId>,
     pushback: Vec<u8>,
     pushback_offset: usize,
 }
 
-impl<T> AsyncRead for Extensible<T>
+impl<T> AsyncRead for ConnStream<T>
 where
     T: AsyncRead + Unpin,
 {
@@ -60,7 +60,7 @@ where
     }
 }
 
-impl<T> AsyncWrite for Extensible<T>
+impl<T> AsyncWrite for ConnStream<T>
 where
     T: AsyncWrite + Unpin,
 {
@@ -81,13 +81,13 @@ where
     }
 }
 
-impl<T> DerefMut for Extensible<T> {
+impl<T> DerefMut for ConnStream<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-impl<T> Deref for Extensible<T> {
+impl<T> Deref for ConnStream<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -95,10 +95,10 @@ impl<T> Deref for Extensible<T> {
     }
 }
 
-impl<T> Extensible<T> {
+impl<T> ConnStream<T> {
     /// Wraps a stream with a fresh connection id.
     pub fn of(inner: T) -> Self {
-        Extensible {
+        ConnStream {
             inner,
             request_id: Arc::new(RequestId::new()),
             pushback: Vec::new(),
@@ -109,7 +109,7 @@ impl<T> Extensible<T> {
     /// Rewraps a transformed stream (e.g. the plaintext stream after TLS
     /// termination) while preserving the original connection id.
     pub fn with_request_id(inner: T, request_id: Arc<RequestId>) -> Self {
-        Extensible { inner, request_id, pushback: Vec::new(), pushback_offset: 0 }
+        ConnStream { inner, request_id, pushback: Vec::new(), pushback_offset: 0 }
     }
 
     /// The connection's request id. Cheap `Arc` clone; never fails.
@@ -155,7 +155,7 @@ mod tests {
     async fn unread_bytes_are_presented_before_the_stream_across_partial_reads() {
         let (mut peer, stream) = tokio::io::duplex(64);
         peer.write_all(b"WIRE").await.unwrap();
-        let mut stream = Extensible::of(stream);
+        let mut stream = ConnStream::of(stream);
         stream.unread(b"PEEKED");
         let mut small = [0u8; 3];
         stream.read_exact(&mut small).await.unwrap();
@@ -169,7 +169,7 @@ mod tests {
     async fn later_unread_prepends_to_remaining_pushback() {
         let (mut peer, stream) = tokio::io::duplex(64);
         peer.write_all(b"!").await.unwrap();
-        let mut stream = Extensible::of(stream);
+        let mut stream = ConnStream::of(stream);
         stream.unread(b"cd");
         let mut first = [0u8; 1];
         stream.read_exact(&mut first).await.unwrap();
@@ -188,7 +188,7 @@ mod tests {
         let raw = b"POST /submit HTTP/1.1\r\nHost: h.example\r\nContent-Length: 9\r\n\r\nBODY";
         let (mut peer, stream) = tokio::io::duplex(256);
         peer.write_all(raw).await.unwrap();
-        let mut client = Extensible::of(stream);
+        let mut client = ConnStream::of(stream);
         let head = crate::http_header::read_http_head(
             &mut client,
             std::time::Duration::from_secs(1),
@@ -210,7 +210,7 @@ mod tests {
         let (mut peer, stream) = tokio::io::duplex(64);
         peer.write_all(b"-tail").await.unwrap();
         drop(peer);
-        let mut stream = Extensible::of(stream);
+        let mut stream = ConnStream::of(stream);
         stream.unread(b"head");
         let (mut read, _write) = tokio::io::split(stream);
         let mut output = String::new();

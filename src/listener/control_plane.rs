@@ -10,7 +10,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
 
 use crate::ca::LocalCa;
-use crate::extensible::Extensible;
+use crate::conn_stream::ConnStream;
 use crate::listener::default::{ControlFuture, ControlPlaneService};
 use crate::tls_header::ClientHello;
 
@@ -36,7 +36,7 @@ impl AxumControlPlaneService {
         &self,
         hostname: String,
         hello: ClientHello,
-        client: Extensible<tokio::net::TcpStream>,
+        client: ConnStream<tokio::net::TcpStream>,
     ) -> Result<()> {
         if hello.sni_host != hostname {
             return Err(anyhow!("control-plane SNI changed after classification"));
@@ -83,7 +83,7 @@ impl ControlPlaneService for AxumControlPlaneService {
         &'a self,
         hostname: String,
         hello: ClientHello,
-        client: Extensible<tokio::net::TcpStream>,
+        client: ConnStream<tokio::net::TcpStream>,
     ) -> ControlFuture<'a> {
         Box::pin(async move { self.serve_inner(hostname, hello, client).await })
     }
@@ -120,7 +120,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut client = Extensible::of(socket);
+            let mut client = ConnStream::of(socket);
             let hello = crate::tls_header::read_client_hello(
                 &mut client,
                 Duration::from_secs(2),
@@ -169,7 +169,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut client = Extensible::of(socket);
+            let mut client = ConnStream::of(socket);
             let hello = crate::tls_header::read_client_hello(&mut client, Duration::from_secs(2), crate::tls_header::DEFAULT_MAX_CLIENT_HELLO_SIZE).await.unwrap();
             service.serve("tls.example".into(), hello, client).await.unwrap();
         });

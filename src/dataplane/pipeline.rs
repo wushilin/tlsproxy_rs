@@ -22,7 +22,7 @@ pub struct Intercepted<Artifact, Stream> {
 ///
 /// Interception is *lossless*: an implementation must retain the exact bytes
 /// it consumed in the artifact (`ClientHello::buffered`, `HttpHead::buffered`)
-/// without altering them, so `Extensible::unread(artifact.buffered)` restores
+/// without altering them, so `ConnStream::unread(artifact.buffered)` restores
 /// the byte-identical wire stream. This lets the next layer either work from
 /// the parsed artifact or take the pristine stream — a TLS acceptor, an h2
 /// engine, a raw relay — as if nothing had been peeked. Transformations
