@@ -87,15 +87,11 @@ pub(crate) async fn run(
     let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
     upstream_write.write_all(&client_hello.buffered).await?;
     crate::relay::relay(
-        conn_id,
+        crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: header_len as u64 },
         client_read,
         client_write,
         upstream_read,
         upstream_write,
-        listener_config,
-        context,
-        controller,
-        header_len as u64,
     )
     .await
 }

@@ -258,7 +258,7 @@ where
         client_write.write_all(&response_head).await?;
         if response_status(&response_head) == Some(101) {
             info!("{conn_id} upgrade accepted by upstream; relaying as a bidirectional tunnel");
-            return crate::relay::relay(conn_id, base_read, client_write, upstream_read, upstream_write, listener_config, context, controller, header_len as u64).await;
+            return crate::relay::relay(crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: header_len as u64 }, base_read, client_write, upstream_read, upstream_write).await;
         }
     }
 
@@ -270,7 +270,7 @@ where
             Box::new(crate::http_header::ChunkedBodyReader::new(base_read))
         }
     };
-    crate::relay::relay(conn_id, client_read, client_write, upstream_read, upstream_write, listener_config, context, controller, header_len as u64).await
+    crate::relay::relay(crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: header_len as u64 }, client_read, client_write, upstream_read, upstream_write).await
 }
 
 /// Reads an HTTP response head (through the blank line) from the upstream,

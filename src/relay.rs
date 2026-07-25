@@ -75,8 +75,19 @@ pub async fn resolve_target(listener: &RelayPolicy, sni: &str, upstream_tls: boo
     Ok(selected)
 }
 
-pub async fn relay<CR, CW, UR, UW>(id: Arc<RequestId>, client_read: CR, client_write: CW, upstream_read: UR, upstream_write: UW, listener: Arc<RelayPolicy>, stats: Arc<ListenerStats>, controller: Arc<RwLock<Controller>>, initial_uploaded: u64) -> Result<()>
+/// Everything a bidirectional relay needs besides the four stream halves.
+pub struct RelayContext {
+    pub id: Arc<RequestId>,
+    pub policy: Arc<RelayPolicy>,
+    pub stats: Arc<ListenerStats>,
+    pub controller: Arc<RwLock<Controller>>,
+    /// Bytes already accounted to the upload direction (e.g. a parsed head).
+    pub initial_uploaded: u64,
+}
+
+pub async fn relay<CR, CW, UR, UW>(relay_ctx: RelayContext, client_read: CR, client_write: CW, upstream_read: UR, upstream_write: UW) -> Result<()>
 where CR: AsyncRead + Unpin + Send + 'static, CW: AsyncWrite + Unpin + Send + 'static, UR: AsyncRead + Unpin + Send + 'static, UW: AsyncWrite + Unpin + Send + 'static {
+    let RelayContext { id, policy: listener, stats, controller, initial_uploaded } = relay_ctx;
     let idle = Arc::new(Mutex::new(IdleTracker::new(stats.idle_timeout_ms())));
     let uploaded = Arc::new(AtomicU64::new(initial_uploaded));
     let downloaded = Arc::new(AtomicU64::new(0));
@@ -182,15 +193,11 @@ mod tests {
         let stats = Arc::new(ListenerStats::new("test", 5_000));
         let controller = Arc::new(RwLock::new(Controller::new()));
         let relay_task = tokio::spawn(relay(
-            Arc::new(RequestId::new()),
+            RelayContext { id: Arc::new(RequestId::new()), policy: listener, stats, controller, initial_uploaded: 0 },
             proxy_client_read,
             proxy_client_write,
             proxy_upstream_read,
             proxy_upstream_write,
-            listener,
-            stats,
-            controller,
-            0,
         ));
 
         client_write.write_all(b"GET / HTTP/1.1\r\nHost: example\r\n\r\n").await.unwrap();

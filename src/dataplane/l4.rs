@@ -53,29 +53,21 @@ pub(crate) async fn run(
         );
         let (upstream_read, upstream_write) = tokio::io::split(upstream);
         crate::relay::relay(
-            conn_id,
+            crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: 0 },
             client_read,
             client_write,
             upstream_read,
             upstream_write,
-            listener_config,
-            context,
-            controller,
-            0,
         )
         .await
     } else {
         let (upstream_read, upstream_write) = tokio::io::split(upstream);
         crate::relay::relay(
-            conn_id,
+            crate::relay::RelayContext { id: conn_id, policy: listener_config, stats: context, controller, initial_uploaded: 0 },
             client_read,
             client_write,
             upstream_read,
             upstream_write,
-            listener_config,
-            context,
-            controller,
-            0,
         )
         .await
     }
