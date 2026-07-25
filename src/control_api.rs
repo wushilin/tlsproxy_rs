@@ -883,6 +883,15 @@ async fn save_certificate(
             Err(cause) => return (StatusCode::BAD_REQUEST, cause.to_string()).into_response(),
         }
     }
+    // Public CAs never issue for a single label, so a dotless name is always a
+    // typo; rejecting it here beats a renewal that can only ever fail.
+    if let Some(domain) = certificate.domains.iter().find(|domain| !domain.contains('.')) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("`{domain}` is not a fully-qualified domain name (it has no dot); did you mean `{domain}.<your-domain>`?"),
+        )
+            .into_response();
+    }
     let store = state.store.clone();
     match tokio::task::spawn_blocking(move || store.save_managed_certificate(&certificate)).await {
         Ok(Ok(())) => {

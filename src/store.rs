@@ -1077,16 +1077,22 @@ impl Store {
         let lets_encrypt = matches!(certificate.provider_id.as_str(), "letsencrypt-production" | "letsencrypt-staging");
         let issued_and_valid = self.active_generation(certificate_id)?
             .is_some_and(|generation| crate::managed_tls::validate_generation(&certificate, &generation).is_ok());
-        if lets_encrypt && issued_and_valid {
-            bail!("an issued and still-valid Let's Encrypt certificate cannot be deleted");
-        }
-        if certificate.automatic {
-            let config = self.load_config()?.map(|stored| stored.config);
-            let still_managed = config.as_ref().is_some_and(|config| certificate.domains.iter().any(|domain| {
-                automatic_domain_is_in_use(config, domain)
-            }));
-            if still_managed {
-                bail!("automatic certificate is managed by an active TLS route and cannot be deleted");
+        // A certificate that never issued (or whose issuance expired) is only a
+        // pending request — often a typo — so it is always deletable; deleting
+        // an automatic one is harmless because the next matching handshake
+        // simply re-registers it.
+        if issued_and_valid {
+            if lets_encrypt {
+                bail!("an issued and still-valid Let's Encrypt certificate cannot be deleted");
+            }
+            if certificate.automatic {
+                let config = self.load_config()?.map(|stored| stored.config);
+                let still_managed = config.as_ref().is_some_and(|config| certificate.domains.iter().any(|domain| {
+                    automatic_domain_is_in_use(config, domain)
+                }));
+                if still_managed {
+                    bail!("automatic certificate is managed by an active TLS route and cannot be deleted");
+                }
             }
         }
         let certificates = self.cf(CF_CERTIFICATES)?;
@@ -1470,6 +1476,32 @@ mod tests {
         let certificate = store.certificate_for_domain("auto.example").unwrap().unwrap();
         assert!(certificate.automatic);
         assert_eq!(certificate.provider_id, "letsencrypt-production");
+
+        // Never-issued (pending) certificates are always deletable — a pending
+        // entry may simply be a typo — even while a route still matches.
+        assert!(store.delete_managed_certificate(&certificate.id).unwrap());
+        assert_eq!(store.ensure_automatic_certificates(&config).unwrap(), 1);
+        let certificate = store.certificate_for_domain("auto.example").unwrap().unwrap();
+
+        // Once issued and still valid, the certificate becomes protected.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["auto.example".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        store
+            .activate_generation(
+                &CertificateGeneration {
+                    id: "auto-generation".into(),
+                    certificate_id: certificate.id.clone(),
+                    certificate_pem: leaf.pem(),
+                    private_key_pem: key.serialize_pem(),
+                    not_after: Some(OffsetDateTime::now_utc() + time::Duration::days(30)),
+                    ..Default::default()
+                },
+                &RenewalState { certificate_id: certificate.id.clone(), ..Default::default() },
+            )
+            .unwrap();
         assert!(store.delete_managed_certificate(&certificate.id).is_err());
     }
 

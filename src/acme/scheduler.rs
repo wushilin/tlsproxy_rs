@@ -3,7 +3,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use futures_util::StreamExt;
 use log::{error, info, warn};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify};
@@ -13,6 +14,13 @@ use crate::controller::Controller;
 
 pub const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 pub const DEFAULT_RENEWAL_DEADLINE: Duration = Duration::from_secs(5 * 60);
+/// Bounds the pre-renewal bookkeeping (ARI refresh plus the due-certificate
+/// scan). Without this ceiling a single hung CA request wedges `run_once`
+/// while it holds `exclusive`, silently disabling every future scan.
+const SCAN_PREPARATION_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// Renewals within one scan run concurrently up to this limit so one slow or
+/// misconfigured certificate cannot head-of-line-block the others.
+const RENEWAL_CONCURRENCY: usize = 4;
 
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
@@ -147,18 +155,28 @@ impl<B: RenewalBackend> RenewalScheduler<B> {
     pub async fn run_once(&self, trigger: ScanTrigger) -> Result<ScanSummary> {
         let _guard = self.exclusive.lock().await;
         let started = Instant::now();
-        let candidates = match self
-            .backend
-            .due_certificates(OffsetDateTime::now_utc())
-            .await
+        info!("ACME scan triggered: trigger={}", trigger.as_str());
+        let candidates = match tokio::time::timeout(
+            SCAN_PREPARATION_DEADLINE,
+            self.backend.due_certificates(OffsetDateTime::now_utc()),
+        )
+        .await
         {
-            Ok(candidates) => candidates,
-            Err(cause) => {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(cause)) => {
                 error!(
                     "ACME scan failed: trigger={}, error={cause:#}",
                     trigger.as_str()
                 );
                 return Err(cause);
+            }
+            Err(_) => {
+                error!(
+                    "ACME scan preparation timed out: trigger={}, deadline_seconds={}",
+                    trigger.as_str(),
+                    SCAN_PREPARATION_DEADLINE.as_secs()
+                );
+                return Err(anyhow!("ACME scan preparation timed out"));
             }
         };
         let mut summary = ScanSummary {
@@ -171,51 +189,21 @@ impl<B: RenewalBackend> RenewalScheduler<B> {
             summary.due
         );
 
-        for candidate in candidates {
-            let certificate_id = candidate.certificate_id.clone();
-            let domains = candidate.domains.clone();
-            let provider_id = candidate.provider_id.clone();
-            let renewal_started = Instant::now();
-            info!(
-                "ACME renewal started: cert={certificate_id}, domains={domains:?}, provider={provider_id}, deadline_seconds={}",
-                self.renewal_deadline.as_secs()
-            );
-            match tokio::time::timeout(
-                self.renewal_deadline,
-                self.backend.renew(candidate.clone()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    summary.renewed += 1;
-                    info!(
-                        "ACME renewal succeeded: cert={certificate_id}, domains={domains:?}, elapsed_ms={}",
-                        renewal_started.elapsed().as_millis()
-                    );
-                }
-                Ok(Err(cause)) => {
-                    summary.failed += 1;
-                    warn!(
-                        "ACME renewal failed: cert={certificate_id}, domains={domains:?}, elapsed_ms={}, error={cause:#}",
-                        renewal_started.elapsed().as_millis()
-                    );
-                }
-                Err(_) => {
+        let outcomes = futures_util::stream::iter(
+            candidates
+                .into_iter()
+                .map(|candidate| self.renew_candidate(candidate)),
+        )
+        .buffer_unordered(RENEWAL_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for outcome in outcomes {
+            match outcome {
+                RenewalOutcome::Renewed => summary.renewed += 1,
+                RenewalOutcome::Failed => summary.failed += 1,
+                RenewalOutcome::TimedOut => {
                     summary.failed += 1;
                     summary.timed_out += 1;
-                    warn!(
-                        "ACME renewal timed out: cert={certificate_id}, domains={domains:?}, deadline_seconds={}",
-                        self.renewal_deadline.as_secs()
-                    );
-                    if let Err(cause) = self
-                        .backend
-                        .record_timeout(&candidate, self.renewal_deadline)
-                        .await
-                    {
-                        error!(
-                            "ACME timeout state update failed: cert={certificate_id}, error={cause:#}"
-                        );
-                    }
                 }
             }
         }
@@ -231,6 +219,60 @@ impl<B: RenewalBackend> RenewalScheduler<B> {
         );
         Ok(summary)
     }
+
+    async fn renew_candidate(&self, candidate: RenewalCandidate) -> RenewalOutcome {
+        let certificate_id = candidate.certificate_id.clone();
+        let domains = candidate.domains.clone();
+        let provider_id = candidate.provider_id.clone();
+        let renewal_started = Instant::now();
+        info!(
+            "ACME renewal started: cert={certificate_id}, domains={domains:?}, provider={provider_id}, deadline_seconds={}",
+            self.renewal_deadline.as_secs()
+        );
+        match tokio::time::timeout(
+            self.renewal_deadline,
+            self.backend.renew(candidate.clone()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                info!(
+                    "ACME renewal succeeded: cert={certificate_id}, domains={domains:?}, elapsed_ms={}",
+                    renewal_started.elapsed().as_millis()
+                );
+                RenewalOutcome::Renewed
+            }
+            Ok(Err(cause)) => {
+                warn!(
+                    "ACME renewal failed: cert={certificate_id}, domains={domains:?}, elapsed_ms={}, error={cause:#}",
+                    renewal_started.elapsed().as_millis()
+                );
+                RenewalOutcome::Failed
+            }
+            Err(_) => {
+                warn!(
+                    "ACME renewal timed out: cert={certificate_id}, domains={domains:?}, deadline_seconds={}",
+                    self.renewal_deadline.as_secs()
+                );
+                if let Err(cause) = self
+                    .backend
+                    .record_timeout(&candidate, self.renewal_deadline)
+                    .await
+                {
+                    error!(
+                        "ACME timeout state update failed: cert={certificate_id}, error={cause:#}"
+                    );
+                }
+                RenewalOutcome::TimedOut
+            }
+        }
+    }
+}
+
+enum RenewalOutcome {
+    Renewed,
+    Failed,
+    TimedOut,
 }
 
 #[cfg(test)]
@@ -342,5 +384,27 @@ mod tests {
         assert_eq!(summary.timed_out, 2);
         assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
         assert_eq!(backend.timeouts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn renewals_within_a_scan_run_concurrently() {
+        let backend = Arc::new(FakeBackend {
+            candidates: vec![candidate("one"), candidate("two"), candidate("three")],
+            active: AtomicUsize::new(0),
+            maximum_active: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            timeouts: AtomicUsize::new(0),
+            delay: Duration::from_millis(50),
+            fail_id: None,
+        });
+        let scheduler = RenewalScheduler::with_timing(
+            Arc::clone(&backend),
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+        );
+        let summary = scheduler.run_once(ScanTrigger::Manual).await.unwrap();
+        assert_eq!(summary.renewed, 3);
+        // One slow certificate must not head-of-line-block the others.
+        assert!(backend.maximum_active.load(Ordering::SeqCst) >= 2);
     }
 }

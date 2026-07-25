@@ -66,6 +66,12 @@ impl<D> StoreRenewalBackend<D> {
     }
 }
 
+/// The account lookup and renewal-info call each contact the CA over HTTP
+/// with no client-level timeout; this bound keeps a dead connection (for
+/// example a stale pooled socket whose NAT mapping expired) from wedging the
+/// ARI sweep — and with it the whole renewal scan — indefinitely.
+const ARI_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl<D: DnsPrerequisite> StoreRenewalBackend<D> {
     async fn refresh_ari(&self, now: OffsetDateTime) -> Result<()> {
         for managed in self.store.managed_certificates_async().await? {
@@ -73,9 +79,14 @@ impl<D: DnsPrerequisite> StoreRenewalBackend<D> {
             let previous = self.store.renewal_state_async(managed.id.clone()).await?.unwrap_or_else(|| RenewalState { certificate_id: managed.id.clone(), ..Default::default() });
             if previous.ari_next_check.is_some_and(|next| next > now) { continue; }
             let Some(generation) = self.store.active_generation_async(managed.id.clone()).await? else { continue; };
-            let account = match self.account(&managed.provider_id).await { Ok(value) => value, Err(cause) => { log::warn!("ACME ARI account unavailable: cert={}, error={cause:#}", managed.id); continue; } };
-            match super::client::renewal_information(&account, &generation).await {
-                Ok(Some(value)) => {
+            let account = match tokio::time::timeout(ARI_STEP_TIMEOUT, self.account(&managed.provider_id)).await {
+                Ok(Ok(value)) => value,
+                Ok(Err(cause)) => { log::warn!("ACME ARI account unavailable: cert={}, error={cause:#}", managed.id); continue; }
+                Err(_) => { log::warn!("ACME ARI account lookup timed out: cert={}, deadline_seconds={}", managed.id, ARI_STEP_TIMEOUT.as_secs()); continue; }
+            };
+            match tokio::time::timeout(ARI_STEP_TIMEOUT, super::client::renewal_information(&account, &generation)).await {
+                Err(_) => log::warn!("ACME ARI refresh timed out: cert={}, deadline_seconds={}", managed.id, ARI_STEP_TIMEOUT.as_secs()),
+                Ok(Ok(Some(value))) => {
                     let mut state = previous;
                     state.ari_suggested_at = Some(value.suggested_at);
                     state.ari_explanation_url = value.explanation_url;
@@ -83,13 +94,13 @@ impl<D: DnsPrerequisite> StoreRenewalBackend<D> {
                     state.ari_next_check = Some(now + time::Duration::try_from(value.retry_after).unwrap_or(time::Duration::hours(12)));
                     self.store.save_renewal_state_async(state).await?;
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     let mut state = previous;
                     state.ari_checked_at = Some(now);
                     state.ari_next_check = Some(now + time::Duration::days(7));
                     self.store.save_renewal_state_async(state).await?;
                 }
-                Err(cause) => log::warn!("ACME ARI refresh failed: cert={}, error={cause:#}", managed.id),
+                Ok(Err(cause)) => log::warn!("ACME ARI refresh failed: cert={}, error={cause:#}", managed.id),
             }
         }
         Ok(())
