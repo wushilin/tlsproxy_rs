@@ -181,6 +181,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_head_read_is_fully_undoable() {
+        // The head parse must be reversible: unreading `head.buffered`
+        // restores the byte-identical wire stream, so a downstream protocol
+        // engine can take over as if nothing had been peeked.
+        let raw = b"POST /submit HTTP/1.1\r\nHost: h.example\r\nContent-Length: 9\r\n\r\nBODY";
+        let (mut peer, stream) = tokio::io::duplex(256);
+        peer.write_all(raw).await.unwrap();
+        let mut client = Extensible::of(stream);
+        let head = crate::http_header::read_http_head(
+            &mut client,
+            std::time::Duration::from_secs(1),
+            65536,
+        )
+        .await
+        .unwrap();
+        assert_eq!(head.method, "POST");
+        client.unread(&head.buffered);
+        peer.write_all(b"-tail").await.unwrap();
+        drop(peer);
+        let mut restored = Vec::new();
+        client.read_to_end(&mut restored).await.unwrap();
+        assert_eq!(restored, [raw.as_slice(), b"-tail"].concat());
+    }
+
+    #[tokio::test]
     async fn split_read_half_still_drains_pushback() {
         let (mut peer, stream) = tokio::io::duplex(64);
         peer.write_all(b"-tail").await.unwrap();
