@@ -6,17 +6,32 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const DEFAULT_MAX_HTTP_HEADER_SIZE: usize = 256 * 1024;
 
+/// Header carrying the random tokens of requests this proxy (or another
+/// tlsproxy hop) forwarded to a plaintext HTTP upstream. Inbound values are
+/// passed through untouched and a fresh token is appended per hop, so in a
+/// self-connection loop — direct or through several proxies — the originating
+/// instance recognizes its own recent token and closes the loop.
+pub const LOOP_TOKEN_HEADER: &str = "x-tlsproxy-rid";
+
 /// The buffered start of a plaintext HTTP/1.x connection: everything read so
 /// far (`buffered`, which may extend past the header block into the body) and
 /// the routing facts parsed from the request head.
 #[derive(Debug)]
 pub struct HttpHead {
+    pub method: String,
+    /// Origin-form request path including any query string.
+    pub target: String,
     /// Hostname from the `Host` header, without any port.
     pub host: String,
     /// Explicit port from the `Host` header, when the client sent one.
     pub port: Option<u16>,
     /// The raw `Host` header value (`example.com` or `example.com:8080`).
     pub host_raw: String,
+    pub authorization: Option<String>,
+    /// Values of `X-Tlsproxy-Rid` headers on the inbound request, checked
+    /// against recently forwarded tokens to detect self-connection loops.
+    pub loop_tokens: Vec<String>,
+    strip_authorization: bool,
     /// Bytes read from the client; the head occupies `..head_len`.
     pub buffered: Vec<u8>,
     head_len: usize,
@@ -78,9 +93,11 @@ fn parse_head(buffered: Vec<u8>, head_len: usize) -> Result<HttpHead> {
         .map_err(|_| anyhow!("HTTP request head is not valid UTF-8"))?;
     let mut lines = head.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line));
     let request_line = lines.next().unwrap_or("");
-    validate_request_line(request_line)?;
+    let (method, target) = validate_request_line(request_line)?;
 
     let mut host_value: Option<&str> = None;
+    let mut authorization: Option<String> = None;
+    let mut loop_tokens: Vec<String> = Vec::new();
     let mut last_was_host = false;
     for line in lines {
         if line.is_empty() {
@@ -102,6 +119,10 @@ fn parse_head(buffered: Vec<u8>, head_len: usize) -> Result<HttpHead> {
                 bail!("HTTP request contains multiple Host headers");
             }
             host_value = Some(value.trim());
+        } else if name.trim().eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.trim().to_string());
+        } else if name.trim().eq_ignore_ascii_case(LOOP_TOKEN_HEADER) {
+            loop_tokens.extend(value.split(',').map(|token| token.trim().to_string()).filter(|token| !token.is_empty()));
         }
     }
     let host_raw = host_value
@@ -109,15 +130,20 @@ fn parse_head(buffered: Vec<u8>, head_len: usize) -> Result<HttpHead> {
         .to_string();
     let (host, port) = split_host_port(&host_raw)?;
     Ok(HttpHead {
+        method,
+        target,
         host,
         port,
         host_raw,
+        authorization,
+        loop_tokens,
+        strip_authorization: false,
         buffered,
         head_len,
     })
 }
 
-fn validate_request_line(line: &str) -> Result<()> {
+fn validate_request_line(line: &str) -> Result<(String, String)> {
     let mut parts = line.split_ascii_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -128,7 +154,10 @@ fn validate_request_line(line: &str) -> Result<()> {
     if !version.starts_with("HTTP/1.") {
         bail!("only HTTP/1.x requests are supported, got `{version}`");
     }
-    Ok(())
+    if !target.starts_with('/') {
+        bail!("only origin-form HTTP request targets are supported");
+    }
+    Ok((method.to_string(), target.to_string()))
 }
 
 /// Splits `example.com`, `example.com:8080`, `[::1]`, or `[::1]:8080` from a
@@ -160,12 +189,159 @@ fn split_host_port(value: &str) -> Result<(String, Option<u16>)> {
     Ok((host.to_string(), port))
 }
 
+/// How the first request's body is delimited on the wire. Anything that
+/// cannot be delimited unambiguously is rejected to prevent request smuggling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyFraming {
+    Length(u64),
+    Chunked,
+}
+
 impl HttpHead {
+    pub fn consume_authorization(&mut self) { self.strip_authorization = true; }
+
+    /// True when the request asks to switch protocols: `Connection` lists the
+    /// `upgrade` token and an `Upgrade` header names the target protocol
+    /// (for example WebSocket).
+    pub fn upgrade_requested(&self) -> bool {
+        self.header_value("connection")
+            .is_some_and(|value| value.split(',').any(|token| token.trim().eq_ignore_ascii_case("upgrade")))
+            && self.header_value("upgrade").is_some()
+    }
+
+    /// Returns the value of the first header with the given name
+    /// (case-insensitive), trimmed of surrounding whitespace.
+    pub fn header_value(&self, name: &str) -> Option<String> {
+        let head = String::from_utf8_lossy(&self.buffered[..self.head_len]);
+        for line in head.lines().skip(1) {
+            if let Some((key, value)) = line.split_once(':') {
+                if key.trim().eq_ignore_ascii_case(name) {
+                    return Some(value.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Bytes read past the request head (the start of the body, and possibly
+    /// pipelined data beyond it).
+    pub fn body_prefix(&self) -> &[u8] { &self.buffered[self.head_len..] }
+
+    /// Determines how the request body ends, so the data plane can stop
+    /// relaying client bytes at the message boundary instead of streaming the
+    /// connection verbatim (which would let pipelined requests bypass per-path
+    /// authentication and routing).
+    pub fn body_framing(&self) -> Result<BodyFraming> {
+        let head = std::str::from_utf8(&self.buffered[..self.head_len])
+            .map_err(|_| anyhow!("HTTP request head is not valid UTF-8"))?;
+        let mut content_length: Option<u64> = None;
+        let mut transfer_encoding: Option<String> = None;
+        let mut last_was_framing = false;
+        for line in head.split('\n').skip(1).map(|line| line.strip_suffix('\r').unwrap_or(line)) {
+            if line.is_empty() { break; }
+            if line.starts_with([' ', '\t']) {
+                if last_was_framing {
+                    bail!("folded body-framing headers are not supported");
+                }
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else { continue };
+            let name = name.trim().to_ascii_lowercase();
+            last_was_framing = matches!(name.as_str(), "content-length" | "transfer-encoding");
+            match name.as_str() {
+                "content-length" => {
+                    let value = value.trim();
+                    let parsed = value
+                        .parse::<u64>()
+                        .map_err(|_| anyhow!("invalid Content-Length `{value}`"))?;
+                    if content_length.is_some() {
+                        bail!("duplicate Content-Length headers");
+                    }
+                    content_length = Some(parsed);
+                }
+                "transfer-encoding" => {
+                    if transfer_encoding.is_some() {
+                        bail!("multiple Transfer-Encoding headers are not supported");
+                    }
+                    transfer_encoding = Some(value.trim().to_ascii_lowercase());
+                }
+                _ => {}
+            }
+        }
+        match transfer_encoding {
+            Some(encoding) => {
+                if content_length.is_some() {
+                    bail!("Content-Length combined with Transfer-Encoding is rejected");
+                }
+                if encoding != "chunked" {
+                    bail!("unsupported Transfer-Encoding `{encoding}`");
+                }
+                Ok(BodyFraming::Chunked)
+            }
+            None => Ok(BodyFraming::Length(content_length.unwrap_or(0))),
+        }
+    }
+    pub fn strip_path_prefix(&mut self, prefix: &str) {
+        let prefix = prefix.trim_end_matches('/');
+        let stripped = self.target.strip_prefix(prefix).unwrap_or(&self.target);
+        let new_target = if stripped.is_empty() { "/" } else { stripped };
+        let head = String::from_utf8_lossy(&self.buffered[..self.head_len]);
+        if let Some(line_end) = head.find('\n') {
+            // Lossy decoding can expand invalid bytes, shifting string
+            // indexes past the byte head; a first line that only terminates
+            // there is malformed anyway, so leave the head untouched.
+            if line_end + 1 > self.head_len {
+                return;
+            }
+            let first = head[..line_end].trim_end_matches('\r');
+            let mut parts = first.split_ascii_whitespace();
+            let method = parts.next().unwrap_or(&self.method);
+            let _old_target = parts.next();
+            let version = parts.next().unwrap_or("HTTP/1.1");
+            let ending = if head.as_bytes().get(line_end.wrapping_sub(1)) == Some(&b'\r') { "\r\n" } else { "\n" };
+            let mut rebuilt = format!("{method} {new_target} {version}{ending}").into_bytes();
+            // Only the first line changed, so the head terminator moves by
+            // exactly the difference between the new and old first-line
+            // lengths — no re-scan (and no unreachable failure arm) needed.
+            let rebuilt_head_len = rebuilt.len() + (self.head_len - (line_end + 1));
+            rebuilt.extend_from_slice(&self.buffered[line_end + 1..]);
+            self.buffered = rebuilt;
+            self.head_len = rebuilt_head_len;
+            self.target = new_target.to_string();
+        }
+    }
+
     /// Rebuilds the buffered bytes with proxy forwarding headers injected into
     /// the first request: the client is appended to `X-Forwarded-For` and
     /// `Forwarded`, while `X-Forwarded-Host` and `X-Forwarded-Proto` are set
     /// to this hop's values. Bytes past the header block pass through as-is.
-    pub fn with_forwarded_headers(&self, client_ip: IpAddr) -> Vec<u8> {
+    /// Pure rewrite: mint the loop token via
+    /// `hello_cache::mint_request_token` and pass it in; this function only
+    /// formats bytes and never touches process-wide state.
+    pub fn rewrite_for_proxy(
+        &self,
+        client_ip: IpAddr,
+        scheme: &str,
+        upstream_host: Option<&str>,
+        loop_token: &str,
+    ) -> Vec<u8> {
+        let upgrade_requested = self.upgrade_requested();
+        // RFC 9110 §7.6.1: hop-by-hop headers, plus every field named as a
+        // token in the client's own Connection header, terminate at this hop.
+        let mut hop_by_hop: Vec<String> = ["keep-alive", "te", "trailer", "proxy-authorization", "proxy-connection"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        if let Some(connection) = self.header_value("connection") {
+            hop_by_hop.extend(
+                connection
+                    .split(',')
+                    .map(|token| token.trim().to_ascii_lowercase())
+                    // `close` names no header, and an honored `upgrade` must
+                    // stay on the wire for the upstream to switch protocols.
+                    .filter(|token| !token.is_empty() && token != "close" && !(token == "upgrade" && upgrade_requested)),
+            );
+        }
         let head = String::from_utf8_lossy(&self.buffered[..self.head_len]);
         let mut lines = head
             .split('\n')
@@ -193,6 +369,10 @@ impl HttpHead {
             skipping_folds = false;
             if let Some((name, value)) = line.split_once(':') {
                 match name.trim().to_ascii_lowercase().as_str() {
+                    "host" if upstream_host.is_some() => {
+                        skipping_folds = true;
+                        continue;
+                    }
                     "x-forwarded-for" => {
                         xff_values.push(value.trim().to_string());
                         skipping_folds = true;
@@ -203,7 +383,22 @@ impl HttpHead {
                         skipping_folds = true;
                         continue;
                     }
-                    "x-forwarded-host" | "x-forwarded-proto" => {
+                    "authorization" if self.strip_authorization => {
+                        skipping_folds = true;
+                        continue;
+                    }
+                    "x-forwarded-host" | "x-forwarded-proto" | "connection" => {
+                        skipping_folds = true;
+                        continue;
+                    }
+                    // An Upgrade header without the Connection token is not an
+                    // upgrade request; forwarding it dangling would be
+                    // contradictory next to our own Connection header.
+                    "upgrade" if !upgrade_requested => {
+                        skipping_folds = true;
+                        continue;
+                    }
+                    name if hop_by_hop.iter().any(|token| token == name) => {
                         skipping_folds = true;
                         continue;
                     }
@@ -220,8 +415,7 @@ impl HttpHead {
             IpAddr::V6(ip) => format!("for=\"[{ip}]\""),
         };
         forwarded_values.push(format!(
-            "{forwarded_for};host={};proto=http",
-            self.host_raw
+            "{forwarded_for};host={};proto={scheme}", self.host_raw
         ));
         let mut push_header = |name: &str, value: &str| {
             output.extend_from_slice(name.as_bytes());
@@ -231,11 +425,147 @@ impl HttpHead {
         };
         push_header("X-Forwarded-For", &xff_values.join(", "));
         push_header("X-Forwarded-Host", &self.host_raw);
-        push_header("X-Forwarded-Proto", "http");
+        push_header("X-Forwarded-Proto", scheme);
         push_header("Forwarded", &forwarded_values.join(", "));
+        // Fresh loop token per hop; inbound tokens from other tlsproxy hops
+        // were passed through above so a multi-instance loop is still caught
+        // by whichever instance sees its own token return.
+        push_header("X-Tlsproxy-Rid", loop_token);
+        // The current data plane selects a path backend once per connection.
+        // Closing after the response guarantees every subsequent request is
+        // independently routed, including clients that otherwise use
+        // keep-alive. An Upgrade request is the exception: it must keep the
+        // upgrade intent on the wire or the upstream would refuse the
+        // protocol switch, and after a successful switch the connection is a
+        // tunnel, not a request stream.
+        if self.upgrade_requested() {
+            push_header("Connection", "upgrade");
+        } else {
+            push_header("Connection", "close");
+        }
+        if let Some(host) = upstream_host {
+            push_header("Host", host);
+        }
         output.extend_from_slice(b"\r\n");
         output.extend_from_slice(&self.buffered[self.head_len..]);
         output
+    }
+}
+
+/// Passes a chunked request body through verbatim while tracking the chunk
+/// framing, and reports EOF exactly at the end of the message (terminal chunk
+/// plus trailers). Framing lines are read one byte at a time so no bytes
+/// belonging to a pipelined follow-up request are ever consumed.
+pub struct ChunkedBodyReader<R> {
+    inner: R,
+    state: ChunkedState,
+}
+
+enum ChunkedState {
+    SizeLine { line: Vec<u8> },
+    Data { remaining: u64 },
+    DataEnd { seen_cr: bool },
+    Trailers { line: Vec<u8>, consumed: usize },
+    Done,
+}
+
+const MAX_CHUNK_LINE: usize = 256;
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
+
+impl<R> ChunkedBodyReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self { inner, state: ChunkedState::SizeLine { line: Vec::new() } }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ChunkedBodyReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::io::{Error, ErrorKind};
+        use std::task::Poll;
+        let this = self.as_mut().get_mut();
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let want = match &this.state {
+            ChunkedState::Done => return Poll::Ready(Ok(())),
+            // Framing lines advance one byte at a time to avoid overshooting
+            // the message boundary; chunk payloads read in bulk.
+            ChunkedState::Data { remaining } => (*remaining).min(buffer.remaining() as u64) as usize,
+            _ => 1,
+        };
+        let mut chunk = [0u8; 8192];
+        let mut scratch = tokio::io::ReadBuf::new(&mut chunk[..want.min(8192)]);
+        match std::pin::Pin::new(&mut this.inner).poll_read(context, &mut scratch) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(cause)) => return Poll::Ready(Err(cause)),
+            Poll::Ready(Ok(())) => {}
+        }
+        let filled = scratch.filled();
+        if filled.is_empty() {
+            return Poll::Ready(Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "connection closed inside a chunked request body",
+            )));
+        }
+        let malformed = |message: &str| Error::new(ErrorKind::InvalidData, message.to_string());
+        match &mut this.state {
+            ChunkedState::SizeLine { line } => {
+                let byte = filled[0];
+                if byte == b'\n' {
+                    let text = std::str::from_utf8(line).map_err(|_| malformed("chunk size line is not UTF-8"))?;
+                    let size_text = text.trim_end_matches('\r');
+                    let size_text = size_text.split(';').next().unwrap_or("").trim();
+                    let size = u64::from_str_radix(size_text, 16)
+                        .map_err(|_| malformed("invalid chunk size"))?;
+                    this.state = if size == 0 {
+                        ChunkedState::Trailers { line: Vec::new(), consumed: 0 }
+                    } else {
+                        ChunkedState::Data { remaining: size }
+                    };
+                } else {
+                    if line.len() >= MAX_CHUNK_LINE {
+                        return Poll::Ready(Err(malformed("chunk size line too long")));
+                    }
+                    line.push(byte);
+                }
+            }
+            ChunkedState::Data { remaining } => {
+                *remaining -= filled.len() as u64;
+                if *remaining == 0 {
+                    this.state = ChunkedState::DataEnd { seen_cr: false };
+                }
+            }
+            ChunkedState::DataEnd { seen_cr } => match (filled[0], *seen_cr) {
+                (b'\r', false) => *seen_cr = true,
+                (b'\n', _) => this.state = ChunkedState::SizeLine { line: Vec::new() },
+                _ => return Poll::Ready(Err(malformed("chunk data is not terminated by CRLF"))),
+            },
+            ChunkedState::Trailers { line, consumed } => {
+                *consumed += 1;
+                if *consumed > MAX_TRAILER_BYTES {
+                    return Poll::Ready(Err(malformed("chunked trailers too long")));
+                }
+                let byte = filled[0];
+                if byte == b'\n' {
+                    if line.iter().all(|value| *value == b'\r') && line.len() <= 1 {
+                        this.state = ChunkedState::Done;
+                    } else {
+                        line.clear();
+                    }
+                } else {
+                    line.push(byte);
+                }
+            }
+            // Unreachable: Done returns before reading. Report the message
+            // boundary again instead of forwarding stray bytes.
+            ChunkedState::Done => return Poll::Ready(Ok(())),
+        }
+        buffer.put_slice(filled);
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -256,6 +586,47 @@ mod tests {
             DEFAULT_MAX_HTTP_HEADER_SIZE,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn hop_by_hop_headers_terminate_at_this_proxy() {
+        let head = parse(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, X-Hop-Token\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\nTrailer: Expires\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nX-Hop-Token: secret\r\nUpgrade: h2c\r\nAccept: text/html\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let rewritten = String::from_utf8(head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None, "cafe")).unwrap();
+        let lower = rewritten.to_ascii_lowercase();
+        assert!(!lower.contains("keep-alive: timeout"));
+        assert!(!lower.contains("\nte:"));
+        assert!(!lower.contains("trailer:"));
+        assert!(!lower.contains("proxy-authorization:"));
+        assert!(!lower.contains("proxy-connection:"));
+        assert!(!lower.contains("x-hop-token:"), "headers named in Connection are dropped");
+        assert!(!lower.contains("upgrade: h2c"), "unhonored Upgrade is dropped");
+        assert!(rewritten.contains("Accept: text/html\r\n"), "end-to-end headers pass through");
+        assert!(rewritten.contains("Connection: close\r\n"));
+    }
+
+    #[tokio::test]
+    async fn upgrade_requests_keep_upgrade_intent_in_the_rewritten_head() {
+        let head = parse(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: abc\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert!(head.upgrade_requested());
+        let rewritten = String::from_utf8(head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "https", None, "cafe")).unwrap();
+        assert!(rewritten.contains("Connection: upgrade\r\n"));
+        assert!(!rewritten.contains("Connection: close"));
+        assert!(rewritten.contains("Upgrade: websocket\r\n"));
+        assert!(rewritten.contains("Sec-WebSocket-Key: abc\r\n"));
+
+        let plain = parse("GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n").await.unwrap();
+        // Upgrade without the Connection token is not an upgrade request.
+        assert!(!plain.upgrade_requested());
+        let rewritten = String::from_utf8(plain.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None, "cafe")).unwrap();
+        assert!(rewritten.contains("Connection: close\r\n"));
     }
 
     #[tokio::test]
@@ -361,7 +732,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let rewritten = head.with_forwarded_headers("192.0.2.7".parse::<IpAddr>().unwrap());
+        let rewritten = head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None, &crate::hello_cache::mint_request_token());
         let text = String::from_utf8(rewritten).unwrap();
         assert!(text.starts_with("GET /path HTTP/1.1\r\n"));
         assert!(text.contains("Host: app.example:8080\r\n"));
@@ -376,11 +747,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rewrite_injects_a_registered_loop_token_and_passes_foreign_tokens_through() {
+        let head = parse("GET / HTTP/1.1\r\nHost: app.example\r\nX-Tlsproxy-Rid: feedface\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(head.loop_tokens, vec!["feedface".to_string()]);
+        let rewritten = String::from_utf8(head.rewrite_for_proxy("192.0.2.7".parse::<IpAddr>().unwrap(), "http", None, &crate::hello_cache::mint_request_token())).unwrap();
+        // the upstream hop's token is preserved so the originating instance
+        // can still recognize it in a multi-instance loop
+        assert!(rewritten.contains("X-Tlsproxy-Rid: feedface\r\n"));
+        let ours = rewritten
+            .lines()
+            .filter_map(|line| line.strip_prefix("X-Tlsproxy-Rid: "))
+            .find(|value| *value != "feedface")
+            .expect("a fresh token is appended");
+        assert_eq!(ours.len(), 32);
+        assert!(crate::hello_cache::request_token_is_looped(ours), "our token is registered");
+        assert!(!crate::hello_cache::request_token_is_looped(ours), "detection consumes the token");
+        assert!(!crate::hello_cache::request_token_is_looped("feedface"), "foreign tokens are not registered");
+    }
+
+    #[tokio::test]
+    async fn body_framing_handles_lengths_chunked_and_smuggling_conflicts() {
+        use super::BodyFraming;
+        let head = parse("GET / HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+        assert_eq!(head.body_framing().unwrap(), BodyFraming::Length(0));
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 12\r\n\r\n").await.unwrap();
+        assert_eq!(head.body_framing().unwrap(), BodyFraming::Length(12));
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        assert_eq!(head.body_framing().unwrap(), BodyFraming::Chunked);
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        assert!(head.body_framing().is_err());
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n").await.unwrap();
+        assert!(head.body_framing().is_err());
+        let head = parse("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n").await.unwrap();
+        assert!(head.body_framing().is_err());
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_stops_exactly_at_the_message_boundary() {
+        use tokio::io::AsyncReadExt;
+        let wire = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\nGET /admin HTTP/1.1\r\n".to_vec();
+        let mut reader = super::ChunkedBodyReader::new(Cursor::new(wire));
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n");
+
+        let wire = b"3\r\nabc\r\n0\r\nExpires: soon\r\n\r\ntrailing pipelined".to_vec();
+        let mut reader = super::ChunkedBodyReader::new(Cursor::new(wire));
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"3\r\nabc\r\n0\r\nExpires: soon\r\n\r\n");
+
+        let truncated = b"5\r\nab".to_vec();
+        let mut reader = super::ChunkedBodyReader::new(Cursor::new(truncated));
+        let mut body = Vec::new();
+        assert!(reader.read_to_end(&mut body).await.is_err());
+    }
+
+    #[tokio::test]
     async fn forwarded_header_quotes_ipv6_and_body_passes_through() {
         let head = parse("POST / HTTP/1.1\r\nHost: v6.example\r\nContent-Length: 4\r\n\r\nbody")
             .await
             .unwrap();
-        let rewritten = head.with_forwarded_headers("2001:db8::1".parse::<IpAddr>().unwrap());
+        let rewritten = head.rewrite_for_proxy("2001:db8::1".parse::<IpAddr>().unwrap(), "http", None, &crate::hello_cache::mint_request_token());
         let text = String::from_utf8(rewritten).unwrap();
         assert!(text.contains("X-Forwarded-For: 2001:db8::1\r\n"));
         assert!(text.contains("Forwarded: for=\"[2001:db8::1]\";host=v6.example;proto=http\r\n"));

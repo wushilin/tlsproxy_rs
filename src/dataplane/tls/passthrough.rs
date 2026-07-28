@@ -10,28 +10,30 @@ use anyhow::{anyhow, Result};
 use log::{info, warn};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
 
 use crate::accounting::ConnStatus;
 use crate::active_tracker;
-use crate::config::Listener;
-use crate::controller::Controller;
-use crate::extensible::Extensible;
+use crate::dataplane::RelayPolicy;
+use crate::conn_stream::ConnStream;
 use crate::hello_cache;
-use crate::listener_stats::ListenerStats;
-use crate::request_id::RequestId;
 use crate::tls_header::{self, ClientHello};
 
+/// A passthrough route already selected by the dispatcher.
+pub(crate) struct PassthroughRoute {
+    pub target: Option<String>,
+    pub target_port: u16,
+    pub load_balancing: crate::runtime_config::HttpLoadBalancing,
+}
+
 pub(crate) async fn run(
-    name: Arc<String>,
-    mut client: Extensible<TcpStream>,
-    listener_config: Arc<Listener>,
-    context: Arc<ListenerStats>,
-    controller: Arc<RwLock<Controller>>,
+    ctx: crate::dataplane::ConnCtx,
+    policy: Arc<RelayPolicy>,
+    mut client: ConnStream<TcpStream>,
     inspected: Option<ClientHello>,
-    route_target: Option<(Option<String>, u16)>,
+    route: Option<PassthroughRoute>,
 ) -> Result<()> {
-    let conn_id = client.get_extension::<RequestId>().await.unwrap();
+    let crate::dataplane::ConnCtx { name, stats, controller, remote } = ctx;
+    let conn_id = client.request_id();
     info!("{conn_id} {name} passthrough worker started");
     let client_hello = match inspected {
         Some(client_hello) => client_hello,
@@ -51,22 +53,25 @@ pub(crate) async fn run(
     let header_len = client_hello.buffered.len();
     let sni_target = client_hello.sni_host;
     info!("{conn_id} sni target is {sni_target}");
-    active_tracker::set_sni(&conn_id, &sni_target).await;
-    context.increase_uploaded_bytes(header_len);
-    active_tracker::add_uploaded(&conn_id, header_len as u64).await;
-    let selected = match route_target {
-        Some((target, target_port)) => {
-            crate::forward::select_routed_target(
+    active_tracker::set_sni(&conn_id, &sni_target);
+    stats.increase_uploaded_bytes(header_len);
+    active_tracker::add_uploaded(&conn_id, header_len as u64);
+    let selected = match route {
+        Some(route) => {
+            crate::forward::select_routed_pool(
+                &name,
                 &sni_target,
-                target.as_deref(),
-                target_port,
+                route.target.as_deref(),
+                route.target_port,
                 true,
+                remote.ip(),
+                route.load_balancing,
             )
             .await?
         }
         None => {
             crate::relay::resolve_target(
-                &listener_config,
+                &policy,
                 &sni_target,
                 true,
                 &sni_target,
@@ -75,7 +80,7 @@ pub(crate) async fn run(
             .await?
         }
     };
-    active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint).await;
+    active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint);
     hello_cache::insert(client_hello.random);
     let upstream = tokio::time::timeout(
         Duration::from_secs(5),
@@ -83,20 +88,16 @@ pub(crate) async fn run(
     )
     .await??;
     info!("{conn_id} connected to TLS upstream {}", selected.endpoint);
-    active_tracker::set_status(&conn_id, ConnStatus::Ok).await;
+    active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(client);
     let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
     upstream_write.write_all(&client_hello.buffered).await?;
     crate::relay::relay(
-        conn_id,
+        crate::relay::RelayContext { id: conn_id, policy, stats, controller, initial_uploaded: header_len as u64 },
         client_read,
         client_write,
         upstream_read,
         upstream_write,
-        listener_config,
-        context,
-        controller,
-        header_len as u64,
     )
     .await
 }

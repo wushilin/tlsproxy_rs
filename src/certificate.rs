@@ -1,7 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Write};
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,64 +16,16 @@ use rustls::{
     sign::CertifiedKey,
 };
 use time::{Duration, OffsetDateTime};
-use x509_parser::extensions::GeneralName;
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::FromDer;
 
-const DEFAULT_VALIDITY_DAYS: u32 = 365;
 const CA_VALIDITY_DAYS: i64 = 3650;
-
-#[derive(Debug, Clone)]
-pub struct CertificatePaths {
-    pub cert: PathBuf,
-    pub key: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub struct LocalIdentityPaths {
-    pub ca_cert: PathBuf,
-    pub ca_key: PathBuf,
-    pub cert: PathBuf,
-    pub key: PathBuf,
-}
 
 pub struct MintedIdentity {
     pub certified_key: CertifiedKey,
     pub cert_pem: String,
     pub key_pem: String,
     pub expires_at: OffsetDateTime,
-}
-
-/// Generates or reuses an identity signed by the locally managed CA. The CA
-/// is created on first use; the leaf is regenerated when missing, nearing
-/// expiry, or no longer covering `san`.
-pub fn prepare_local_identity(
-    paths: &LocalIdentityPaths,
-    san: &[String],
-) -> Result<CertificatePaths> {
-    let issuer = load_or_create_ca(&paths.ca_cert, &paths.ca_key)?;
-    let sans = parse_sans(san)?;
-    if !leaf_is_reusable(&paths.cert, &paths.key, &paths.ca_cert, &sans) {
-        info!(
-            "local identity `{}` is missing, stale, or SAN-mismatched; generating new certificate",
-            paths.cert.display()
-        );
-        let ca_chain = read_certificates(&paths.ca_cert)?;
-        generate_leaf(
-            &issuer,
-            &ca_chain,
-            &paths.cert,
-            &paths.key,
-            sans,
-            DEFAULT_VALIDITY_DAYS,
-        )?;
-    } else {
-        info!("reusing existing local identity `{}`", paths.cert.display());
-    }
-    Ok(CertificatePaths {
-        cert: paths.cert.clone(),
-        key: paths.key.clone(),
-    })
 }
 
 /// Splits configured SAN entries into DNS and IP subject alternative names.
@@ -95,23 +47,13 @@ pub fn parse_sans(san: &[String]) -> Result<Vec<SanType>> {
         }
     }
     if sans.is_empty() {
-        sans.push(SanType::DnsName("localhost".try_into().unwrap()));
+        sans.push(SanType::DnsName(
+            "localhost"
+                .try_into()
+                .map_err(|_| anyhow!("`localhost` was rejected as a certificate DNS name"))?,
+        ));
     }
     Ok(sans)
-}
-
-/// Remaining validity of a PEM certificate file; zero when already expired.
-pub fn remaining_validity(cert_path: &Path) -> Result<std::time::Duration> {
-    let pem = fs::read(cert_path)
-        .with_context(|| format!("failed to read certificate `{}`", cert_path.display()))?;
-    let (_, pem) = parse_x509_pem(&pem).context("failed to decode certificate PEM")?;
-    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&pem.contents)
-        .context("failed to parse X.509 certificate")?;
-    Ok(certificate
-        .validity()
-        .time_to_expiration()
-        .and_then(|remaining| std::time::Duration::try_from(remaining).ok())
-        .unwrap_or(std::time::Duration::ZERO))
 }
 
 pub fn certificate_expires_at(cert_der: &[u8]) -> Result<OffsetDateTime> {
@@ -120,34 +62,6 @@ pub fn certificate_expires_at(cert_der: &[u8]) -> Result<OffsetDateTime> {
     let timestamp = certificate.validity().not_after.timestamp();
     OffsetDateTime::from_unix_timestamp(timestamp)
         .context("certificate has an unsupported expiration timestamp")
-}
-
-pub fn certificate_file_expires_at(cert_path: &Path) -> Result<OffsetDateTime> {
-    let pem = fs::read(cert_path)
-        .with_context(|| format!("failed to read certificate `{}`", cert_path.display()))?;
-    let (_, pem) = parse_x509_pem(&pem).context("failed to decode certificate PEM")?;
-    certificate_expires_at(&pem.contents)
-}
-
-/// Writes a certificate/key PEM pair to disk atomically (key mode 0600).
-pub fn write_identity(paths: &CertificatePaths, cert_pem: &str, key_pem: &str) -> Result<()> {
-    atomic_write(&paths.cert, cert_pem.as_bytes(), false)?;
-    atomic_write(&paths.key, key_pem.as_bytes(), true)
-}
-
-pub fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
-    let certs = read_certificates(cert_path)?;
-    let key = read_private_key(key_path)?;
-    certified_key_from_parts(certs, key)
-}
-
-pub fn load_server_config(cert_path: &Path, key_path: &Path) -> Result<rustls::ServerConfig> {
-    let certs = read_certificates(cert_path)?;
-    let key = read_private_key(key_path)?;
-    rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| anyhow!("certificate and key do not form a valid TLS identity: {e}"))
 }
 
 pub fn load_or_create_ca(cert_path: &Path, key_path: &Path) -> Result<Issuer<'static, KeyPair>> {
@@ -236,75 +150,6 @@ fn load_ca(cert_path: &Path, key_path: &Path) -> Result<Issuer<'static, KeyPair>
     Issuer::from_ca_cert_pem(&cert_pem, key).context("failed to parse local CA certificate")
 }
 
-fn leaf_is_reusable(
-    cert_path: &Path,
-    key_path: &Path,
-    ca_cert_path: &Path,
-    required_sans: &[SanType],
-) -> bool {
-    leaf_is_reusable_with_threshold(
-        cert_path,
-        key_path,
-        ca_cert_path,
-        required_sans,
-        std::time::Duration::from_secs(30 * 24 * 60 * 60),
-    )
-}
-
-pub fn leaf_is_reusable_with_threshold(
-    cert_path: &Path,
-    key_path: &Path,
-    ca_cert_path: &Path,
-    required_sans: &[SanType],
-    renewal_window: std::time::Duration,
-) -> bool {
-    let result = (|| -> Result<bool> {
-        if !cert_path.exists() || !key_path.exists() {
-            return Ok(false);
-        }
-        validate_leaf_pair(cert_path, key_path)?;
-        let leaf_pem = fs::read(cert_path)?;
-        let ca_pem = fs::read(ca_cert_path)?;
-        let (_, leaf_pem) = parse_x509_pem(&leaf_pem)?;
-        let (_, ca_pem) = parse_x509_pem(&ca_pem)?;
-        let (_, leaf) = x509_parser::certificate::X509Certificate::from_der(&leaf_pem.contents)?;
-        let (_, ca) = x509_parser::certificate::X509Certificate::from_der(&ca_pem.contents)?;
-        if leaf
-            .validity()
-            .time_to_expiration()
-            .is_none_or(|remaining| remaining < renewal_window)
-        {
-            return Ok(false);
-        }
-        leaf.verify_signature(Some(ca.public_key()))?;
-        let san = leaf
-            .subject_alternative_name()?
-            .ok_or_else(|| anyhow!("generated certificate has no SAN extension"))?;
-        for required in required_sans {
-            let found = match required {
-                SanType::DnsName(name) => san.value.general_names.iter().any(|candidate| {
-                    matches!(candidate, GeneralName::DNSName(value) if *value == name.as_str())
-                }),
-                SanType::IpAddress(ip) => san.value.general_names.iter().any(|candidate| {
-                    matches!(candidate, GeneralName::IPAddress(value) if *value == ip_bytes(ip).as_slice())
-                }),
-                _ => false,
-            };
-            if !found {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    })();
-    result.unwrap_or(false)
-}
-
-fn ip_bytes(ip: &IpAddr) -> Vec<u8> {
-    match ip {
-        IpAddr::V4(ip) => ip.octets().to_vec(),
-        IpAddr::V6(ip) => ip.octets().to_vec(),
-    }
-}
 
 /// Appends CA certificates to a served chain, skipping any already present,
 /// so clients receive the full chain rather than a bare leaf.
@@ -358,43 +203,6 @@ pub fn mint_leaf(
         key_pem: key.serialize_pem(),
         expires_at,
     })
-}
-
-fn generate_leaf(
-    issuer: &Issuer<'_, KeyPair>,
-    ca_chain: &[CertificateDer<'static>],
-    cert_path: &Path,
-    key_path: &Path,
-    sans: Vec<SanType>,
-    validity_days: u32,
-) -> Result<()> {
-    let san_strings: Result<Vec<_>> = sans
-        .into_iter()
-        .map(|san| match san {
-            SanType::DnsName(name) => Ok(name.to_string()),
-            SanType::IpAddress(ip) => Ok(ip.to_string()),
-            _ => Err(anyhow!("unsupported SAN type")),
-        })
-        .collect();
-    let minted = mint_leaf(
-        issuer,
-        ca_chain,
-        &san_strings?,
-        "TLS Proxy Server",
-        validity_days,
-    )?;
-    atomic_write(cert_path, minted.cert_pem.as_bytes(), false)?;
-    atomic_write(key_path, minted.key_pem.as_bytes(), true)?;
-    info!(
-        "wrote local identity certificate `{}` and key `{}`",
-        cert_path.display(),
-        key_path.display()
-    );
-    Ok(())
-}
-
-fn validate_leaf_pair(cert_path: &Path, key_path: &Path) -> Result<()> {
-    load_server_config(cert_path, key_path).map(|_| ())
 }
 
 pub fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -473,83 +281,41 @@ fn atomic_write(path: &Path, contents: &[u8], private: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::Path;
-
+    use super::*;
     use tempfile::tempdir;
 
-    use super::{prepare_local_identity, remaining_validity, LocalIdentityPaths};
-
-    fn paths_in(directory: &Path) -> LocalIdentityPaths {
-        LocalIdentityPaths {
-            ca_cert: directory.join("CA.pem"),
-            ca_key: directory.join("CA.key"),
-            cert: directory.join("admin.pem"),
-            key: directory.join("admin.key"),
-        }
-    }
-
-    fn sans() -> Vec<String> {
-        vec!["localhost".into(), "proxy.test".into(), "127.0.0.1".into()]
-    }
-
     #[test]
-    fn generates_and_reuses_ca_and_leaf() {
+    fn generates_and_reuses_ca() {
         let directory = tempdir().unwrap();
-        let paths = paths_in(directory.path());
-        let identity = prepare_local_identity(&paths, &sans()).unwrap();
-        let ca_before = fs::read(&paths.ca_cert).unwrap();
-        let leaf_before = fs::read(&identity.cert).unwrap();
-
-        prepare_local_identity(&paths, &sans()).unwrap();
-
-        assert_eq!(ca_before, fs::read(&paths.ca_cert).unwrap());
-        assert_eq!(leaf_before, fs::read(&identity.cert).unwrap());
-        assert!(paths.ca_key.exists());
-        assert!(identity.key.exists());
-    }
-
-    #[test]
-    fn changed_sans_regenerate_leaf() {
-        let directory = tempdir().unwrap();
-        let paths = paths_in(directory.path());
-        let identity = prepare_local_identity(&paths, &sans()).unwrap();
-        let leaf_before = fs::read(&identity.cert).unwrap();
-
-        prepare_local_identity(&paths, &["another.test".to_string()]).unwrap();
-        assert_ne!(leaf_before, fs::read(&identity.cert).unwrap());
-    }
-
-    #[test]
-    fn generated_leaf_reports_remaining_validity() {
-        let directory = tempdir().unwrap();
-        let identity = prepare_local_identity(&paths_in(directory.path()), &sans()).unwrap();
-        let remaining = remaining_validity(&identity.cert).unwrap();
-        // generated with 365 days of validity; expect comfortably more than 300
-        assert!(remaining > std::time::Duration::from_secs(300 * 24 * 60 * 60));
+        let cert = directory.path().join("CA.pem");
+        let key = directory.path().join("CA-key.pem");
+        let first = load_or_create_ca(&cert, &key).unwrap();
+        let first_pem = std::fs::read(&cert).unwrap();
+        drop(first);
+        load_or_create_ca(&cert, &key).unwrap();
+        assert_eq!(std::fs::read(&cert).unwrap(), first_pem, "existing CA is reused, not regenerated");
     }
 
     #[test]
     fn refuses_partial_ca_pair() {
         let directory = tempdir().unwrap();
-        fs::write(directory.path().join("CA.pem"), "not a certificate").unwrap();
-        let error = prepare_local_identity(&paths_in(directory.path()), &sans()).unwrap_err();
-        assert!(error.to_string().contains("local CA is incomplete"));
-        assert!(!directory.path().join("CA.key").exists());
+        let cert = directory.path().join("CA.pem");
+        let key = directory.path().join("CA-key.pem");
+        load_or_create_ca(&cert, &key).unwrap();
+        std::fs::remove_file(&key).unwrap();
+        assert!(load_or_create_ca(&cert, &key).is_err(), "cert without key must not silently regenerate");
     }
 
     #[test]
-    fn invalid_existing_ca_is_never_replaced() {
+    fn minted_leaf_covers_requested_sans_and_expiry() {
         let directory = tempdir().unwrap();
-        let ca_cert = directory.path().join("CA.pem");
-        let ca_key = directory.path().join("CA.key");
-        fs::write(&ca_cert, "invalid certificate").unwrap();
-        fs::write(&ca_key, "invalid key").unwrap();
-        let cert_before = fs::read(&ca_cert).unwrap();
-        let key_before = fs::read(&ca_key).unwrap();
-
-        assert!(prepare_local_identity(&paths_in(directory.path()), &sans()).is_err());
-        assert_eq!(fs::read(&ca_cert).unwrap(), cert_before);
-        assert_eq!(fs::read(&ca_key).unwrap(), key_before);
+        let issuer = load_or_create_ca(&directory.path().join("CA.pem"), &directory.path().join("CA-key.pem")).unwrap();
+        let minted = mint_leaf(&issuer, &[], &["a.example".into(), "127.0.0.1".into()], "test", 30).unwrap();
+        assert_eq!(minted.certified_key.cert.len(), 1);
+        assert!(minted.expires_at > time::OffsetDateTime::now_utc());
+        let der = minted.certified_key.cert[0].as_ref();
+        let (_, parsed) = x509_parser::parse_x509_certificate(der).unwrap();
+        let text = format!("{:?}", parsed.extensions());
+        assert!(text.contains("a.example"));
     }
 }

@@ -10,26 +10,16 @@ pub struct Config {
     #[serde(default)]
     pub listeners: HashMap<String, Listener>,
     #[serde(default)]
-    pub options: Options,
-    #[serde(default)]
     pub dns: DnsConfig,
     /// Certificate authority used for every certificate the proxy manages
     /// (admin server TLS and terminating listeners). When absent, a local CA
     /// with default parameters is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ca: Option<CaConfig>,
-    pub admin_server: Option<AdminServerConfig>,
     /// Accounting CDR log. Absent or `enabled: false` disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounting: Option<AccountingConfig>,
 }
 
 /// Local CA configuration. When absent, `localca` defaults are used.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CaConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub localca: Option<LocalCaConfig>,
-}
 
 #[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
 pub struct LocalCaConfig {
@@ -106,32 +96,6 @@ pub struct RegexDnsRule {
 }
 
 impl Listener {
-    pub fn speed_limit(&self) -> f64 {
-        match self.speed_limit.as_ref() {
-            Some(inner) => {
-                if *inner == 0f64 {
-                    f64::INFINITY
-                } else {
-                    *inner
-                }
-            }
-            None => f64::INFINITY,
-        }
-    }
-    pub fn max_idle_time_ms(&self) -> u64 {
-        match self.max_idle_time_ms.as_ref() {
-            Some(inner) => {
-                if *inner == 0 {
-                    return u64::MAX;
-                } else {
-                    return *inner;
-                }
-            }
-            None => {
-                return 3600000;
-            }
-        }
-    }
 
     fn match_host(&self, host: &str) -> bool {
         for static_host in &self.rules.static_hosts {
@@ -155,32 +119,7 @@ impl Listener {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
-pub struct AdminServerConfig {
-    pub bind_address: Option<String>,
-    pub bind_port: Option<u16>,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub tls: Option<bool>,
-    /// Subject alternative names for the admin certificate; DNS names and
-    /// IP addresses are told apart automatically. The certificate itself
-    /// comes from the top-level `ca` source.
-    #[serde(default)]
-    pub san: Vec<String>,
-}
 
-impl Default for AdminServerConfig {
-    fn default() -> Self {
-        AdminServerConfig {
-            bind_address: Some("0.0.0.0".into()),
-            bind_port: Some(48888),
-            username: Some("admin".into()),
-            password: Some("admin".into()),
-            tls: Some(false),
-            san: vec!["localhost".into(), "127.0.0.1".into()],
-        }
-    }
-}
 
 /// Per-connection CDR accounting log with size-based rotation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,13 +242,6 @@ impl Config {
                 }
             }
         }
-        if let Some(admin) = &config.admin_server {
-            if let Some(address) = &admin.bind_address {
-                if let Err(cause) = crate::bindaddr::parse_bind_pattern(address) {
-                    return Err(format!("admin_server.bind_address: {cause}").into());
-                }
-            }
-        }
         return Ok(());
     }
 
@@ -385,24 +317,7 @@ pub enum Policy {
     ALLOW,
     DENY,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Options {
-    /// Directory for runtime artifacts such as the local CA.
-    #[serde(default = "default_runtime_dir")]
-    pub runtime_dir: String,
-}
 
-fn default_runtime_dir() -> String {
-    "./runtime".into()
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            runtime_dir: default_runtime_dir(),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -465,21 +380,6 @@ dns: {}
         let message = format!("{error}");
         assert!(message.contains("web"), "got: {message}");
         assert!(message.contains("missing closing"), "got: {message}");
-    }
-
-    #[test]
-    fn malformed_admin_bind_address_fails_load() {
-        let yaml = r#"
-listeners: {}
-admin_server:
-  bind_address: "%eth0/v5%"
-options: {}
-dns: {}
-"#;
-        let error = Config::load_string(yaml).unwrap_err();
-        let message = format!("{error}");
-        assert!(message.contains("admin_server"), "got: {message}");
-        assert!(message.contains("unknown family suffix"), "got: {message}");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::net::TcpStream;
@@ -11,14 +11,14 @@ use log::{info, warn};
 
 use crate::acme_challenge::TLS_ALPN_PROTOCOL;
 use crate::ca::LocalCa;
-use crate::config::{Listener, ListenerMode, Policy, Rules};
+
 use crate::controller::Controller;
-use crate::extensible::Extensible;
+use crate::conn_stream::ConnStream;
 use crate::listener_stats::ListenerStats;
 use crate::runtime_config::{DefaultListenerConfig, TlsRouteAction, UpstreamTransport};
 use crate::store::normalize_domain;
 use crate::tls_header::ClientHello;
-use crate::request_id::RequestId;
+use crate::dataplane::pipeline::Intercept;
 
 use super::{DefaultRoute, RejectReason};
 
@@ -39,7 +39,7 @@ pub trait ControlPlaneService: Send + Sync + 'static {
         &'a self,
         hostname: String,
         hello: ClientHello,
-        client: Extensible<TcpStream>,
+        client: ConnStream<TcpStream>,
     ) -> ControlFuture<'a>;
 }
 
@@ -48,27 +48,27 @@ pub trait ControlPlaneService: Send + Sync + 'static {
 /// use an ephemeral port without a find-then-bind race.
 pub async fn run(
     listener: tokio::net::TcpListener,
-    config: Arc<DefaultListenerConfig>,
     control_hostname: Option<String>,
     stats: Arc<ListenerStats>,
     mut listener_controller: Controller,
     ca: LocalCa,
     control_service: Arc<dyn ControlPlaneService>,
     certificate_cache: crate::managed_tls::ManagedCertificateCache,
-    certificate_fallback: crate::runtime_config::CertificateFallbackPolicy,
 ) -> Result<()> {
     let name = Arc::new(crate::runtime_config::DEFAULT_LISTENER_NAME.to_owned());
     loop {
         let (socket, remote_address) = listener.accept().await?;
-        let client = Extensible::of(socket);
-        client.extend(RequestId::new()).await;
+        let client = ConnStream::of(socket);
         let connection_controller = Arc::new(RwLock::new(listener_controller.child()));
         let task_name = Arc::clone(&name);
-        let task_config = Arc::clone(&config);
+        let live = crate::runtime_live::load();
+        let task_config = Arc::new(live.default_listener.clone());
+        stats.set_idle_timeout_ms(task_config.ordinary_traffic.max_idle_time_ms.unwrap_or(u64::MAX));
         let task_stats = Arc::clone(&stats);
         let task_ca = ca.clone();
         let task_control = Arc::clone(&control_service);
-        let task_control_hostname = control_hostname.clone();
+        let task_control_hostname = if live.control_plane.hostname.is_empty() { control_hostname.clone() } else { Some(live.control_plane.hostname.clone()) };
+        let task_fallback = live.certificate_fallback;
         let task_certificate_cache = certificate_cache.clone();
         drop(listener_controller.spawn(async move {
             handle_connection(
@@ -82,7 +82,7 @@ pub async fn run(
                 task_ca,
                 task_control,
                 task_certificate_cache,
-                certificate_fallback,
+                task_fallback,
             )
             .await;
         }));
@@ -91,7 +91,7 @@ pub async fn run(
 
 async fn handle_connection(
     name: Arc<String>,
-    mut client: Extensible<TcpStream>,
+    client: ConnStream<TcpStream>,
     remote_address: SocketAddr,
     config: Arc<DefaultListenerConfig>,
     control_hostname: Option<String>,
@@ -102,23 +102,27 @@ async fn handle_connection(
     certificate_cache: crate::managed_tls::ManagedCertificateCache,
     certificate_fallback: crate::runtime_config::CertificateFallbackPolicy,
 ) {
-    let request_id = client
-        .get_extension::<RequestId>()
-        .await
-        .expect("default listener installs request ID");
-    let started = Instant::now();
-    let active = stats.increase_conn_count();
-    crate::active_tracker::put(&request_id, &name, remote_address).await;
-    info!("{request_id} ({name}) default-listener connection from {remote_address}, active={active}");
+    let request_id = client.request_id();
+    // The guard owns tracking, active counts, and the CDR for this connection;
+    // it cleans up in Drop even if this task is force cancelled.
+    let guard = crate::dataplane::ConnGuard::start(
+        request_id.clone(),
+        name.clone(),
+        remote_address,
+        stats.clone(),
+        crate::accounting::ListenerType::TlsPassthrough,
+    );
+    info!("{request_id} ({name}) default-listener connection from {remote_address}");
 
-    let result: Result<crate::accounting::ListenerType> = async {
-        let hello = crate::tls_header::read_client_hello(
-            &mut client,
-            Duration::from_secs(5),
-            crate::tls_header::DEFAULT_MAX_CLIENT_HELLO_SIZE,
-        )
-        .await?;
-        crate::active_tracker::set_sni(&request_id, &hello.sni_host).await;
+    let result: Result<()> = async {
+        // The mandatory listener's single TLS interception. Its ClientHello
+        // artifact (SNI + ALPN) feeds `decide`, the classifier that routes ACME
+        // and control-plane traffic ahead of the data-plane interceptor stages.
+        let crate::dataplane::pipeline::Intercepted { artifact: hello, stream: client } =
+            crate::dataplane::tls::ClientHelloIntercept::new(client, Duration::from_secs(5))
+                .intercept()
+                .await?;
+        crate::active_tracker::set_sni(&request_id, &hello.sni_host);
         let route = decide(
             &hello,
             &config,
@@ -126,72 +130,41 @@ async fn handle_connection(
             |domain| crate::acme_challenge::global().resolve(domain).is_some(),
         );
         info!("{request_id} default-listener route selected: {route:?}");
+        let listener_type = match &route {
+            ConnectionRoute::ControlPlane { .. }
+            | ConnectionRoute::AcmeChallenge { .. }
+            | ConnectionRoute::Ordinary {
+                action: TlsRouteAction::Terminate { .. } | TlsRouteAction::ReverseProxy { .. },
+                ..
+            } => crate::accounting::ListenerType::TlsTerminate,
+            _ => crate::accounting::ListenerType::TlsPassthrough,
+        };
+        crate::active_tracker::set_listener_type(&request_id, listener_type);
         match route {
             ConnectionRoute::ControlPlane { hostname } => {
                 control_service.serve(hostname, hello, client).await?;
-                crate::active_tracker::set_status(&request_id, crate::accounting::ConnStatus::Ok).await;
-                Ok(crate::accounting::ListenerType::TlsTerminate)
+                crate::active_tracker::set_status(&request_id, crate::accounting::ConnStatus::Ok);
             }
             route => {
-                let listener_type = match &route {
-                    ConnectionRoute::Ordinary { action: TlsRouteAction::Terminate { .. }, .. }
-                    | ConnectionRoute::AcmeChallenge { .. } => crate::accounting::ListenerType::TlsTerminate,
-                    _ => crate::accounting::ListenerType::TlsPassthrough,
-                };
                 let is_acme = matches!(&route, ConnectionRoute::AcmeChallenge { .. });
-                dispatch_non_control(
-                    route,
-                    hello,
-                    client,
-                    name.clone(),
-                    &config,
-                    stats.clone(),
-                    controller,
-                    ca,
-                    certificate_cache,
-                    certificate_fallback,
-                )
+                let ctx = crate::dataplane::ConnCtx { name: name.clone(), remote: remote_address, stats: stats.clone(), controller };
+                let tls = crate::dataplane::TlsCtx { ca, cache: certificate_cache, fallback: certificate_fallback };
+                dispatch_non_control(ctx, tls, route, hello, client, &config)
                 .await?;
                 if is_acme {
-                    crate::active_tracker::set_status(&request_id, crate::accounting::ConnStatus::Ok).await;
+                    crate::active_tracker::set_status(&request_id, crate::accounting::ConnStatus::Ok);
                 }
-                Ok(listener_type)
             }
         }
+        Ok(())
     }
     .await;
     if let Err(cause) = &result {
         warn!("{request_id} default-listener connection failed: {cause:#}");
     }
-    let closed = crate::active_tracker::remove(&request_id).await;
-    if let Some(closed) = closed.filter(|_| crate::accounting::enabled()) {
-        let listener_type = result
-            .as_ref()
-            .copied()
-            .unwrap_or(crate::accounting::ListenerType::TlsPassthrough);
-        let end_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
-        crate::accounting::submit(crate::accounting::CdrRecord {
-            listener_type,
-            connection_id: request_id.to_string(),
-            listener_name: (*name).clone(),
-            sni: closed.sni,
-            target_host: closed.target_host,
-            target_endpoint: closed.target_endpoint,
-            remote_address: closed.remote_address.to_string(),
-            status: closed.status,
-            uploaded_bytes: closed.uploaded_bytes,
-            downloaded_bytes: closed.downloaded_bytes,
-            start_unix_ms: closed.started_at_unix_ms,
-            end_unix_ms,
-        });
-    }
-    let active = stats.decrease_conn_count();
     info!(
-        "{request_id} default-listener connection closed: active={active}, elapsed_ms={}",
-        started.elapsed().as_millis()
+        "{request_id} default-listener connection closed: elapsed_ms={}",
+        guard.elapsed().as_millis()
     );
 }
 
@@ -213,14 +186,12 @@ pub fn decide(
     ) {
         DefaultRoute::AcmeChallenge { domain } => ConnectionRoute::AcmeChallenge { domain },
         DefaultRoute::ControlPlane { hostname } => ConnectionRoute::ControlPlane { hostname },
-        DefaultRoute::Proxy { sni } => {
-            let action = config
-                .ordinary_traffic
-                .select_route(&sni)
-                .expect("classifier only returns Proxy for an available route")
-                .clone();
-            ConnectionRoute::Ordinary { sni, action }
-        }
+        DefaultRoute::Proxy { sni } => match config.ordinary_traffic.select_route(&sni) {
+            Some(action) => ConnectionRoute::Ordinary { sni, action: action.clone() },
+            // The classifier only returns Proxy for an available route; if
+            // the tables disagree, reject the connection instead of panicking.
+            None => ConnectionRoute::Reject(RejectReason::PolicyDenied),
+        },
         DefaultRoute::Reject(reason) => ConnectionRoute::Reject(reason),
     }
 }
@@ -229,16 +200,12 @@ pub fn decide(
 /// connections deliberately remain the responsibility of the admin service
 /// adapter so this module cannot accidentally proxy the reserved hostname.
 pub(crate) async fn dispatch_non_control(
+    ctx: crate::dataplane::ConnCtx,
+    tls: crate::dataplane::TlsCtx,
     route: ConnectionRoute,
     hello: ClientHello,
-    client: Extensible<TcpStream>,
-    name: Arc<String>,
+    client: ConnStream<TcpStream>,
     config: &DefaultListenerConfig,
-    context: Arc<ListenerStats>,
-    controller: Arc<RwLock<Controller>>,
-    ca: LocalCa,
-    certificate_cache: crate::managed_tls::ManagedCertificateCache,
-    certificate_fallback: crate::runtime_config::CertificateFallbackPolicy,
 ) -> Result<()> {
     match route {
         ConnectionRoute::AcmeChallenge { domain } => {
@@ -248,17 +215,24 @@ pub(crate) async fn dispatch_non_control(
             crate::acme_challenge::accept_buffered(hello.buffered, client, certificate).await
         }
         ConnectionRoute::Ordinary { action, .. } => {
-            let limits = compatibility_listener(config, &action);
+            // Covers every route kind: a ClientHello random this proxy
+            // recently sent upstream (passthrough-forwarded or originated by
+            // our own TLS connector) arriving back here is a self-connection
+            // loop, whether it re-enters a passthrough, terminate, or
+            // reverse-proxy route.
+            if crate::hello_cache::is_looped(&hello.random) {
+                warn!("inbound ClientHello was recently forwarded by this proxy; closing self-connection loop");
+                bail!("detected self-connection loop");
+            }
+            let policy = crate::dataplane::RelayPolicy::for_tls_route(config, &action);
             match action {
-                TlsRouteAction::Passthrough { target_port, target } => {
-                    crate::listener::tls_passthrough::run(
-                        name,
+                TlsRouteAction::Passthrough { target_port, target, load_balancing } => {
+                    crate::dataplane::tls::passthrough::run(
+                        ctx,
+                        policy,
                         client,
-                        limits,
-                        context,
-                        controller,
                         Some(hello),
-                        Some((target, target_port)),
+                        Some(crate::dataplane::tls::passthrough::PassthroughRoute { target, target_port, load_balancing }),
                     )
                     .await
                 }
@@ -266,24 +240,36 @@ pub(crate) async fn dispatch_non_control(
                     target_port,
                     target,
                     upstream,
+                    load_balancing,
                 } => {
-                    let certified_key = certificate_cache
-                        .resolve_with_fallback(&hello.sni_host, &ca, certificate_fallback)
+                    crate::managed_tls::request_automatic_for_sni(&hello.sni_host);
+                    let certified_key = tls.cache
+                        .resolve_with_fallback(&hello.sni_host, &tls.ca, tls.fallback)
                         .await?;
-                    crate::listener::tls_terminate::run_inspected(
-                        name,
+                    crate::dataplane::tls::terminate::run_inspected(
+                        ctx,
+                        policy,
+                        tls.ca,
                         client,
                         hello,
-                        limits,
-                        context,
-                        controller,
-                        ca,
-                        target,
-                        target_port,
-                        upstream == UpstreamTransport::Tls,
+                        crate::dataplane::tls::terminate::TerminateRoute {
+                            target,
+                            target_port,
+                            upstream_tls: upstream == UpstreamTransport::Tls,
+                            load_balancing,
+                        },
                         certified_key,
                     )
                     .await
+                }
+                TlsRouteAction::ReverseProxy { action } => {
+                    crate::managed_tls::request_automatic_for_sni(&hello.sni_host);
+                    let certified_key = tls.cache
+                        .resolve_with_fallback(&hello.sni_host, &tls.ca, tls.fallback)
+                        .await?;
+                    crate::dataplane::tls::terminate::run_reverse_proxy(
+                        ctx, policy, client, hello, certified_key, action,
+                    ).await
                 }
                 TlsRouteAction::Reject => bail!("default-listener route explicitly rejected SNI"),
             }
@@ -295,38 +281,13 @@ pub(crate) async fn dispatch_non_control(
     }
 }
 
-pub(crate) fn compatibility_listener(
-    config: &DefaultListenerConfig,
-    action: &TlsRouteAction,
-) -> Arc<Listener> {
-    let (mode, upstream_tls) = match action {
-        TlsRouteAction::Passthrough { .. } => (ListenerMode::Passthrough, true),
-        TlsRouteAction::Terminate { upstream, .. } => {
-            (ListenerMode::Terminate, *upstream == UpstreamTransport::Tls)
-        }
-        TlsRouteAction::Reject => (ListenerMode::Passthrough, false),
-    };
-    Arc::new(Listener {
-        bind: config.bind.clone(),
-        target: None,
-        target_port: action.target_port().unwrap_or(443),
-        policy: Policy::DENY,
-        rules: Rules {
-            static_hosts: Vec::new(),
-            patterns: Vec::new(),
-        },
-        max_idle_time_ms: config.ordinary_traffic.max_idle_time_ms,
-        speed_limit: config.ordinary_traffic.speed_limit,
-        mode,
-        upstream_tls,
-    })
-}
 
 /// Pure routing policy for the required public :443 listener.
 ///
-/// Ordering is security-sensitive: ACME ALPN is never allowed to fall through
-/// to a proxy handler, and the reserved control hostname bypasses ordinary ACL
-/// evaluation but can never become an upstream route.
+/// Ordering is security-sensitive: an active local ACME challenge takes
+/// precedence, while unmatched ACME ALPN follows the ordinary SNI route. The
+/// reserved control hostname bypasses ordinary ACL evaluation but can never
+/// become an upstream route.
 pub fn classify(
     sni: Option<&str>,
     alpn_protocols: &[Vec<u8>],
@@ -340,12 +301,8 @@ pub fn classify(
     let is_acme = alpn_protocols
         .iter()
         .any(|protocol| protocol.as_slice() == TLS_ALPN_PROTOCOL);
-    if is_acme {
-        return if challenge_is_active(&sni) {
-            DefaultRoute::AcmeChallenge { domain: sni }
-        } else {
-            DefaultRoute::Reject(RejectReason::UnmatchedAcmeChallenge)
-        };
+    if is_acme && challenge_is_active(&sni) {
+        return DefaultRoute::AcmeChallenge { domain: sni };
     }
     if control_hostname
         .and_then(|value| normalize_domain(value).ok())
@@ -386,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_acme_never_falls_through() {
+    fn unmatched_acme_follows_ordinary_sni_route() {
         assert_eq!(
             classify(
                 Some("site.example"),
@@ -395,7 +352,23 @@ mod tests {
                 |_| false,
                 |_| true,
             ),
-            DefaultRoute::Reject(RejectReason::UnmatchedAcmeChallenge)
+            DefaultRoute::Proxy {
+                sni: "site.example".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unmatched_acme_is_rejected_without_an_ordinary_route() {
+        assert_eq!(
+            classify(
+                Some("site.example"),
+                &acme(),
+                Some("tls.example"),
+                |_| false,
+                |_| false,
+            ),
+            DefaultRoute::Reject(RejectReason::PolicyDenied)
         );
     }
 
@@ -416,6 +389,40 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_acme_selects_configured_passthrough_action() {
+        let mut config = DefaultListenerConfig::default();
+        config.ordinary_traffic.routes.push(TlsHostRoute {
+            name: "downstream-acme".into(),
+            matcher: HostMatcher {
+                exact: vec!["site.example".into()],
+                ..Default::default()
+            },
+            action: TlsRouteAction::Passthrough {
+                target_port: 443,
+                target: Some("downstream.example".into()),
+                load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin,
+            },
+        });
+        let hello = ClientHello {
+            sni_host: "site.example".into(),
+            alpn_protocols: acme(),
+            random: [0; 32],
+            buffered: vec![1, 2, 3],
+        };
+
+        assert!(matches!(
+            decide(&hello, &config, Some("tls.example"), |_| false),
+            ConnectionRoute::Ordinary {
+                action: TlsRouteAction::Passthrough {
+                    target_port: 443,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn complete_decision_returns_the_configured_per_host_action() {
         let config = DefaultListenerConfig {
             bind: "0.0.0.0:443".into(),
@@ -430,6 +437,7 @@ mod tests {
                         target_port: 8080,
                         target: Some("backend.internal".into()),
                         upstream: UpstreamTransport::Plaintext,
+                        load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin,
                     },
                 }],
                 ..Default::default()
@@ -466,6 +474,7 @@ mod tests {
             action: TlsRouteAction::Passthrough {
                 target_port: 443,
                 target: Some("upstream.example".into()),
+                load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin,
             },
         });
         let hello = ClientHello {

@@ -21,7 +21,9 @@ impl rustls::client::danger::ServerCertVerifier for TrustAllVerifier {
     fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> { Ok(rustls::client::danger::ServerCertVerified::assertion()) }
     fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
     fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> { rustls::crypto::CryptoProvider::get_default().expect("rustls provider installed").signature_verification_algorithms.supported_schemes() }
+    // The provider is installed at startup; an empty scheme list fails the
+    // handshake with a TLS error instead of panicking if it ever is not.
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> { rustls::crypto::CryptoProvider::get_default().map(|provider| provider.signature_verification_algorithms.supported_schemes()).unwrap_or_default() }
 }
 
 pub(crate) async fn connect_trust_all_tls(upstream: TcpStream, server_name: &str) -> Result<tokio_rustls::client::TlsStream<ClientHelloTrackingStream>> {

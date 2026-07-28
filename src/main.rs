@@ -15,7 +15,9 @@ pub mod certificate;
 pub mod config;
 pub mod controller;
 pub mod control_api;
-pub mod extensible;
+pub mod dataplane;
+pub mod conn_stream;
+pub mod events_hub;
 pub mod forward;
 pub mod hello_cache;
 pub mod hostutil;
@@ -29,6 +31,7 @@ pub mod relay;
 pub mod resolver;
 pub mod upstream_tls;
 pub mod runtime_config;
+pub mod runtime_live;
 pub mod runtime;
 pub mod store;
 pub mod tls_header;
@@ -97,7 +100,7 @@ impl Default for RunArgs {
         Self {
             runtime_dir: DEFAULT_RUNTIME_DIR.into(),
             setup_port: None,
-            setup_bind: "127.0.0.1".parse().unwrap(),
+            setup_bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             setup_token: None,
             setup_token_file: None,
         }
@@ -217,7 +220,9 @@ async fn run(args: RunArgs) -> Result<()> {
                     .to_owned(),
             ),
             (None, None) => None,
-            _ => unreachable!("clap enforces setup token conflicts"),
+            (Some(_), Some(_)) => {
+                anyhow::bail!("--setup-token and --setup-token-file are mutually exclusive")
+            }
         };
         let setup = bootstrap::SetupServer::prepare(
             store.clone(),

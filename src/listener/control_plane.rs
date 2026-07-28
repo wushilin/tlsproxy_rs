@@ -10,7 +10,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
 
 use crate::ca::LocalCa;
-use crate::extensible::Extensible;
+use crate::conn_stream::ConnStream;
 use crate::listener::default::{ControlFuture, ControlPlaneService};
 use crate::tls_header::ClientHello;
 
@@ -36,7 +36,7 @@ impl AxumControlPlaneService {
         &self,
         hostname: String,
         hello: ClientHello,
-        client: Extensible<tokio::net::TcpStream>,
+        client: ConnStream<tokio::net::TcpStream>,
     ) -> Result<()> {
         if hello.sni_host != hostname {
             return Err(anyhow!("control-plane SNI changed after classification"));
@@ -51,10 +51,13 @@ impl AxumControlPlaneService {
                 certified_key,
             )));
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let replay = crate::acme_challenge::ReplayStream::new(hello.buffered, client);
+        let mut client = client;
+        // Restore the peeked ClientHello so the TLS acceptor sees the
+        // pristine wire stream.
+        client.unread(hello.buffered);
         let acceptor = tokio_rustls::LazyConfigAcceptor::new(
             rustls::server::Acceptor::default(),
-            replay,
+            client,
         );
         let start = tokio::time::timeout(Duration::from_secs(5), acceptor)
             .await
@@ -68,7 +71,7 @@ impl AxumControlPlaneService {
         let io = TokioIo::new(tls);
         let service = TowerToHyperService::new(self.router.clone());
         hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-            .serve_connection(io, service)
+            .serve_connection_with_upgrades(io, service)
             .await
             .map_err(|cause| anyhow!("control-plane HTTP connection failed: {cause}"))?;
         Ok(())
@@ -80,7 +83,7 @@ impl ControlPlaneService for AxumControlPlaneService {
         &'a self,
         hostname: String,
         hello: ClientHello,
-        client: Extensible<tokio::net::TcpStream>,
+        client: ConnStream<tokio::net::TcpStream>,
     ) -> ControlFuture<'a> {
         Box::pin(async move { self.serve_inner(hostname, hello, client).await })
     }
@@ -89,7 +92,9 @@ impl ControlPlaneService for AxumControlPlaneService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::ws::WebSocketUpgrade;
     use axum::{routing::get, Router};
+    use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -115,7 +120,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut client = Extensible::of(socket);
+            let mut client = ConnStream::of(socket);
             let hello = crate::tls_header::read_client_hello(
                 &mut client,
                 Duration::from_secs(2),
@@ -146,6 +151,36 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.ends_with("healthy"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keeps_websocket_upgrade_alive_on_control_tls_stream() {
+        rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+        let directory = tempfile::tempdir().unwrap();
+        let ca = LocalCa::new(directory.path().to_str().unwrap(), &crate::config::LocalCaConfig::default()).unwrap();
+        let app = Router::new().route("/ws", get(|upgrade: WebSocketUpgrade| async move {
+            upgrade.on_upgrade(|mut socket| async move {
+                if let Some(Ok(message)) = socket.recv().await { socket.send(message).await.unwrap(); }
+            })
+        }));
+        let service = AxumControlPlaneService::new(app, ca, crate::managed_tls::ManagedCertificateCache::default(), crate::runtime_config::CertificateFallbackPolicy::LocalCa);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut client = ConnStream::of(socket);
+            let hello = crate::tls_header::read_client_hello(&mut client, Duration::from_secs(2), crate::tls_header::DEFAULT_MAX_CLIENT_HELLO_SIZE).await.unwrap();
+            service.serve("tls.example".into(), hello, client).await.unwrap();
+        });
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut config = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(crate::upstream_tls::TrustAllVerifier)).with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(rustls::pki_types::ServerName::try_from("tls.example".to_owned()).unwrap(), socket).await.unwrap();
+        let (mut websocket, _) = tokio_tungstenite::client_async("ws://tls.example/ws", tls).await.unwrap();
+        websocket.send(tokio_tungstenite::tungstenite::Message::Text("still-open".into())).await.unwrap();
+        assert_eq!(websocket.next().await.unwrap().unwrap().into_text().unwrap(), "still-open");
+        websocket.close(None).await.unwrap();
         server.await.unwrap();
     }
 }

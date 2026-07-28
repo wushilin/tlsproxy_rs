@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -10,7 +8,7 @@ use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub const TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
 pub const DEFAULT_GATE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -44,83 +42,25 @@ pub fn server_config(certificate: Arc<CertifiedKey>) -> Arc<rustls::ServerConfig
     Arc::new(config)
 }
 
-/// Completes a challenge handshake after a passthrough listener has already
-/// buffered the ClientHello for inspection.
+/// Completes a challenge handshake after a listener has already peeked the
+/// ClientHello for inspection. The peeked bytes are restored onto the stream
+/// so the TLS acceptor sees the pristine wire stream.
 pub async fn accept_buffered<S>(
     buffered: Vec<u8>,
-    stream: S,
+    mut stream: crate::conn_stream::ConnStream<S>,
     certificate: Arc<CertifiedKey>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let replay = ReplayStream::new(buffered, stream);
-    let acceptor = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), replay);
+    stream.unread(buffered);
+    let acceptor = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
     let start = acceptor.await.context("invalid ACME TLS ClientHello")?;
     let _stream = start
         .into_stream(server_config(certificate))
         .await
         .context("ACME TLS-ALPN handshake failed")?;
     Ok(())
-}
-
-/// Replays bytes consumed during protocol inspection before reading from the
-/// underlying stream. The default listener uses this for both ACME and normal
-/// TLS termination so a ClientHello is inspected exactly once at its edge.
-pub(crate) struct ReplayStream<S> {
-    prefix: std::io::Cursor<Vec<u8>>,
-    inner: S,
-}
-
-impl<S> ReplayStream<S> {
-    pub(crate) fn new(prefix: Vec<u8>, inner: S) -> Self {
-        Self {
-            prefix: std::io::Cursor::new(prefix),
-            inner,
-        }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for ReplayStream<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let position = self.prefix.position() as usize;
-        if position < self.prefix.get_ref().len() {
-            let remaining = &self.prefix.get_ref()[position..];
-            let count = remaining.len().min(buffer.remaining());
-            buffer.put_slice(&remaining[..count]);
-            self.prefix.set_position((position + count) as u64);
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.inner).poll_read(cx, buffer)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for ReplayStream<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        bytes: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, bytes)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
 }
 
 /// Removes exactly the registration it created. A later challenge for the
@@ -133,7 +73,7 @@ pub struct ChallengeGuard {
 
 impl Drop for ChallengeGuard {
     fn drop(&mut self) {
-        let mut entries = self.registry.inner.lock().expect("challenge lock poisoned");
+        let mut entries = self.registry.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if entries
             .get(&self.domain)
             .is_some_and(|entry| entry.nonce == self.nonce)
@@ -152,7 +92,7 @@ impl ChallengeRegistry {
     ) -> Result<ChallengeGuard> {
         let domain = normalize_domain(domain)?;
         let certificate = Arc::new(make_challenge_certificate(&domain, key_authorization)?);
-        let mut entries = self.inner.lock().expect("challenge lock poisoned");
+        let mut entries = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = entries
             .get(&domain)
             .map_or(1, |entry| entry.nonce.wrapping_add(1));
@@ -173,7 +113,7 @@ impl ChallengeRegistry {
 
     pub fn resolve(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
         let domain = normalize_domain(domain).ok()?;
-        let mut entries = self.inner.lock().expect("challenge lock poisoned");
+        let mut entries = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = entries.get(&domain)?.clone();
         if entry.expires_at <= Instant::now() {
             entries.remove(&domain);
@@ -186,7 +126,7 @@ impl ChallengeRegistry {
         let now = Instant::now();
         self.inner
             .lock()
-            .expect("challenge lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|_, entry| entry.expires_at > now);
     }
 
@@ -294,7 +234,7 @@ mod tests {
                 .alpn_protocols
                 .iter()
                 .any(|protocol| protocol == TLS_ALPN_PROTOCOL));
-            accept_buffered(hello.buffered, server_io, certificate)
+            accept_buffered(hello.buffered, crate::conn_stream::ConnStream::of(server_io), certificate)
                 .await
                 .unwrap();
         });

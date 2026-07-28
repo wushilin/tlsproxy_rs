@@ -43,7 +43,7 @@ impl ListenerType {
 
 /// Connection outcome for the CDR. Defaults to `ConnectFailed`; workers
 /// upgrade it to `Ok` once the upstream socket is connected, or mark
-/// `Denied` on ACL rejection.
+/// `Denied` on admission rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnStatus {
     Ok,
@@ -273,7 +273,9 @@ pub fn compress_file(path: &Path, compression: Compression) -> io::Result<()> {
         Compression::Zstd => {
             zstd::stream::copy_encode(input, File::create(&output_path)?, 0)?;
         }
-        Compression::None => unreachable!("extension() returned Some"),
+        // Only reachable if a caller ignores `extension()` returning None;
+        // leave the file untouched rather than delete it uncompressed.
+        Compression::None => return Ok(()),
     }
     fs::remove_file(path)?;
     Ok(())

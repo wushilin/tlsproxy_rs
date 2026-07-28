@@ -1,4 +1,9 @@
-use crate::config::{Listener, ListenerMode};
+//! Backend endpoint groups: registration, DNS-cached resolution, and
+//! per-request selection with round-robin or client-IP-hash balancing.
+//! Active probing and health status views live in [`health`].
+
+use crate::dataplane::RelayPolicy;
+use crate::runtime_config::HttpLoadBalancing;
 use crate::controller::Controller;
 use crate::hostutil::HostAndPort;
 use crate::resolver;
@@ -7,13 +12,20 @@ use lazy_static::lazy_static;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 use tokio::net::{lookup_host, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 use tokio_rustls::TlsConnector;
+
+mod health;
+pub use health::*;
 
 const RUNTIME_TTL_MS: u128 = 600_000;
 const RUNTIME_GROUP_MAX: usize = 1000;
@@ -28,6 +40,8 @@ lazy_static! {
     static ref GROUPS: Arc<RwLock<HashMap<GroupKey, Arc<MonitorGroup>>>> =
         Arc::new(RwLock::new(HashMap::new()));
     static ref DNS_CACHE: Arc<RwLock<HashMap<(String, u16), CachedDns>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    static ref HTTP_ROUTE_CURSORS: Arc<RwLock<HashMap<String, u64>>> =
         Arc::new(RwLock::new(HashMap::new()));
 }
 
@@ -55,6 +69,7 @@ pub struct SelectedTarget {
 struct GroupKey {
     target: String,
     upstream_tls: bool,
+    http_health: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +83,7 @@ struct EndpointState {
     endpoint: String,
     online: Option<bool>,
     since_ms: u128,
+    last_checked_ms: u128,
 }
 
 #[derive(Debug)]
@@ -80,7 +96,32 @@ struct MonitorGroup {
     owner: Owner,
     endpoints: RwLock<Vec<EndpointState>>,
     last_activity_ms: RwLock<u128>,
-    rng_state: AtomicU64,
+    sequence: AtomicU64,
+}
+
+/// How a caller wants a member picked from a candidate set: spread load
+/// sequentially or stay sticky to a client address. Sticky selection uses
+/// rendezvous (highest-random-weight) hashing so removing one member only
+/// remaps the clients that were pinned to it, instead of reshuffling
+/// everyone the way modulo hashing does.
+#[derive(Clone, Copy)]
+pub(crate) enum Pick {
+    Sequential,
+    Sticky(IpAddr),
+}
+
+fn rendezvous_index<T>(items: &[T], member_key: impl Fn(&T) -> &str, client_ip: IpAddr) -> usize {
+    items
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, item)| {
+            let mut hasher = DefaultHasher::new();
+            client_ip.hash(&mut hasher);
+            member_key(item).hash(&mut hasher);
+            hasher.finish()
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
 }
 
 impl MonitorGroup {
@@ -88,6 +129,7 @@ impl MonitorGroup {
         requested_target: String,
         effective: HostAndPort,
         upstream_tls: bool,
+        http_health: bool,
         tls_server_name: String,
         owner: Owner,
     ) -> Arc<Self> {
@@ -95,6 +137,7 @@ impl MonitorGroup {
         let key = GroupKey {
             target: effective.to_string(),
             upstream_tls,
+            http_health,
         };
         let group = Arc::new(Self {
             key,
@@ -105,7 +148,7 @@ impl MonitorGroup {
             owner,
             endpoints: RwLock::new(Vec::new()),
             last_activity_ms: RwLock::new(now),
-            rng_state: AtomicU64::new(now as u64),
+            sequence: AtomicU64::new(now as u64),
         });
         group.reconcile_endpoints().await;
         group
@@ -120,7 +163,7 @@ impl MonitorGroup {
             && now.saturating_sub(*self.last_activity_ms.read().await) > RUNTIME_TTL_MS
     }
 
-    async fn choose_endpoint(&self) -> Option<SelectedTarget> {
+    async fn choose_endpoint(&self, pick: Pick) -> Option<SelectedTarget> {
         let endpoints = self.endpoints.read().await;
         let online: Vec<_> = endpoints
             .iter()
@@ -151,7 +194,10 @@ impl MonitorGroup {
         } else {
             return None;
         };
-        let index = (self.next_random() as usize) % candidates.len();
+        let index = match pick {
+            Pick::Sequential => (self.sequence.fetch_add(1, Ordering::Relaxed) as usize) % candidates.len(),
+            Pick::Sticky(client_ip) => rendezvous_index(&candidates, |endpoint| endpoint.endpoint.as_str(), client_ip),
+        };
         Some(SelectedTarget {
             endpoint: candidates[index].endpoint.clone(),
             tls_server_name: self.tls_server_name.clone(),
@@ -180,6 +226,7 @@ impl MonitorGroup {
                     endpoint,
                     online: None,
                     since_ms: now,
+                    last_checked_ms: 0,
                 })
             })
             .collect();
@@ -193,6 +240,7 @@ impl MonitorGroup {
                 .iter_mut()
                 .find(|state| state.endpoint == endpoint)
             {
+                state.last_checked_ms = now_ms();
                 if state.online != Some(online) {
                     let before = state.online;
                     state.online = Some(online);
@@ -238,27 +286,6 @@ impl MonitorGroup {
         }
     }
 
-    fn next_random(&self) -> u64 {
-        let mut value = self.rng_state.load(Ordering::Relaxed);
-        loop {
-            let mut next = value;
-            next ^= next << 13;
-            next ^= next >> 7;
-            next ^= next << 17;
-            if next == 0 {
-                next = 0x9e37_79b9_7f4a_7c15;
-            }
-            match self.rng_state.compare_exchange_weak(
-                value,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return next,
-                Err(observed) => value = observed,
-            }
-        }
-    }
 }
 
 pub async fn register_forward_listener(
@@ -274,6 +301,7 @@ pub async fn register_forward_listener(
             requested.host(),
             requested.port(),
             upstream_tls,
+            false,
             requested.host().to_string(),
             Owner::Configured,
         )
@@ -285,38 +313,9 @@ pub async fn register_forward_listener(
     Ok(())
 }
 
-pub async fn reconcile_forward_listener(
-    listener_name: String,
-    targets: &str,
-    upstream_tls: bool,
-) -> Result<()> {
-    register_forward_listener(listener_name, targets, upstream_tls).await
-}
-
-pub async fn reconcile_configured_listeners(listeners: &HashMap<String, Listener>) -> Result<()> {
-    LISTENER_BACKENDS.write().await.clear();
-    FORWARD_LISTENERS.write().await.clear();
-    for (name, listener) in listeners {
-        if listener.mode == ListenerMode::Forward {
-            if let Some(targets) = listener.target.as_deref() {
-                register_forward_listener(name.clone(), targets, listener.upstream_tls).await?;
-            }
-        }
-        if listener.mode == ListenerMode::Http {
-            if let Some(targets) = http_listener_targets(listener) {
-                let normalized = parse_http_targets(&targets)?;
-                register_forward_listener(name.clone(), &normalized, false).await?;
-            }
-        }
-    }
-    prune_unreferenced_configured_groups().await;
-    publish_configured_statuses().await;
-    Ok(())
-}
-
 /// Explicit backends of an http listener, or None when it routes dynamically
 /// by Host header.
-pub fn http_listener_targets(listener: &Listener) -> Option<String> {
+pub fn http_listener_targets(listener: &RelayPolicy) -> Option<String> {
     listener
         .target
         .as_deref()
@@ -371,38 +370,114 @@ pub fn parse_http_targets(targets: &str) -> Result<String> {
     Ok(parsed.join(";"))
 }
 
-pub async fn clear_listener(listener_name: &str) {
-    LISTENER_BACKENDS.write().await.remove(listener_name);
-    FORWARD_LISTENERS.write().await.remove(listener_name);
-    prune_unreferenced_configured_groups().await;
-    publish_configured_statuses().await;
-}
-
 pub async fn reset() {
     LISTENER_BACKENDS.write().await.clear();
     FORWARD_LISTENERS.write().await.clear();
     GROUPS.write().await.clear();
+    HTTP_ROUTE_CURSORS.write().await.clear();
+    health::HEALTH_BINDINGS.write().await.clear();
 }
 
-pub async fn choose_online(listener_name: &str) -> Option<SelectedTarget> {
+pub async fn apply_hot_listener_settings(config: &crate::runtime_config::RuntimeConfig) -> Result<()> {
+    for (name, listener) in &config.additional_listeners {
+        if config.disabled_listeners.contains(name) {
+            continue;
+        }
+        if let crate::runtime_config::AdditionalListenerConfig::Forward(listener) = listener {
+            register_forward_listener(name.clone(), &listener.targets, listener.upstream_tls).await?;
+        }
+    }
+    configure_health_checks(config).await
+}
+
+/// Selects a healthy endpoint from a reverse-proxy route's backend pool.
+/// Legacy target/port routes remain supported when `backends` is empty.
+pub async fn select_http_backend(
+    route_key: &str,
+    host: &str,
+    client_ip: IpAddr,
+    action: &crate::runtime_config::HttpRouteAction,
+) -> Result<(SelectedTarget, bool)> {
+    use crate::runtime_config::HttpLoadBalancing;
+    if action.backends.is_empty() {
+        let tls = action.upstream == crate::runtime_config::UpstreamTransport::Tls;
+        return Ok((select_routed_target(host, action.target.as_deref(), action.target_port, tls).await?, tls));
+    }
+    let mut available = Vec::new();
+    let mut down = Vec::new();
+    for backend in &action.backends {
+        let requested: HostAndPort = backend.address.parse()
+            .map_err(|cause| anyhow!("invalid HTTP backend `{}`: {cause}", backend.address))?;
+        let tls = backend.transport == crate::runtime_config::UpstreamTransport::Tls;
+        let tls_name = backend.tls_server_name.clone().unwrap_or_else(|| requested.host().to_string());
+        let group = ensure_group(requested.to_string(), requested.host(), requested.port(), tls, true, tls_name, Owner::Runtime).await?;
+        group.touch().await;
+        let endpoints = group.endpoints.read().await;
+        if endpoints.iter().any(|item| item.online == Some(true)) || endpoints.iter().any(|item| item.online.is_none()) {
+            available.push((Arc::clone(&group), tls));
+        } else if !endpoints.is_empty() {
+            down.push((Arc::clone(&group), tls));
+        }
+    }
+    // Health state is eventually consistent; when everything is marked down,
+    // trying a down backend beats failing fast (it may have just recovered).
+    let available = if available.is_empty() { down } else { available };
+    if available.is_empty() { return Err(anyhow!("no reverse-proxy backends for `{host}`")); }
+    let (index, pick) = match action.load_balancing {
+        HttpLoadBalancing::ClientIpHash => (
+            rendezvous_index(&available, |(group, _)| group.requested_target.as_str(), client_ip),
+            Pick::Sticky(client_ip),
+        ),
+        HttpLoadBalancing::RoundRobin => {
+            let mut cursors = HTTP_ROUTE_CURSORS.write().await;
+            let cursor = cursors.entry(route_key.to_string()).or_insert_with(random_cursor_seed);
+            let index = (*cursor as usize) % available.len();
+            *cursor = cursor.wrapping_add(1);
+            (index, Pick::Sequential)
+        }
+    };
+    let (group, tls) = &available[index];
+    let selected = group.choose_endpoint(pick).await.ok_or_else(|| anyhow!("no healthy reverse-proxy endpoints for `{host}`"))?;
+    Ok((selected, *tls))
+}
+
+pub async fn choose_online(listener_name: &str, client_ip: IpAddr, load_balancing: crate::runtime_config::HttpLoadBalancing) -> Option<SelectedTarget> {
     let groups = GROUPS.read().await;
     let keys = FORWARD_LISTENERS.read().await.get(listener_name).cloned();
-    let mut selected = Vec::new();
+    let mut members = Vec::new();
     if let Some(keys) = keys {
         for key in keys {
             if let Some(group) = groups.get(&key) {
-                if let Some(endpoint) = group.choose_endpoint().await {
-                    selected.push(endpoint);
-                }
+                members.push(Arc::clone(group));
             }
         }
     }
     drop(groups);
-    if selected.is_empty() {
+    if members.is_empty() {
         return None;
     }
-    let index = (now_ms() as usize) % selected.len();
-    selected.get(index).cloned()
+    let (index, pick) = match load_balancing {
+        crate::runtime_config::HttpLoadBalancing::ClientIpHash => (
+            rendezvous_index(&members, |group| group.requested_target.as_str(), client_ip),
+            Pick::Sticky(client_ip),
+        ),
+        crate::runtime_config::HttpLoadBalancing::RoundRobin => {
+            let mut cursors = HTTP_ROUTE_CURSORS.write().await;
+            let cursor = cursors.entry(listener_name.to_string()).or_insert_with(random_cursor_seed);
+            let index = (*cursor as usize) % members.len();
+            *cursor = cursor.wrapping_add(1);
+            (index, Pick::Sequential)
+        }
+    };
+    // Fall through the member ring so one down group does not blackhole its
+    // cursor/hash slot.
+    for offset in 0..members.len() {
+        let member = &members[(index + offset) % members.len()];
+        if let Some(endpoint) = member.choose_endpoint(pick).await {
+            return Some(endpoint);
+        }
+    }
+    None
 }
 
 pub async fn select_runtime_target(
@@ -416,13 +491,14 @@ pub async fn select_runtime_target(
         requested_host,
         requested_port,
         upstream_tls,
+        false,
         tls_server_name.to_string(),
         Owner::Runtime,
     )
     .await?;
     group.touch().await;
     let mut selected = group
-        .choose_endpoint()
+        .choose_endpoint(Pick::Sequential)
         .await
         .ok_or_else(|| anyhow!("no available upstream endpoint for {}", group.key.target))?;
     selected.tls_server_name = tls_server_name.to_string();
@@ -449,45 +525,81 @@ pub async fn select_routed_target(
         requested.host(),
         requested.port(),
         upstream_tls,
+        false,
         sni_host.to_string(),
         Owner::Runtime,
     )
     .await?;
     group.touch().await;
     let mut selected = group
-        .choose_endpoint()
+        .choose_endpoint(Pick::Sequential)
         .await
         .ok_or_else(|| anyhow!("no available upstream endpoint for {}", group.key.target))?;
     selected.tls_server_name = sni_host.to_string();
     Ok(selected)
 }
 
-pub fn spawn_global_health_checks(controller: &mut Controller) {
-    let health_controller = controller.child();
-    controller.spawn(async move {
-        run_global_health_checks(health_controller).await;
-    });
-}
+/// Selects from a comma/semicolon-separated Layer-4 route pool. Each named
+/// target goes through the configured DNS override and then normal DNS
+/// expansion in `ensure_group`, exactly like reverse-proxy backends.
+pub async fn select_routed_pool(
+    route_key: &str,
+    sni_host: &str,
+    explicit_targets: Option<&str>,
+    default_port: u16,
+    upstream_tls: bool,
+    client_ip: IpAddr,
+    load_balancing: crate::runtime_config::HttpLoadBalancing,
+) -> Result<SelectedTarget> {
+    use crate::runtime_config::HttpLoadBalancing;
 
-pub async fn check_all_once(check_controller: &mut Controller) {
-    evict_expired_runtime_groups().await;
-    evict_excess_runtime_groups().await;
-    let groups: Vec<_> = GROUPS.read().await.values().cloned().collect();
-    let mut jobs = Vec::new();
-    for group in groups {
-        group.reconcile_endpoints().await;
-        let endpoints: Vec<String> = group
-            .endpoints
-            .read()
-            .await
-            .iter()
-            .map(|endpoint| endpoint.endpoint.clone())
-            .collect();
-        for endpoint in endpoints {
-            jobs.push((Arc::clone(&group), endpoint));
+    let target_texts: Vec<&str> = explicit_targets
+        .map(|targets| targets.split([',', ';']).map(str::trim).filter(|value| !value.is_empty()).collect())
+        .unwrap_or_else(|| vec![sni_host]);
+    if target_texts.is_empty() {
+        return Err(anyhow!("route backend pool requires at least one target"));
+    }
+
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+    for target in target_texts {
+        let requested = HostAndPort::parse_or_default(target, default_port);
+        if requested.port() == 0 {
+            return Err(anyhow!("route target `{target}` has an invalid port"));
+        }
+        let group = ensure_group(
+            requested.to_string(), requested.host(), requested.port(), upstream_tls,
+            false, sni_host.to_string(), Owner::Runtime,
+        ).await?;
+        group.touch().await;
+        let endpoints = group.endpoints.read().await;
+        if endpoints.iter().any(|item| item.online != Some(false)) {
+            preferred.push(group.clone());
+        } else if !endpoints.is_empty() {
+            fallback.push(group.clone());
         }
     }
-    check_jobs(jobs, check_controller).await;
+    let available = if preferred.is_empty() { fallback } else { preferred };
+    if available.is_empty() {
+        return Err(anyhow!("no available upstream endpoint for route `{route_key}`"));
+    }
+    let (index, pick) = match load_balancing {
+        HttpLoadBalancing::ClientIpHash => (
+            rendezvous_index(&available, |group| group.requested_target.as_str(), client_ip),
+            Pick::Sticky(client_ip),
+        ),
+        HttpLoadBalancing::RoundRobin => {
+            let mut cursors = HTTP_ROUTE_CURSORS.write().await;
+            let cursor = cursors.entry(route_key.to_string()).or_insert_with(random_cursor_seed);
+            let index = (*cursor as usize) % available.len();
+            *cursor = cursor.wrapping_add(1);
+            (index, Pick::Sequential)
+        }
+    };
+    let mut selected = available[index].choose_endpoint(pick).await
+        .ok_or_else(|| anyhow!("no available upstream endpoint for route `{route_key}`"))?;
+    selected.tls_server_name = sni_host.to_string();
+    Ok(selected)
 }
 
 async fn ensure_group(
@@ -495,6 +607,7 @@ async fn ensure_group(
     requested_host: &str,
     requested_port: u16,
     upstream_tls: bool,
+    http_health: bool,
     tls_server_name: String,
     owner: Owner,
 ) -> Result<Arc<MonitorGroup>> {
@@ -502,6 +615,7 @@ async fn ensure_group(
     let key = GroupKey {
         target: effective.to_string(),
         upstream_tls,
+        http_health,
     };
     if let Some(group) = GROUPS.read().await.get(&key).cloned() {
         if owner == Owner::Runtime {
@@ -513,6 +627,7 @@ async fn ensure_group(
         requested_target,
         effective,
         upstream_tls,
+        http_health,
         tls_server_name,
         owner,
     )
@@ -571,19 +686,6 @@ fn excess_runtime_groups_to_evict(mut runtime_groups: Vec<(GroupKey, u128)>) -> 
         .collect()
 }
 
-async fn prune_unreferenced_configured_groups() {
-    let referenced: HashSet<GroupKey> = FORWARD_LISTENERS
-        .read()
-        .await
-        .values()
-        .flat_map(|keys| keys.iter().cloned())
-        .collect();
-    GROUPS
-        .write()
-        .await
-        .retain(|key, group| group.owner == Owner::Runtime || referenced.contains(key));
-}
-
 async fn publish_configured_statuses() {
     let listener_groups = FORWARD_LISTENERS.read().await.clone();
     let groups = GROUPS.read().await;
@@ -598,67 +700,6 @@ async fn publish_configured_statuses() {
         statuses.insert(listener, listener_statuses);
     }
     *LISTENER_BACKENDS.write().await = statuses;
-}
-
-async fn run_global_health_checks(mut health_controller: Controller) {
-    loop {
-        let mut check_controller = health_controller.child();
-        check_all_once(&mut check_controller).await;
-        check_controller.cancel();
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
-}
-
-async fn check_jobs(jobs: Vec<(Arc<MonitorGroup>, String)>, check_controller: &mut Controller) {
-    let expected_count = jobs.len();
-    let (tx, mut rx) = mpsc::channel(expected_count.max(1));
-    for (group, endpoint) in &jobs {
-        let tx = tx.clone();
-        let group = Arc::clone(group);
-        let endpoint = endpoint.clone();
-        check_controller.spawn(async move {
-            let online = probe(&endpoint, group.key.upstream_tls, &group.tls_server_name).await;
-            let _ = tx.send((group, endpoint, online)).await;
-        });
-    }
-    drop(tx);
-
-    let mut checked = HashSet::new();
-    let deadline = tokio::time::sleep(Duration::from_secs(5));
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            _ = &mut deadline => {
-                break;
-            }
-            result = rx.recv() => {
-                let Some((group, endpoint, online)) = result else {
-                    break;
-                };
-                checked.insert((group.key.clone(), endpoint.clone()));
-                group.set_endpoint_state(endpoint, online).await;
-                if checked.len() == expected_count {
-                    break;
-                }
-            }
-        }
-    }
-
-    for (group, endpoint) in jobs {
-        if !checked.contains(&(group.key.clone(), endpoint.clone())) {
-            group.set_endpoint_state(endpoint, false).await;
-        }
-    }
-    publish_configured_statuses().await;
-}
-
-pub async fn statuses(listener_name: &str) -> Vec<BackendStatusSerde> {
-    LISTENER_BACKENDS
-        .read()
-        .await
-        .get(listener_name)
-        .cloned()
-        .unwrap_or_default()
 }
 
 fn parse_targets(targets: &str) -> Result<Vec<String>> {
@@ -768,33 +809,20 @@ impl rustls::client::danger::ServerCertVerifier for TrustAllVerifier {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
+    // The provider is installed at startup; an empty scheme list fails the
+    // handshake with a TLS error instead of panicking if it ever is not.
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::CryptoProvider::get_default()
-            .expect("rustls crypto provider is installed")
-            .signature_verification_algorithms
-            .supported_schemes()
+            .map(|provider| provider.signature_verification_algorithms.supported_schemes())
+            .unwrap_or_default()
     }
 }
 
-async fn probe(endpoint: &str, upstream_tls: bool, tls_server_name: &str) -> bool {
-    let stream = match TcpStream::connect(endpoint).await {
-        Ok(stream) => stream,
-        Err(_) => return false,
-    };
-    if !upstream_tls {
-        return true;
-    }
-
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TrustAllVerifier))
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
-    let Ok(server_name) = rustls::pki_types::ServerName::try_from(tls_server_name.to_string())
-    else {
-        return false;
-    };
-    connector.connect(server_name, stream).await.is_ok()
+/// Seeds new round-robin cursors randomly so a configuration reload does not
+/// bias the first request of every route onto the first backend.
+fn random_cursor_seed() -> u64 {
+    use rand::Rng as _;
+    rand::rng().random()
 }
 
 fn now_ms() -> u128 {
@@ -816,11 +844,13 @@ fn state_name(online: Option<bool>) -> &'static str {
 mod tests {
     use super::*;
 
+
     fn test_group(owner: Owner, target: &str, endpoints: Vec<EndpointState>) -> MonitorGroup {
         MonitorGroup {
             key: GroupKey {
                 target: target.into(),
                 upstream_tls: false,
+                http_health: false,
             },
             requested_target: target.into(),
             effective_host: target
@@ -837,8 +867,62 @@ mod tests {
             owner,
             endpoints: RwLock::new(endpoints),
             last_activity_ms: RwLock::new(now_ms()),
-            rng_state: AtomicU64::new(1),
+            sequence: AtomicU64::new(0),
         }
+    }
+
+    #[tokio::test]
+    async fn sequential_pick_cycles_all_online_endpoints() {
+        let now = now_ms();
+        let endpoint = |addr: &str| EndpointState {
+            endpoint: addr.into(),
+            online: Some(true),
+            since_ms: now,
+            last_checked_ms: now,
+        };
+        let group = test_group(
+            Owner::Runtime,
+            "pool.example:443",
+            vec![endpoint("10.0.0.1:443"), endpoint("10.0.0.2:443"), endpoint("10.0.0.3:443")],
+        );
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            seen.insert(group.choose_endpoint(Pick::Sequential).await.unwrap().endpoint);
+        }
+        assert_eq!(seen.len(), 3, "three sequential picks cover all three endpoints");
+    }
+
+    #[tokio::test]
+    async fn sticky_pick_is_stable_and_survives_unrelated_member_loss() {
+        let now = now_ms();
+        let endpoint = |addr: &str, online: bool| EndpointState {
+            endpoint: addr.into(),
+            online: Some(online),
+            since_ms: now,
+            last_checked_ms: now,
+        };
+        let client: IpAddr = "203.0.113.7".parse().unwrap();
+        let group = test_group(
+            Owner::Runtime,
+            "pool.example:443",
+            vec![endpoint("10.0.0.1:443", true), endpoint("10.0.0.2:443", true), endpoint("10.0.0.3:443", true)],
+        );
+        let first = group.choose_endpoint(Pick::Sticky(client)).await.unwrap().endpoint;
+        for _ in 0..5 {
+            assert_eq!(group.choose_endpoint(Pick::Sticky(client)).await.unwrap().endpoint, first);
+        }
+        // Rendezvous hashing: removing a member the client was NOT pinned to
+        // must not move the client.
+        let survivors: Vec<EndpointState> = ["10.0.0.1:443", "10.0.0.2:443", "10.0.0.3:443"]
+            .iter()
+            .filter(|addr| **addr != first)
+            .map(|addr| endpoint(addr, true))
+            .collect();
+        let victim = survivors[0].endpoint.clone();
+        let remaining: Vec<EndpointState> = [endpoint(&first, true), endpoint(&survivors[1].endpoint, true)].into();
+        let _ = victim;
+        let shrunk = test_group(Owner::Runtime, "pool.example:443", remaining);
+        assert_eq!(shrunk.choose_endpoint(Pick::Sticky(client)).await.unwrap().endpoint, first);
     }
 
     #[tokio::test]
@@ -851,17 +935,19 @@ mod tests {
                     endpoint: "[2606:4700:4700::1111]:443".into(),
                     online: Some(false),
                     since_ms: now_ms(),
+                    last_checked_ms: now_ms(),
                 },
                 EndpointState {
                     endpoint: "104.16.248.249:443".into(),
                     online: Some(false),
                     since_ms: now_ms(),
+                    last_checked_ms: now_ms(),
                 },
             ],
         );
 
         let selected = group
-            .choose_endpoint()
+            .choose_endpoint(Pick::Sequential)
             .await
             .expect("stale down status should not block all candidates");
 
@@ -872,7 +958,7 @@ mod tests {
     #[tokio::test]
     async fn choose_endpoint_returns_none_only_when_no_endpoints_exist() {
         let group = test_group(Owner::Runtime, "example.com:443", Vec::new());
-        assert!(group.choose_endpoint().await.is_none());
+        assert!(group.choose_endpoint(Pick::Sequential).await.is_none());
     }
 
     #[tokio::test]
@@ -884,11 +970,12 @@ mod tests {
                 endpoint: "127.0.0.1:443".into(),
                 online: Some(false),
                 since_ms: now_ms(),
+                last_checked_ms: now_ms(),
             }],
         );
 
         let selected = group
-            .choose_endpoint()
+            .choose_endpoint(Pick::Sequential)
             .await
             .expect("stale down status should not block configured forward candidates");
 
@@ -902,6 +989,7 @@ mod tests {
                 let key = GroupKey {
                     target: format!("runtime-{index}.example:443"),
                     upstream_tls: false,
+                    http_health: false,
                 };
                 (key, index as u128)
             })
@@ -913,10 +1001,12 @@ mod tests {
         assert!(evicted.contains(&GroupKey {
             target: "runtime-0.example:443".into(),
             upstream_tls: false,
+            http_health: false,
         }));
         assert!(!evicted.contains(&GroupKey {
             target: "runtime-204.example:443".into(),
             upstream_tls: false,
+            http_health: false,
         }));
     }
 

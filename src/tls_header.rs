@@ -153,6 +153,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_hello_read_is_fully_undoable() {
+        use tokio::io::AsyncReadExt;
+        // Interception must be lossless: unreading `hello.buffered` restores
+        // the byte-identical wire stream for a TLS acceptor or relay.
+        let bytes = client_hello("undo.example");
+        let (mut writer, reader) = tokio::io::duplex(bytes.len() * 2);
+        writer.write_all(&bytes).await.unwrap();
+        let mut stream = crate::conn_stream::ConnStream::of(reader);
+        let hello = read_client_hello(
+            &mut stream,
+            std::time::Duration::from_secs(1),
+            DEFAULT_MAX_CLIENT_HELLO_SIZE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hello.sni_host, "undo.example");
+        stream.unread(&hello.buffered);
+        writer.write_all(b"-tail").await.unwrap();
+        drop(writer);
+        let mut restored = Vec::new();
+        stream.read_to_end(&mut restored).await.unwrap();
+        assert_eq!(restored, [bytes.as_slice(), b"-tail"].concat());
+    }
+
+    #[tokio::test]
     async fn rejects_missing_sni() {
         let (mut writer, mut reader) = tokio::io::duplex(64);
         writer.write_all(b"not tls").await.unwrap();
