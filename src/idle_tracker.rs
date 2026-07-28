@@ -1,4 +1,4 @@
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 pub struct IdleTracker {
     last_active: Instant,
@@ -7,15 +7,15 @@ pub struct IdleTracker {
 
 impl IdleTracker {
     pub fn new(max_idle_ms: u64) -> IdleTracker {
-        let mut max_idle_ms_local = max_idle_ms as u64;
-        if max_idle_ms_local ==0 {
-            max_idle_ms_local = std::u64::MAX;
+        let mut max_idle_ms_local = max_idle_ms;
+        if max_idle_ms_local == 0 {
+            max_idle_ms_local = u64::MAX;
         }
         let last_active = Instant::now();
-        return IdleTracker { 
+        return IdleTracker {
             last_active,
-            max_idle: Duration::from_millis(max_idle_ms_local)
-         };
+            max_idle: Duration::from_millis(max_idle_ms_local),
+        };
     }
 
     pub fn mark(&mut self) -> Instant {

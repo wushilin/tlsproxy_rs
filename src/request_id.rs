@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 use short_uuid::short;
 
-use std::{fmt::{self, Display}, sync::atomic::{AtomicUsize, Ordering}};
 use lazy_static::lazy_static;
+use std::{
+    fmt::{self, Display},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 lazy_static! {
     pub static ref ID_GEN: AtomicUsize = AtomicUsize::new(0);
@@ -11,7 +14,6 @@ lazy_static! {
 fn next() -> usize {
     ID_GEN.fetch_add(1, Ordering::SeqCst)
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub struct RequestId {
@@ -27,7 +29,10 @@ impl Display for RequestId {
 impl RequestId {
     pub fn new() -> Self {
         let uuid = short!().to_string();
-        RequestId { _seq: next(), _uuid: uuid }
+        RequestId {
+            _seq: next(),
+            _uuid: uuid,
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -44,4 +49,3 @@ impl Default for RequestId {
         Self::new()
     }
 }
-

@@ -1,0 +1,29 @@
+services:
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    command: ["-defaultIPv6", "", "-defaultIPv4", "10.30.50.3"]
+    ports: ["127.0.0.1:18055:8055"]
+    networks:
+      acme: {ipv4_address: 10.30.50.4}
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: ["-config", "test/config/pebble-config.json", "-dnsserver", "10.30.50.4:8053"]
+    environment: ["PEBBLE_VA_NOSLEEP=1", "PEBBLE_WFE_NONCEREJECT=0"]
+    volumes: ["./pebble-config.json:/test/config/pebble-config.json:ro"]
+    depends_on: [challtestsrv]
+    networks:
+      acme: {ipv4_address: 10.30.50.2}
+  tlsproxy:
+    image: ubuntu:24.04
+    entrypoint: ["/usr/local/bin/tlsproxy"]
+    command: ["run", "--runtime-dir", "/data", "--setup-bind", "0.0.0.0", "--setup-port", "44448", "--setup-token", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+    ports: ["127.0.0.1:14448:44448", "127.0.0.1:18443:443"]
+    volumes: ["runtime:/data", "../../target/debug/tlsproxy:/usr/local/bin/tlsproxy:ro"]
+    networks:
+      acme: {ipv4_address: 10.30.50.3}
+networks:
+  acme:
+    ipam:
+      config: [{subnet: 10.30.50.0/24}]
+volumes:
+  runtime: {}

@@ -1,0 +1,12 @@
+services:
+  tlsproxy:
+    build: ..
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "127.0.0.1:44448:44448"
+    volumes:
+      - tlsproxy-data:/var/lib/tlsproxy
+    command: ["run", "--runtime-dir", "/var/lib/tlsproxy", "--setup-bind", "0.0.0.0", "--setup-port", "44448"]
+volumes:
+  tlsproxy-data: {}
