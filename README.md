@@ -80,9 +80,10 @@ global health checker probes every backend endpoint every five seconds over
 TCP — plus an HTTP `GET /` for HTTP backends — and routing prefers online
 endpoints; results are visible in the control plane.
 
-The mandatory listener additionally intercepts only exact `acme-tls/1`
-connections with an active exact-SNI challenge. Unmatched ACME ALPN is closed
-and never reaches an upstream.
+The mandatory listener intercepts exact `acme-tls/1` connections with an
+active exact-SNI challenge. Without an active local challenge, ACME ALPN
+follows the ordinary SNI route, so a passthrough backend receives the original
+ClientHello unchanged; connections without an allowed route are rejected.
 
 DNS overrides are applied after route selection to both inferred and explicit
 targets. ACME prerequisites deliberately bypass those overrides and query A

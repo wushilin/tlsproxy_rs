@@ -14,6 +14,5 @@ pub enum DefaultRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     MissingSni,
-    UnmatchedAcmeChallenge,
     PolicyDenied,
 }

@@ -284,9 +284,10 @@ pub(crate) async fn dispatch_non_control(
 
 /// Pure routing policy for the required public :443 listener.
 ///
-/// Ordering is security-sensitive: ACME ALPN is never allowed to fall through
-/// to a proxy handler, and the reserved control hostname bypasses ordinary ACL
-/// evaluation but can never become an upstream route.
+/// Ordering is security-sensitive: an active local ACME challenge takes
+/// precedence, while unmatched ACME ALPN follows the ordinary SNI route. The
+/// reserved control hostname bypasses ordinary ACL evaluation but can never
+/// become an upstream route.
 pub fn classify(
     sni: Option<&str>,
     alpn_protocols: &[Vec<u8>],
@@ -300,12 +301,8 @@ pub fn classify(
     let is_acme = alpn_protocols
         .iter()
         .any(|protocol| protocol.as_slice() == TLS_ALPN_PROTOCOL);
-    if is_acme {
-        return if challenge_is_active(&sni) {
-            DefaultRoute::AcmeChallenge { domain: sni }
-        } else {
-            DefaultRoute::Reject(RejectReason::UnmatchedAcmeChallenge)
-        };
+    if is_acme && challenge_is_active(&sni) {
+        return DefaultRoute::AcmeChallenge { domain: sni };
     }
     if control_hostname
         .and_then(|value| normalize_domain(value).ok())
@@ -346,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_acme_never_falls_through() {
+    fn unmatched_acme_follows_ordinary_sni_route() {
         assert_eq!(
             classify(
                 Some("site.example"),
@@ -355,7 +352,23 @@ mod tests {
                 |_| false,
                 |_| true,
             ),
-            DefaultRoute::Reject(RejectReason::UnmatchedAcmeChallenge)
+            DefaultRoute::Proxy {
+                sni: "site.example".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unmatched_acme_is_rejected_without_an_ordinary_route() {
+        assert_eq!(
+            classify(
+                Some("site.example"),
+                &acme(),
+                Some("tls.example"),
+                |_| false,
+                |_| false,
+            ),
+            DefaultRoute::Reject(RejectReason::PolicyDenied)
         );
     }
 
@@ -373,6 +386,40 @@ mod tests {
                 domain: "site.example".into()
             }
         );
+    }
+
+    #[test]
+    fn unmatched_acme_selects_configured_passthrough_action() {
+        let mut config = DefaultListenerConfig::default();
+        config.ordinary_traffic.routes.push(TlsHostRoute {
+            name: "downstream-acme".into(),
+            matcher: HostMatcher {
+                exact: vec!["site.example".into()],
+                ..Default::default()
+            },
+            action: TlsRouteAction::Passthrough {
+                target_port: 443,
+                target: Some("downstream.example".into()),
+                load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin,
+            },
+        });
+        let hello = ClientHello {
+            sni_host: "site.example".into(),
+            alpn_protocols: acme(),
+            random: [0; 32],
+            buffered: vec![1, 2, 3],
+        };
+
+        assert!(matches!(
+            decide(&hello, &config, Some("tls.example"), |_| false),
+            ConnectionRoute::Ordinary {
+                action: TlsRouteAction::Passthrough {
+                    target_port: 443,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
