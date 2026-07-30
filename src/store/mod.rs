@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
+use rocksdb::{BlockBasedOptions, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use time::OffsetDateTime;
 use base64::Engine as _;
@@ -60,6 +60,11 @@ const ALL_CFS: &[&str] = &[
 const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
 const KEY_CURRENT_CONFIG: &[u8] = b"current";
 const KEY_CONFIG_REVISION: &[u8] = b"revision";
+
+const ROCKSDB_DB_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
+const ROCKSDB_CF_WRITE_BUFFER_SIZE: usize = 16 * 1024;
+const ROCKSDB_MAX_WRITE_BUFFERS: i32 = 2;
+const ROCKSDB_MAX_TOTAL_WAL_SIZE: u64 = 4 * 1024 * 1024;
 
 type RocksDb = DBWithThreadMode<MultiThreaded>;
 
@@ -191,9 +196,16 @@ impl Store {
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
+        db_options.set_db_write_buffer_size(ROCKSDB_DB_WRITE_BUFFER_SIZE);
+        db_options.set_max_total_wal_size(ROCKSDB_MAX_TOTAL_WAL_SIZE);
         let descriptors = ALL_CFS.iter().map(|name| {
             let mut options = Options::default();
             options.set_compression_type(rocksdb::DBCompressionType::Lz4);
+            options.set_write_buffer_size(ROCKSDB_CF_WRITE_BUFFER_SIZE);
+            options.set_max_write_buffer_number(ROCKSDB_MAX_WRITE_BUFFERS);
+            let mut table_options = BlockBasedOptions::default();
+            table_options.disable_cache();
+            options.set_block_based_table_factory(&table_options);
             ColumnFamilyDescriptor::new(*name, options)
         });
         let db = RocksDb::open_cf_descriptors(&db_options, &path, descriptors)
