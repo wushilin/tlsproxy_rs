@@ -497,8 +497,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for ChunkedBodyReader<R> {
             ChunkedState::Data { remaining } => (*remaining).min(buffer.remaining() as u64) as usize,
             _ => 1,
         };
-        let mut chunk = [0u8; 8192];
-        let mut scratch = tokio::io::ReadBuf::new(&mut chunk[..want.min(8192)]);
+        let mut chunk = [0u8; 4096];
+        let mut scratch = tokio::io::ReadBuf::new(&mut chunk[..want.min(4096)]);
         match std::pin::Pin::new(&mut this.inner).poll_read(context, &mut scratch) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(cause)) => return Poll::Ready(Err(cause)),

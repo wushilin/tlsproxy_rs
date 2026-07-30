@@ -312,7 +312,7 @@ async fn serve_file<S: AsyncWrite + Unpin>(stream: &mut S, head: &HttpHead, phys
 /// buffer whole files in memory.
 async fn stream_body<S: AsyncWrite + Unpin>(stream: &mut S, file: &mut tokio::fs::File, length: u64) -> Result<()> {
     let mut remaining = length;
-    let mut chunk = vec![0u8; 64 * 1024];
+    let mut chunk = vec![0u8; 4096];
     while remaining > 0 {
         let want = remaining.min(chunk.len() as u64) as usize;
         let count = tokio::io::AsyncReadExt::read(file, &mut chunk[..want]).await?;
@@ -328,7 +328,7 @@ async fn stream_body<S: AsyncWrite + Unpin>(stream: &mut S, file: &mut tokio::fs
 async fn stream_compressed<S: AsyncWrite + Unpin>(stream: &mut S, file: &mut tokio::fs::File, length: u64, encoding: Encoding) -> Result<()> {
     let mut encoder = BodyEncoder::new(encoding).context("failed to create compressor")?;
     let mut remaining = length;
-    let mut chunk = vec![0u8; 64 * 1024];
+    let mut chunk = vec![0u8; 4096];
     while remaining > 0 {
         let want = remaining.min(chunk.len() as u64) as usize;
         let count = tokio::io::AsyncReadExt::read(file, &mut chunk[..want]).await?;

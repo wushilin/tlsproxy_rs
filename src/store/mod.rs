@@ -68,6 +68,17 @@ const ROCKSDB_MAX_TOTAL_WAL_SIZE: u64 = 4 * 1024 * 1024;
 
 type RocksDb = DBWithThreadMode<MultiThreaded>;
 
+fn rocksdb_column_family_options() -> Options {
+    let mut options = Options::default();
+    options.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    options.set_write_buffer_size(ROCKSDB_CF_WRITE_BUFFER_SIZE);
+    options.set_max_write_buffer_number(ROCKSDB_MAX_WRITE_BUFFERS);
+    let mut table_options = BlockBasedOptions::default();
+    table_options.disable_cache();
+    options.set_block_based_table_factory(&table_options);
+    options
+}
+
 #[derive(Clone)]
 pub struct Store {
     db: Arc<RocksDb>,
@@ -198,16 +209,10 @@ impl Store {
         db_options.create_missing_column_families(true);
         db_options.set_db_write_buffer_size(ROCKSDB_DB_WRITE_BUFFER_SIZE);
         db_options.set_max_total_wal_size(ROCKSDB_MAX_TOTAL_WAL_SIZE);
-        let descriptors = ALL_CFS.iter().map(|name| {
-            let mut options = Options::default();
-            options.set_compression_type(rocksdb::DBCompressionType::Lz4);
-            options.set_write_buffer_size(ROCKSDB_CF_WRITE_BUFFER_SIZE);
-            options.set_max_write_buffer_number(ROCKSDB_MAX_WRITE_BUFFERS);
-            let mut table_options = BlockBasedOptions::default();
-            table_options.disable_cache();
-            options.set_block_based_table_factory(&table_options);
-            ColumnFamilyDescriptor::new(*name, options)
-        });
+        let descriptors = std::iter::once(ColumnFamilyDescriptor::new("default", rocksdb_column_family_options()))
+            .chain(ALL_CFS.iter().map(|name| {
+                ColumnFamilyDescriptor::new(*name, rocksdb_column_family_options())
+            }));
         let db = RocksDb::open_cf_descriptors(&db_options, &path, descriptors)
             .with_context(|| format!("failed to open RocksDB `{}`", path.display()))?;
         let store = Self {

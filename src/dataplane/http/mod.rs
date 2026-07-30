@@ -383,7 +383,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for KeepWriteOpen<W> {
 async fn read_response_head<R: AsyncRead + Send + Unpin>(upstream: &mut R) -> Result<Vec<u8>> {
     const MAX_RESPONSE_HEAD: usize = 64 * 1024;
     let mut buffer = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 8192];
+    let mut chunk = [0u8; 4096];
     loop {
         let count = tokio::time::timeout(Duration::from_secs(30), tokio::io::AsyncReadExt::read(upstream, &mut chunk))
             .await
