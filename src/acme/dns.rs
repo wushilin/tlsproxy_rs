@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use hickory_resolver::config::{
-    LookupIpStrategy, NameServerConfigGroup, ResolveHosts, ResolverConfig, ResolverOpts,
+    ConnectionConfig, LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig,
+    ResolverOpts,
 };
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use log::{info, warn};
 
@@ -43,8 +44,15 @@ impl PublicDnsPrerequisite {
     async fn lookup(&self, resolver: &str, domain: &str) -> ResolverResult {
         let result = async {
             let (ip, port) = parse_resolver(resolver)?;
-            let nameservers = NameServerConfigGroup::from_ips_clear(&[ip], port, true);
-            let config = ResolverConfig::from_parts(None, Vec::new(), nameservers);
+            let connections = [ConnectionConfig::udp(), ConnectionConfig::tcp()]
+                .into_iter()
+                .map(|mut connection| {
+                    connection.port = port;
+                    connection
+                })
+                .collect();
+            let nameserver = NameServerConfig::new(ip, true, connections);
+            let config = ResolverConfig::from_parts(None, Vec::new(), vec![nameserver]);
             let mut options = ResolverOpts::default();
             options.timeout = self.query_timeout;
             options.attempts = 1;
@@ -52,10 +60,11 @@ impl PublicDnsPrerequisite {
             options.use_hosts_file = ResolveHosts::Never;
             let resolver_client = TokioResolver::builder_with_config(
                 config,
-                TokioConnectionProvider::default(),
+                TokioRuntimeProvider::default(),
             )
             .with_options(options)
-            .build();
+            .build()
+            .with_context(|| format!("failed to build DNS resolver for {resolver}"))?;
             let lookup = resolver_client
                 .lookup_ip(format!("{domain}."))
                 .await
@@ -229,3 +238,4 @@ mod tests {
         assert!(evaluate_domain("app.example", &self_ips, &results, true).is_err());
     }
 }
+

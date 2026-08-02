@@ -19,7 +19,9 @@ log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
-base64 = "0.22"
+# `simd-unsafe` (default-on since 0.23) is left off: it is new unsafe SIMD code and we
+# decode attacker-controlled Authorization headers. Inputs here are far too small to gain.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 serde_json = "1"
 regex = "1"
 serde_derive = "1"
@@ -39,16 +41,16 @@ if-addrs = "0.15"
 rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
 argon2 = "0.5"
 rand = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
 subtle = "2"
 instant-acme = { version = "0.8.5", features = ["time", "x509-parser"] }
-hickory-resolver = "0.25.2"
+hickory-resolver = "0.26.1"
 futures-util = "0.3"
 tempfile = "3"
 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
