@@ -114,6 +114,23 @@ concrete SNI (exact, suffix, or regex match), the domain is registered
 automatically after the public-DNS prerequisite confirms it resolves to the
 configured self IPs. Registration runs in the background, is throttled to
 one attempt per domain per ten minutes, and never delays TLS handshakes.
+Suffix matchers accept the bare domain and hosts exactly one label deeper
+(`code.rusts3api.example` for suffix `rusts3api.example`, but not
+`a.b.rusts3api.example`), so clients cannot spam issuance attempts by
+varying deep subdomains; use a regex route if you need deeper trees.
+
+An optional DNS check script (`acme.dns_check_script`, configurable at the
+bottom of the Auto Certs page) adds an operator-defined gate: when set, the
+script runs with the candidate domain as its only argument before any
+automatic certificate is created — ACME orders and local-CA fallback
+certificates alike. Exit 0 accepts the domain; any other exit (or a spawn
+failure or timeout, which fail closed) rejects it and the terminating TLS
+handshake fails instead of minting a certificate. Verdicts are cached for
+ten minutes, at most four scripts run concurrently, and domains that
+already serve an active managed certificate are exempt, as is the reserved
+control-plane hostname. This suits hostname-style object storage: the
+script can ask the S3 API whether the bucket exists before a certificate
+is ever issued.
 
 The scheduler:
 

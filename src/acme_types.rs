@@ -52,6 +52,14 @@ pub struct AcmeSettings {
     pub scan_interval_hours: u16,
     #[serde(default = "default_challenge_ttl_seconds")]
     pub challenge_ttl_seconds: u16,
+    /// Optional path to an executable that decides whether a domain may be
+    /// managed automatically (ACME orders and local-CA fallback certificates
+    /// alike). It is invoked with the candidate domain as its only argument;
+    /// exit 0 accepts, any other exit (or a spawn failure or timeout, which
+    /// fail closed) rejects the domain and the terminating TLS handshake.
+    /// Empty means every domain a route accepts is eligible.
+    #[serde(default)]
+    pub dns_check_script: String,
 }
 
 impl Default for AcmeSettings {
@@ -61,6 +69,7 @@ impl Default for AcmeSettings {
             renew_before_days: default_renew_before_days(),
             scan_interval_hours: default_scan_interval_hours(),
             challenge_ttl_seconds: default_challenge_ttl_seconds(),
+            dns_check_script: String::new(),
         }
     }
 }

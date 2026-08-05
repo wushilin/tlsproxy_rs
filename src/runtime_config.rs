@@ -405,6 +405,13 @@ impl HostMatcher {
     /// Higher scores win: exact, then longest suffix, then regex. Regex
     /// routes deliberately share one score so their configuration order is
     /// the only precedence rule.
+    ///
+    /// A suffix matches the bare domain and hosts exactly one label deeper
+    /// (`code.rusts3api.example` for suffix `rusts3api.example`, but not
+    /// `a.b.rusts3api.example`). Deeper hosts are client-controlled SNI spam
+    /// vectors: each unique value a suffix route accepts can trigger an
+    /// automatic ACME issuance attempt, so depth is capped at one level.
+    /// Operators who need deeper trees can use a regex route.
     fn match_score(&self, host: &str) -> Option<(u8, usize)> {
         let host = host.trim_end_matches('.');
         if self.exact.iter().any(|entry| host.eq_ignore_ascii_case(entry.trim_end_matches('.'))) {
@@ -412,11 +419,11 @@ impl HostMatcher {
         }
         let suffix = self.suffix.iter().filter_map(|entry| {
                 let suffix = entry.trim().trim_start_matches('.').trim_end_matches('.');
-                (host.eq_ignore_ascii_case(suffix)
-                    || host.len() > suffix.len()
-                        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-                        && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix))
-                    .then_some(suffix.len())
+                let one_label_deeper = host.len() > suffix.len()
+                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+                    && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+                    && !host[..host.len() - suffix.len() - 1].contains('.');
+                (host.eq_ignore_ascii_case(suffix) || one_label_deeper).then_some(suffix.len())
             }).max();
         if let Some(length) = suffix { return Some((2, length)); }
         self.patterns.iter().any(|pattern| pattern.is_match(host)).then_some((1, 0))
@@ -865,6 +872,19 @@ mod tests {
         assert!(matcher.matches("internal.example"));
         assert!(!matcher.matches("notinternal.example"));
         assert!(matcher.matches("api12.example"));
+    }
+
+    #[test]
+    fn suffix_matches_at_most_one_label_deeper() {
+        let matcher = HostMatcher {
+            suffix: vec!["rusts3api.wushilin.net".into()],
+            ..Default::default()
+        };
+        assert!(matcher.matches("rusts3api.wushilin.net"));
+        assert!(matcher.matches("code.rusts3api.wushilin.net"));
+        assert!(matcher.matches("CODE.RUSTS3API.WUSHILIN.NET."));
+        assert!(!matcher.matches("staging.code.rusts3api.wushilin.net"));
+        assert!(!matcher.matches("www1.staging.code.rusts3api.wushilin.net"));
     }
 
     #[test]

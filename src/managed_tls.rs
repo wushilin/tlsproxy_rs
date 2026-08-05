@@ -41,6 +41,95 @@ fn recent_registration_attempts() -> &'static StdRwLock<lru::LruCache<String, st
 
 const REGISTRATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
+const DNS_CHECK_VERDICT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const DNS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn dns_check_verdicts() -> &'static StdRwLock<lru::LruCache<(String, String), (bool, std::time::Instant)>> {
+    static VERDICTS: OnceLock<StdRwLock<lru::LruCache<(String, String), (bool, std::time::Instant)>>> = OnceLock::new();
+    VERDICTS.get_or_init(|| {
+        StdRwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).expect("non-zero cache size")))
+    })
+}
+
+/// Bounds concurrent DNS-check-script processes so a burst of unmanaged SNIs
+/// cannot fork-bomb the host; excess handshakes wait their turn.
+fn dns_check_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(4))
+}
+
+/// Enforces the operator's optional DNS check script for a terminating
+/// handshake. Domains that already serve an active managed certificate are
+/// exempt — the script decides only whether a *new* domain may be managed.
+/// A rejection propagates as a handshake error so the client sees a TLS
+/// failure instead of a local-CA fallback certificate.
+pub async fn ensure_termination_permitted(sni: &str, cache: &ManagedCertificateCache) -> Result<()> {
+    let script = crate::runtime_live::load().acme.dns_check_script.trim().to_string();
+    if script.is_empty() {
+        return Ok(());
+    }
+    let domain = normalize_domain(sni).map_err(|cause| anyhow::anyhow!("invalid SNI for DNS check: {cause}"))?;
+    if cache.resolve(&domain).await.is_some() {
+        return Ok(());
+    }
+    if dns_check_allows(&script, &domain).await {
+        Ok(())
+    } else {
+        bail!("DNS check script rejected domain `{domain}`")
+    }
+}
+
+/// Runs the operator's DNS check script for one domain, caching the verdict
+/// (allowed and rejected alike) for ten minutes. Spawn failures, non-zero
+/// exits, and timeouts all fail closed.
+async fn dns_check_allows(script: &str, domain: &str) -> bool {
+    let key = (script.to_string(), domain.to_string());
+    {
+        let mut verdicts = dns_check_verdicts().write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((allowed, decided_at)) = verdicts.get(&key) {
+            if decided_at.elapsed() < DNS_CHECK_VERDICT_TTL {
+                return *allowed;
+            }
+        }
+    }
+    let _slot = dns_check_slots().acquire().await.expect("DNS check semaphore is never closed");
+    let allowed = run_dns_check_script(script, domain).await;
+    dns_check_verdicts()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .put(key, (allowed, std::time::Instant::now()));
+    allowed
+}
+
+async fn run_dns_check_script(script: &str, domain: &str) -> bool {
+    let mut command = tokio::process::Command::new(script);
+    command.arg(domain).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    let output = match tokio::time::timeout(DNS_CHECK_TIMEOUT, command.output()).await {
+        Err(_elapsed) => {
+            log::warn!("DNS check script `{script}` timed out after {DNS_CHECK_TIMEOUT:?} for `{domain}`; rejecting");
+            return false;
+        }
+        Ok(Err(cause)) => {
+            log::warn!("DNS check script `{script}` could not run for `{domain}`: {cause}; rejecting");
+            return false;
+        }
+        Ok(Ok(output)) => output,
+    };
+    if output.status.success() {
+        info!("DNS check script accepted `{domain}`");
+        return true;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    log::warn!(
+        "DNS check script rejected `{domain}` ({}){}{}",
+        output.status,
+        if stderr.is_empty() { "" } else { ": " },
+        stderr
+    );
+    false
+}
+
 /// Schedules certificate registration for a concrete SNI after an explicit
 /// terminating route has accepted it. This supports exact, suffix, and regex
 /// host rules without wildcards.
@@ -76,6 +165,10 @@ pub fn request_automatic_for_sni(sni: &str) {
 }
 
 async fn register_automatic(domain: String, registration: AutoRegistration) -> Result<()> {
+    let script = crate::runtime_live::load().acme.dns_check_script.trim().to_string();
+    if !script.is_empty() && !dns_check_allows(&script, &domain).await {
+        bail!("DNS check script rejected the domain");
+    }
     let store = registration.store.clone();
     let existing = {
         let store = store.clone();
@@ -352,6 +445,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cache.identity("www.example").await.unwrap().1, "generation-2");
+    }
+
+    #[tokio::test]
+    async fn dns_check_script_gates_domains_and_caches_verdicts() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("dns-check.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\ncase \"$1\" in *.allowed.example) exit 0;; esac\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = script_path.to_str().unwrap();
+
+        assert!(dns_check_allows(script, "bucket.allowed.example").await);
+        assert!(!dns_check_allows(script, "bucket.other.example").await);
+
+        let missing = directory.path().join("missing.sh");
+        assert!(!dns_check_allows(missing.to_str().unwrap(), "bucket.allowed.example").await);
+
+        // Verdicts are cached: the decision survives the script disappearing.
+        std::fs::remove_file(&script_path).unwrap();
+        assert!(dns_check_allows(script, "bucket.allowed.example").await);
+        assert!(!dns_check_allows(script, "bucket.other.example").await);
     }
 
     #[test]
