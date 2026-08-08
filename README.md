@@ -181,7 +181,10 @@ ordering and signatures. Per-resolver DNS results and timestamps are
 available in the control plane.
 
 Every managed certificate can be deleted — pending or issued, automatic or
-manual. Accumulated unwanted registrations (for example spam-driven
+manual. The Auto Certs page filters the certificate list by substring
+(domain, id, or provider) and by status (issued, pending, expired), both
+applied together, and rows carry checkboxes with a select-all for the
+filtered set so a batch can be deleted in one action. Accumulated unwanted registrations (for example spam-driven
 automatic entries from before the suffix cap and DNS check script existed)
 would otherwise consume renewal quota forever. Deleting a certificate whose
 TLS route is still active is not permanent: the next matching handshake
