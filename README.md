@@ -180,13 +180,14 @@ threshold remains the fallback. Downloaded chains are checked for issuer
 ordering and signatures. Per-resolver DNS results and timestamps are
 available in the control plane.
 
-A certificate that has never issued — or whose issuance has expired — is
-just a pending request and can always be deleted, even an automatic one
-whose route is still active (the next matching handshake simply re-registers
-it). Once issued and still valid, a Let's Encrypt certificate cannot be
-deleted — protecting against accidental re-issuance into CA rate limits —
-and an automatic certificate of any provider cannot be deleted while a TLS
-route still uses its domain.
+Every managed certificate can be deleted — pending or issued, automatic or
+manual. Accumulated unwanted registrations (for example spam-driven
+automatic entries from before the suffix cap and DNS check script existed)
+would otherwise consume renewal quota forever. Deleting a certificate whose
+TLS route is still active is not permanent: the next matching handshake
+re-registers the domain, subject to the DNS check script, and a re-issuance
+then counts against CA rate limits — so prune routes or configure the check
+script before mass-deleting still-routed domains.
 
 Active generations are parsed into an atomically replaced exact-SNI cache.
 TLS termination and the control hostname prefer this cache, then apply the

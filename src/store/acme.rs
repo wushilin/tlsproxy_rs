@@ -423,27 +423,10 @@ impl Store {
         let Some(certificate) = self.managed_certificate(certificate_id)? else {
             return Ok(false);
         };
-        let lets_encrypt = matches!(certificate.provider_id.as_str(), "letsencrypt-production" | "letsencrypt-staging");
-        let issued_and_valid = self.active_generation(certificate_id)?
-            .is_some_and(|generation| crate::managed_tls::validate_generation(&certificate, &generation).is_ok());
-        // A certificate that never issued (or whose issuance expired) is only a
-        // pending request — often a typo — so it is always deletable; deleting
-        // an automatic one is harmless because the next matching handshake
-        // simply re-registers it.
-        if issued_and_valid {
-            if lets_encrypt {
-                bail!("an issued and still-valid Let's Encrypt certificate cannot be deleted");
-            }
-            if certificate.automatic {
-                let config = self.load_config()?.map(|stored| stored.config);
-                let still_managed = config.as_ref().is_some_and(|config| certificate.domains.iter().any(|domain| {
-                    automatic_domain_is_in_use(config, domain)
-                }));
-                if still_managed {
-                    bail!("automatic certificate is managed by an active TLS route and cannot be deleted");
-                }
-            }
-        }
+        // Every managed certificate is deletable, issued or not, automatic or
+        // manual — accumulated unwanted registrations would otherwise consume
+        // renewal quota forever. If a TLS route still matches the domain, the
+        // next handshake re-registers it, subject to the DNS check script.
         let certificates = self.cf(CF_CERTIFICATES)?;
         let domain_index = self.cf(CF_DOMAIN_INDEX)?;
         let generations = self.cf(CF_GENERATIONS)?;
@@ -676,18 +659,6 @@ impl Store {
 fn certificate_gate() -> &'static std::sync::Mutex<()> {
     static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     GATE.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-fn automatic_domain_is_in_use(config: &RuntimeConfig, domain: &str) -> bool {
-    use crate::runtime_config::{AdditionalListenerConfig, TlsRouteAction};
-    let terminating = |action: &TlsRouteAction| matches!(action, TlsRouteAction::Terminate { .. } | TlsRouteAction::ReverseProxy { .. });
-    let normalized_hostname = normalize_domain(&config.control_plane.hostname);
-    if normalize_domain(domain).is_ok_and(|domain| normalized_hostname.is_ok_and(|hostname| hostname == domain)) { return true; }
-    if config.default_listener.ordinary_traffic.routes.iter().any(|route| route.matcher.matches(domain) && terminating(&route.action)) { return true; }
-    config.additional_listeners.values().any(|listener| match listener {
-        AdditionalListenerConfig::Tls(listener) => listener.routing.routes.iter().any(|route| route.matcher.matches(domain) && terminating(&route.action)),
-        _ => false,
-    })
 }
 
 fn generation_key(certificate_id: &str, generation_id: &str) -> Vec<u8> {

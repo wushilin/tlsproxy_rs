@@ -687,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_terminating_route_creates_protected_automatic_certificate() {
+    fn exact_terminating_route_creates_deletable_automatic_certificate() {
         use crate::runtime_config::{HostMatcher, TlsHostRoute, TlsRouteAction, UpstreamTransport};
         let directory = tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -710,7 +710,8 @@ mod tests {
         assert_eq!(store.ensure_automatic_certificates(&config).unwrap(), 1);
         let certificate = store.certificate_for_domain("auto.example").unwrap().unwrap();
 
-        // Once issued and still valid, the certificate becomes protected.
+        // Even issued and still valid, it stays deletable — unwanted
+        // registrations would otherwise consume renewal quota forever.
         let key = rcgen::KeyPair::generate().unwrap();
         let leaf = rcgen::CertificateParams::new(vec!["auto.example".into()])
             .unwrap()
@@ -729,7 +730,8 @@ mod tests {
                 &RenewalState { certificate_id: certificate.id.clone(), ..Default::default() },
             )
             .unwrap();
-        assert!(store.delete_managed_certificate(&certificate.id).is_err());
+        assert!(store.delete_managed_certificate(&certificate.id).unwrap());
+        assert!(store.certificate_for_domain("auto.example").unwrap().is_none());
     }
 
     #[test]
