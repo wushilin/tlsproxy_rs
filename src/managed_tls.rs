@@ -42,7 +42,7 @@ fn recent_registration_attempts() -> &'static StdRwLock<lru::LruCache<String, st
 const REGISTRATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 const DNS_CHECK_VERDICT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-const DNS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const DNS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn dns_check_verdicts() -> &'static StdRwLock<lru::LruCache<(String, String), (bool, std::time::Instant)>> {
     static VERDICTS: OnceLock<StdRwLock<lru::LruCache<(String, String), (bool, std::time::Instant)>>> = OnceLock::new();
@@ -58,21 +58,16 @@ fn dns_check_slots() -> &'static tokio::sync::Semaphore {
     SLOTS.get_or_init(|| tokio::sync::Semaphore::new(4))
 }
 
-/// Enforces the operator's optional DNS check script for a terminating
-/// handshake. Domains that already serve an active managed certificate are
-/// exempt — the script decides only whether a *new* domain may be managed.
-/// A rejection propagates as a handshake error so the client sees a TLS
-/// failure instead of a local-CA fallback certificate.
-pub async fn ensure_termination_permitted(sni: &str, cache: &ManagedCertificateCache) -> Result<()> {
+/// Consults the operator's optional DNS check script before a *new*
+/// certificate is created for `domain` — an automatic ACME registration or a
+/// fresh local-CA fallback mint. Domains that already hold a certificate are
+/// never re-checked; callers only invoke this when issuance is imminent.
+async fn dns_check_permits_new_issuance(domain: &str) -> Result<()> {
     let script = crate::runtime_live::load().acme.dns_check_script.trim().to_string();
     if script.is_empty() {
         return Ok(());
     }
-    let domain = normalize_domain(sni).map_err(|cause| anyhow::anyhow!("invalid SNI for DNS check: {cause}"))?;
-    if cache.resolve(&domain).await.is_some() {
-        return Ok(());
-    }
-    if dns_check_allows(&script, &domain).await {
+    if dns_check_allows(&script, domain).await {
         Ok(())
     } else {
         bail!("DNS check script rejected domain `{domain}`")
@@ -103,14 +98,28 @@ async fn dns_check_allows(script: &str, domain: &str) -> bool {
 
 async fn run_dns_check_script(script: &str, domain: &str) -> bool {
     let mut command = tokio::process::Command::new(script);
-    command.arg(domain).stdin(std::process::Stdio::null()).kill_on_drop(true);
-    let output = match tokio::time::timeout(DNS_CHECK_TIMEOUT, command.output()).await {
+    command
+        .arg(domain)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(cause) => {
+            log::warn!("DNS check script `{script}` could not run for `{domain}`: {cause}; rejecting");
+            return false;
+        }
+    };
+    let output = match tokio::time::timeout(DNS_CHECK_TIMEOUT, child.wait_with_output()).await {
         Err(_elapsed) => {
-            log::warn!("DNS check script `{script}` timed out after {DNS_CHECK_TIMEOUT:?} for `{domain}`; rejecting");
+            // `wait_with_output` consumed the child, so dropping the timed-out
+            // future just now (via kill_on_drop) SIGKILLed the script process.
+            log::warn!("DNS check script `{script}` exceeded {DNS_CHECK_TIMEOUT:?} for `{domain}`; force-killed and rejecting");
             return false;
         }
         Ok(Err(cause)) => {
-            log::warn!("DNS check script `{script}` could not run for `{domain}`: {cause}; rejecting");
+            log::warn!("DNS check script `{script}` could not be awaited for `{domain}`: {cause}; rejecting");
             return false;
         }
         Ok(Ok(output)) => output,
@@ -165,10 +174,7 @@ pub fn request_automatic_for_sni(sni: &str) {
 }
 
 async fn register_automatic(domain: String, registration: AutoRegistration) -> Result<()> {
-    let script = crate::runtime_live::load().acme.dns_check_script.trim().to_string();
-    if !script.is_empty() && !dns_check_allows(&script, &domain).await {
-        bail!("DNS check script rejected the domain");
-    }
+    dns_check_permits_new_issuance(&domain).await?;
     let store = registration.store.clone();
     let existing = {
         let store = store.clone();
@@ -263,6 +269,38 @@ impl ManagedCertificateCache {
         }
         match fallback {
             CertificateFallbackPolicy::LocalCa => ca.resolve_or_mint(sni),
+            CertificateFallbackPolicy::Reject => {
+                bail!("no active managed certificate for `{sni}` and fallback is reject")
+            }
+        }
+    }
+
+    /// [`Self::resolve_with_fallback`] for ordinary terminating routes: the
+    /// operator's DNS check script is consulted before the local CA mints a
+    /// certificate for a domain it has never issued for. Active managed
+    /// certificates and still-cached local-CA leaves serve without a check —
+    /// the script gates new issuance only. The control-plane service keeps
+    /// using the ungated variant so a rejecting script can never lock the
+    /// administrator out.
+    pub async fn resolve_for_termination(
+        &self,
+        sni: &str,
+        ca: &crate::ca::LocalCa,
+        fallback: CertificateFallbackPolicy,
+    ) -> Result<Arc<CertifiedKey>> {
+        if let Some(key) = self.resolve(sni).await {
+            return Ok(key);
+        }
+        match fallback {
+            CertificateFallbackPolicy::LocalCa => {
+                if let Some(key) = ca.resolve_cached(sni) {
+                    return Ok(key);
+                }
+                let domain = normalize_domain(sni)
+                    .map_err(|cause| anyhow::anyhow!("invalid SNI for DNS check: {cause}"))?;
+                dns_check_permits_new_issuance(&domain).await?;
+                ca.resolve_or_mint(sni)
+            }
             CertificateFallbackPolicy::Reject => {
                 bail!("no active managed certificate for `{sni}` and fallback is reject")
             }

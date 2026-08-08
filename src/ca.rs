@@ -75,6 +75,13 @@ impl LocalCa {
         self.resolve_or_mint_inner(&hostname, std::slice::from_ref(&hostname))
     }
 
+    /// Returns the cached leaf for `hostname` without minting, so callers can
+    /// distinguish serving an existing certificate from issuing a new one.
+    pub fn resolve_cached(&self, hostname: &str) -> Option<Arc<CertifiedKey>> {
+        let hostname = sanitize_hostname(hostname).ok()?;
+        self.get_cached(&hostname)
+    }
+
     pub fn evict_expiring(&self) {
         let now = OffsetDateTime::now_utc();
         let mut cache = self.inner.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

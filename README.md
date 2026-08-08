@@ -120,17 +120,20 @@ Suffix matchers accept the bare domain and hosts exactly one label deeper
 varying deep subdomains; use a regex route if you need deeper trees.
 
 An optional DNS check script (`acme.dns_check_script`, configurable at the
-bottom of the Auto Certs page) adds an operator-defined gate: when set, the
-script runs with the candidate domain as its only argument before any
-automatic certificate is created — ACME orders and local-CA fallback
-certificates alike. Exit 0 accepts the domain; any other exit (or a spawn
-failure or timeout, which fail closed) rejects it and the terminating TLS
-handshake fails instead of minting a certificate. Verdicts are cached for
-ten minutes, at most four scripts run concurrently, and domains that
-already serve an active managed certificate are exempt, as is the reserved
-control-plane hostname. This suits hostname-style object storage: the
-script can ask the S3 API whether the bucket exists before a certificate
-is ever issued.
+bottom of the Auto Certs page) adds an operator-defined gate on *new*
+issuance: when set, the script runs with the candidate domain as its only
+argument before any new automatic certificate is created — ACME
+registrations and fresh local-CA fallback mints alike. Exit 0 accepts the
+domain; any other exit rejects the issuance, and a terminating handshake
+that needed the new certificate fails instead of minting one. Spawn
+failures fail closed, and a script still running after 30 seconds is
+force-killed and treated as a rejection. Certificates that already exist —
+active managed certificates and still-cached local-CA leaves — serve
+without consulting the script, as does the reserved control-plane
+hostname. Verdicts are cached for ten minutes and at most four scripts
+run concurrently. This suits hostname-style object storage: the script
+can ask the S3 API whether the bucket exists before a certificate is
+ever issued.
 
 The scheduler:
 

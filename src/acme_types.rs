@@ -52,12 +52,14 @@ pub struct AcmeSettings {
     pub scan_interval_hours: u16,
     #[serde(default = "default_challenge_ttl_seconds")]
     pub challenge_ttl_seconds: u16,
-    /// Optional path to an executable that decides whether a domain may be
-    /// managed automatically (ACME orders and local-CA fallback certificates
-    /// alike). It is invoked with the candidate domain as its only argument;
-    /// exit 0 accepts, any other exit (or a spawn failure or timeout, which
-    /// fail closed) rejects the domain and the terminating TLS handshake.
-    /// Empty means every domain a route accepts is eligible.
+    /// Optional path to an executable consulted before a *new* automatic
+    /// certificate is issued (ACME registrations and fresh local-CA fallback
+    /// mints alike; already-issued certificates serve unchecked). It is
+    /// invoked with the candidate domain as its only argument; exit 0
+    /// accepts, any other exit rejects the issuance and the terminating TLS
+    /// handshake that needed it. Spawn failures fail closed, and a script
+    /// still running after 30 seconds is force-killed and treated as a
+    /// rejection. Empty means every domain a route accepts is eligible.
     #[serde(default)]
     pub dns_check_script: String,
 }

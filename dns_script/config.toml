@@ -1,0 +1,43 @@
+# dnsauth configuration — read from the current working directory.
+
+# Hosts that are always allowed, exact match (case-insensitive).
+allowed_exact_hosts = [
+    "wushilin.net",
+    "www.wushilin.net",
+    # The S3 endpoint's own hostname must be allowed, otherwise the proxy
+    # can never get a cert for it and bucket probes through it will fail.
+    "rusts3api.wushilin.net",
+]
+
+# Wildcard patterns. Each "*" matches exactly ONE valid DNS label
+# (letters/digits/hyphens, no leading or trailing hyphen, max 63 chars).
+# Label count must match: "*.*.wushilin.net" matches a.b.wushilin.net
+# but NOT a.wushilin.net or a.b.c.wushilin.net.
+allowed_wildcard_hosts = [
+    # "*.internal.wushilin.net",
+]
+
+# S3-backed patterns: must start with "*." — the "*" is the bucket name.
+# The FQDN is allowed only if that bucket exists on s3_endpoint
+# (probed with a path-style signed HEAD request).
+allowed_s3_buckets = [
+    "*.rusts3api.wushilin.net",
+]
+
+s3_endpoint = "https://rusts3api.wushilin.net"
+s3_access_key = "asdf123"
+s3_secret_key = "@super4321"
+s3_region = "us-east-1"      # optional, default us-east-1
+s3_timeout_seconds = 5       # optional, default 5
+
+# Probe URL style. true (default) = path style: HEAD https://endpoint/bucket
+# false = virtual-hosted style:               HEAD https://bucket.endpoint/
+# Virtual-hosted style is only safe against an endpoint that bypasses the
+# TLS proxy (e.g. an internal http:// address). If the probe hostname would
+# match one of the patterns above, the probe is refused (it would trigger a
+# cert request that recurses back into this program).
+s3_path_style = true
+
+# Skip TLS certificate verification on the probe. Useful if s3_endpoint
+# points at an internal address with a self-signed cert.
+s3_insecure_skip_verify = false

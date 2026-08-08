@@ -242,10 +242,9 @@ pub(crate) async fn dispatch_non_control(
                     upstream,
                     load_balancing,
                 } => {
-                    crate::managed_tls::ensure_termination_permitted(&hello.sni_host, &tls.cache).await?;
                     crate::managed_tls::request_automatic_for_sni(&hello.sni_host);
                     let certified_key = tls.cache
-                        .resolve_with_fallback(&hello.sni_host, &tls.ca, tls.fallback)
+                        .resolve_for_termination(&hello.sni_host, &tls.ca, tls.fallback)
                         .await?;
                     crate::dataplane::tls::terminate::run_inspected(
                         ctx,
@@ -264,10 +263,9 @@ pub(crate) async fn dispatch_non_control(
                     .await
                 }
                 TlsRouteAction::ReverseProxy { action } => {
-                    crate::managed_tls::ensure_termination_permitted(&hello.sni_host, &tls.cache).await?;
                     crate::managed_tls::request_automatic_for_sni(&hello.sni_host);
                     let certified_key = tls.cache
-                        .resolve_with_fallback(&hello.sni_host, &tls.ca, tls.fallback)
+                        .resolve_for_termination(&hello.sni_host, &tls.ca, tls.fallback)
                         .await?;
                     crate::dataplane::tls::terminate::run_reverse_proxy(
                         ctx, policy, client, hello, certified_key, action,

@@ -18,3 +18,4 @@ runtime/
 .claude/worktrees/
 *.local.*
 tlsproxy-data/
+dns_script/dnsauth
