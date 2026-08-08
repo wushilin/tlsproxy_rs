@@ -512,6 +512,28 @@ pub enum CertificateFallbackPolicy {
 }
 
 impl RuntimeConfig {
+    /// True when `host` appears verbatim in an `exact` matcher entry of an
+    /// active TLS route. Exact entries are operator-typed hostnames — a client
+    /// cannot steer an exact route onto a name the operator did not write
+    /// down — so the DNS check script exempts them from its new-issuance gate.
+    pub fn tls_routes_list_host_exactly(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.');
+        std::iter::once(&self.default_listener.ordinary_traffic)
+            .chain(self.additional_listeners.iter().filter_map(|(name, listener)| {
+                match listener {
+                    AdditionalListenerConfig::Tls(config)
+                        if !self.disabled_listeners.contains(name) =>
+                    {
+                        Some(&config.routing)
+                    }
+                    _ => None,
+                }
+            }))
+            .flat_map(|routing| routing.routes.iter())
+            .flat_map(|route| route.matcher.exact.iter())
+            .any(|entry| host.eq_ignore_ascii_case(entry.trim().trim_end_matches('.')))
+    }
+
     pub fn validate(&self) -> Result<()> {
         crate::bindaddr::parse_bind_pattern(&self.default_listener.bind)
             .map_err(|cause| anyhow::anyhow!("default listener: {cause}"))?;
@@ -815,6 +837,39 @@ mod tests {
         assert_eq!(routing.select_route("other.example.com").and_then(TlsRouteAction::target_port), Some(1002));
         assert_eq!(routing.select_route("example.net").and_then(TlsRouteAction::target_port), Some(1001));
         assert_eq!(routing.select_route("unmatched.test").and_then(TlsRouteAction::target_port), Some(1005));
+    }
+
+    #[test]
+    fn exact_route_hosts_are_recognized_across_active_tls_listeners() {
+        let action = |port| TlsRouteAction::Passthrough { target_port: port, target: None, load_balancing: HttpLoadBalancing::RoundRobin };
+        let mut config = RuntimeConfig::default();
+        config.default_listener.ordinary_traffic.routes.push(TlsHostRoute {
+            name: String::new(),
+            matcher: HostMatcher { exact: vec!["Api.Example.COM.".into()], suffix: vec!["pool.example.com".into()], ..Default::default() },
+            action: action(1001),
+        });
+        config.additional_listeners.insert(
+            "extra".into(),
+            AdditionalListenerConfig::Tls(HostRoutedTlsListenerConfig {
+                bind: "0.0.0.0:8443".into(),
+                routing: OrdinaryTlsConfig {
+                    routes: vec![TlsHostRoute {
+                        name: String::new(),
+                        matcher: HostMatcher { exact: vec!["extra.example.com".into()], ..Default::default() },
+                        action: action(1002),
+                    }],
+                    ..Default::default()
+                },
+            }),
+        );
+        assert!(config.tls_routes_list_host_exactly("api.example.com"));
+        assert!(config.tls_routes_list_host_exactly("extra.example.com"));
+        // Suffix entries never count as exact, even for the bare domain.
+        assert!(!config.tls_routes_list_host_exactly("pool.example.com"));
+        assert!(!config.tls_routes_list_host_exactly("bucket.pool.example.com"));
+        // A disabled listener's exact hosts no longer vouch for anything.
+        config.disabled_listeners.insert("extra".into());
+        assert!(!config.tls_routes_list_host_exactly("extra.example.com"));
     }
 
     #[test]

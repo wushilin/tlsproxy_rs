@@ -130,10 +130,27 @@ failures fail closed, and a script still running after 30 seconds is
 force-killed and treated as a rejection. Certificates that already exist —
 active managed certificates and still-cached local-CA leaves — serve
 without consulting the script, as does the reserved control-plane
-hostname. Verdicts are cached for ten minutes and at most four scripts
+hostname. Domains listed verbatim in an `exact` route entry also skip the
+script: an exact route only ever matches the hostname the operator typed,
+so there is no room for a client to game it — the script guards the
+suffix and regex routes, whose accepted hostnames are client-chosen.
+Verdicts are cached for ten minutes and at most four scripts
 run concurrently. This suits hostname-style object storage: the script
 can ask the S3 API whether the bucket exists before a certificate is
 ever issued.
+
+A ready-made check script lives in [`dns_script/`](dns_script/): `dnsauth`,
+a dependency-light Go program driven by a `config.toml` in its working
+directory. It allows a domain if it matches an exact host list, a wildcard
+pattern list (each `*` matches exactly one DNS label), or an S3 bucket
+pattern such as `*.rusts3api.example.com` — for bucket patterns it sends a
+SigV4-signed `HEAD` request to the configured S3 endpoint and allows the
+domain only when the bucket exists. Everything else (probe errors, missing
+configuration, 403s from bad credentials) fails closed. Build it with
+`go build` in that directory and point `acme.dns_check_script` at the
+binary; see the commented [`dns_script/config.toml`](dns_script/config.toml)
+for all options, including path-style versus virtual-hosted probes and the
+recursion guard for endpoints served through this proxy itself.
 
 The scheduler:
 

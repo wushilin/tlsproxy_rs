@@ -59,7 +59,9 @@ pub struct AcmeSettings {
     /// accepts, any other exit rejects the issuance and the terminating TLS
     /// handshake that needed it. Spawn failures fail closed, and a script
     /// still running after 30 seconds is force-killed and treated as a
-    /// rejection. Empty means every domain a route accepts is eligible.
+    /// rejection. Domains listed verbatim in an `exact` route entry skip the
+    /// script — only suffix/regex routes accept client-chosen hostnames.
+    /// Empty means every domain a route accepts is eligible.
     #[serde(default)]
     pub dns_check_script: String,
 }

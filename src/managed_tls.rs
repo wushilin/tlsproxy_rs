@@ -62,9 +62,17 @@ fn dns_check_slots() -> &'static tokio::sync::Semaphore {
 /// certificate is created for `domain` — an automatic ACME registration or a
 /// fresh local-CA fallback mint. Domains that already hold a certificate are
 /// never re-checked; callers only invoke this when issuance is imminent.
+///
+/// Domains listed verbatim in an `exact` route entry skip the script: only
+/// suffix and regex routes accept client-chosen hostnames, so only they can
+/// be gamed into unwanted issuance.
 async fn dns_check_permits_new_issuance(domain: &str) -> Result<()> {
-    let script = crate::runtime_live::load().acme.dns_check_script.trim().to_string();
+    let config = crate::runtime_live::load();
+    let script = config.acme.dns_check_script.trim().to_string();
     if script.is_empty() {
+        return Ok(());
+    }
+    if config.tls_routes_list_host_exactly(domain) {
         return Ok(());
     }
     if dns_check_allows(&script, domain).await {
