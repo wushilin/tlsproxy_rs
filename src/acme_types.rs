@@ -19,6 +19,10 @@ fn default_scan_interval_hours() -> u16 {
     12
 }
 
+fn default_cache_failure_time_secs() -> u16 {
+    60
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ControlPlaneConfig {
     #[serde(default)]
@@ -64,6 +68,13 @@ pub struct AcmeSettings {
     /// Empty means every domain a route accepts is eligible.
     #[serde(default)]
     pub dns_check_script: String,
+    /// How long a DNS-check-script rejection is remembered before the script
+    /// is consulted again for the same domain, so repeated handshakes for a
+    /// rejected hostname do not spawn a process each. Acceptances are not
+    /// cached at all: an accepted domain immediately gains a certificate
+    /// (local-CA leaf or managed record) and is never re-checked.
+    #[serde(default = "default_cache_failure_time_secs")]
+    pub cache_failure_time_secs: u16,
 }
 
 impl Default for AcmeSettings {
@@ -74,6 +85,7 @@ impl Default for AcmeSettings {
             scan_interval_hours: default_scan_interval_hours(),
             challenge_ttl_seconds: default_challenge_ttl_seconds(),
             dns_check_script: String::new(),
+            cache_failure_time_secs: default_cache_failure_time_secs(),
         }
     }
 }

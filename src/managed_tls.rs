@@ -41,12 +41,15 @@ fn recent_registration_attempts() -> &'static StdRwLock<lru::LruCache<String, st
 
 const REGISTRATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
-const DNS_CHECK_VERDICT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 const DNS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn dns_check_verdicts() -> &'static StdRwLock<lru::LruCache<(String, String), (bool, std::time::Instant)>> {
-    static VERDICTS: OnceLock<StdRwLock<lru::LruCache<(String, String), (bool, std::time::Instant)>>> = OnceLock::new();
-    VERDICTS.get_or_init(|| {
+/// Rejections only. An accepted domain immediately gains a certificate — a
+/// cached local-CA leaf or a managed record — so the script is never asked
+/// about it again; only rejected hostnames would otherwise spawn a process on
+/// every handshake.
+fn dns_check_rejections() -> &'static StdRwLock<lru::LruCache<(String, String), std::time::Instant>> {
+    static REJECTIONS: OnceLock<StdRwLock<lru::LruCache<(String, String), std::time::Instant>>> = OnceLock::new();
+    REJECTIONS.get_or_init(|| {
         StdRwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).expect("non-zero cache size")))
     })
 }
@@ -75,32 +78,38 @@ async fn dns_check_permits_new_issuance(domain: &str) -> Result<()> {
     if config.tls_routes_list_host_exactly(domain) {
         return Ok(());
     }
-    if dns_check_allows(&script, domain).await {
+    let failure_ttl = std::time::Duration::from_secs(u64::from(config.acme.cache_failure_time_secs));
+    if dns_check_allows(&script, domain, failure_ttl).await {
         Ok(())
     } else {
         bail!("DNS check script rejected domain `{domain}`")
     }
 }
 
-/// Runs the operator's DNS check script for one domain, caching the verdict
-/// (allowed and rejected alike) for ten minutes. Spawn failures, non-zero
-/// exits, and timeouts all fail closed.
-async fn dns_check_allows(script: &str, domain: &str) -> bool {
+/// Runs the operator's DNS check script for one domain. Rejections are
+/// remembered for `failure_ttl` so a rejected hostname does not spawn a
+/// process per handshake; acceptances are not cached (the resulting
+/// certificate makes re-checks moot). Spawn failures, non-zero exits, and
+/// timeouts all fail closed.
+async fn dns_check_allows(script: &str, domain: &str, failure_ttl: std::time::Duration) -> bool {
     let key = (script.to_string(), domain.to_string());
     {
-        let mut verdicts = dns_check_verdicts().write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((allowed, decided_at)) = verdicts.get(&key) {
-            if decided_at.elapsed() < DNS_CHECK_VERDICT_TTL {
-                return *allowed;
+        let mut rejections = dns_check_rejections().write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rejected_at) = rejections.get(&key) {
+            if rejected_at.elapsed() < failure_ttl {
+                return false;
             }
+            rejections.pop(&key);
         }
     }
     let _slot = dns_check_slots().acquire().await.expect("DNS check semaphore is never closed");
     let allowed = run_dns_check_script(script, domain).await;
-    dns_check_verdicts()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .put(key, (allowed, std::time::Instant::now()));
+    if !allowed {
+        dns_check_rejections()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .put(key, std::time::Instant::now());
+    }
     allowed
 }
 
@@ -112,7 +121,7 @@ async fn run_dns_check_script(script: &str, domain: &str) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(cause) => {
             log::warn!("DNS check script `{script}` could not run for `{domain}`: {cause}; rejecting");
@@ -494,8 +503,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_check_script_gates_domains_and_caches_verdicts() {
+    async fn dns_check_script_gates_domains_and_caches_only_rejections() {
         use std::os::unix::fs::PermissionsExt;
+        let ttl = std::time::Duration::from_secs(60);
         let directory = tempfile::tempdir().unwrap();
         let script_path = directory.path().join("dns-check.sh");
         std::fs::write(
@@ -506,16 +516,20 @@ mod tests {
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let script = script_path.to_str().unwrap();
 
-        assert!(dns_check_allows(script, "bucket.allowed.example").await);
-        assert!(!dns_check_allows(script, "bucket.other.example").await);
+        assert!(dns_check_allows(script, "bucket.allowed.example", ttl).await);
+        assert!(!dns_check_allows(script, "bucket.other.example", ttl).await);
 
         let missing = directory.path().join("missing.sh");
-        assert!(!dns_check_allows(missing.to_str().unwrap(), "bucket.allowed.example").await);
+        assert!(!dns_check_allows(missing.to_str().unwrap(), "bucket.allowed.example", ttl).await);
 
-        // Verdicts are cached: the decision survives the script disappearing.
+        // Rejections are cached: they survive the script disappearing …
         std::fs::remove_file(&script_path).unwrap();
-        assert!(dns_check_allows(script, "bucket.allowed.example").await);
-        assert!(!dns_check_allows(script, "bucket.other.example").await);
+        assert!(!dns_check_allows(script, "bucket.other.example", ttl).await);
+        // … but acceptances are not — the same domain now fails closed.
+        assert!(!dns_check_allows(script, "bucket.allowed.example", std::time::Duration::ZERO).await);
+        // A zero TTL means an expired rejection is re-checked (and, with the
+        // script gone, keeps failing closed).
+        assert!(!dns_check_allows(script, "bucket.other.example", std::time::Duration::ZERO).await);
     }
 
     #[test]

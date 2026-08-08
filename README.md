@@ -134,10 +134,14 @@ hostname. Domains listed verbatim in an `exact` route entry also skip the
 script: an exact route only ever matches the hostname the operator typed,
 so there is no room for a client to game it — the script guards the
 suffix and regex routes, whose accepted hostnames are client-chosen.
-Verdicts are cached for ten minutes and at most four scripts
-run concurrently. This suits hostname-style object storage: the script
-can ask the S3 API whether the bucket exists before a certificate is
-ever issued.
+Rejections are remembered for `acme.cache_failure_time_secs` (default 60,
+configurable next to the script path) so repeated handshakes for a
+rejected hostname do not spawn a process each; acceptances are not cached
+at all, because an accepted domain immediately gains a certificate and is
+never re-checked. At most four scripts run concurrently. This suits
+hostname-style object storage: the script can ask the S3 API whether the
+bucket exists before a certificate is ever issued, and a freshly created
+bucket starts serving within the rejection-cache window.
 
 A ready-made check script lives in [`dns_script/`](dns_script/): `dnsauth`,
 a dependency-light Go program driven by a `config.toml` in its working
