@@ -41,6 +41,14 @@ fn recent_registration_attempts() -> &'static StdRwLock<lru::LruCache<String, st
 
 const REGISTRATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// True when the operator has configured a DNS check script, which then decides
+/// on its own which client-chosen hostnames may register. Registration drops the
+/// per-domain throttle and the pre-registration DNS prerequisite in that case;
+/// both exist purely to bound record creation, which the script now bounds.
+fn script_gates_registration() -> bool {
+    !crate::runtime_live::load().acme.dns_check_script.trim().is_empty()
+}
+
 const DNS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Rejections only. An accepted domain immediately gains a certificate — a
@@ -160,23 +168,33 @@ async fn run_dns_check_script(script: &str, domain: &str) -> bool {
 /// terminating route has accepted it. This supports exact, suffix, and regex
 /// host rules without wildcards.
 ///
-/// Because suffix/regex routes accept arbitrary client-chosen subdomains, a
-/// domain is only registered after the public-DNS prerequisite confirms it
-/// resolves to this deployment's configured self IPs — otherwise a client
-/// could mint unbounded certificate records and real ACME orders just by
-/// varying the SNI. (An operator wildcard DNS record pointing here makes every
-/// subdomain pass; that is the operator's explicit choice.) Attempts are
-/// throttled per domain and run in the background so TLS handshakes are never
-/// delayed by DNS lookups or store writes.
+/// Suffix and regex routes accept arbitrary client-chosen subdomains, so
+/// something has to bound which of them may create a record — otherwise a
+/// client mints unbounded certificate records just by varying the SNI. Exactly
+/// one gate does that job, and which one depends on the configuration:
+///
+/// - **A DNS check script**, when configured. It answers to operator policy
+///   rather than to DNS, so the per-domain throttle and the pre-registration
+///   public-DNS prerequisite both stand down. A name the operator has just made
+///   valid then issues on the very next handshake.
+/// - **The public-DNS prerequisite**, otherwise: the domain must resolve to this
+///   deployment's configured self IPs, and attempts are throttled per domain.
+///   (An operator wildcard DNS record pointing here makes every subdomain pass;
+///   that is the operator's explicit choice, and the throttle is what keeps the
+///   resulting resolver traffic bounded.)
+///
+/// Either way the work runs in the background, so TLS handshakes are never
+/// delayed by a script, a DNS lookup, or a store write.
 pub fn request_automatic_for_sni(sni: &str) {
     if !crate::runtime_live::load().acme.enabled {
         return;
     }
+    let script_gated = script_gates_registration();
     let Ok(domain) = normalize_domain(sni) else { return };
     let Some(registration) = auto_registration().read().unwrap_or_else(std::sync::PoisonError::into_inner).clone() else {
         return;
     };
-    {
+    if !script_gated {
         let mut attempts = recent_registration_attempts().write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if attempts.get(&domain).is_some_and(|last| last.elapsed() < REGISTRATION_RETRY_INTERVAL) {
             return;
@@ -191,8 +209,10 @@ pub fn request_automatic_for_sni(sni: &str) {
 }
 
 async fn register_automatic(domain: String, registration: AutoRegistration) -> Result<()> {
-    dns_check_permits_new_issuance(&domain).await?;
     let store = registration.store.clone();
+    // The store lookup comes first: a domain that already holds a record needs
+    // neither the script nor a DNS round-trip, and this path runs on every
+    // handshake for every established domain.
     let existing = {
         let store = store.clone();
         let domain = domain.clone();
@@ -203,11 +223,23 @@ async fn register_automatic(domain: String, registration: AutoRegistration) -> R
     if existing.is_some() {
         return Ok(());
     }
-    let control = crate::runtime_live::load().control_plane.clone();
-    let dns = crate::acme::dns::PublicDnsPrerequisite::default().with_store(store.clone());
-    crate::acme::backend::DnsPrerequisite::verify(&dns, &domain, std::slice::from_ref(&domain), &control)
-        .await
-        .context("public DNS prerequisite rejected SNI-driven registration")?;
+    dns_check_permits_new_issuance(&domain).await?;
+    // Without a DNS check script the public-DNS prerequisite is the only thing
+    // standing between a client-chosen SNI and a new record, so it stays.
+    //
+    // With a script it is redundant: the renewal backend runs the very same
+    // check before every order, so a mismatched name still never reaches the
+    // CA. Verifying here as well would only suppress the record — and a
+    // suppressed record is invisible, leaving the operator a single log line
+    // instead of a pending certificate carrying per-resolver diagnostics, a
+    // `last_error`, and a backed-off retry schedule.
+    if !script_gates_registration() {
+        let control = crate::runtime_live::load().control_plane.clone();
+        let dns = crate::acme::dns::PublicDnsPrerequisite::default().with_store(store.clone());
+        crate::acme::backend::DnsPrerequisite::verify(&dns, &domain, std::slice::from_ref(&domain), &control)
+            .await
+            .context("public DNS prerequisite rejected SNI-driven registration")?;
+    }
     let created = {
         let domain = domain.clone();
         tokio::task::spawn_blocking(move || store.create_automatic_certificate_if_absent(&domain))
@@ -530,6 +562,27 @@ mod tests {
         // A zero TTL means an expired rejection is re-checked (and, with the
         // script gone, keeps failing closed).
         assert!(!dns_check_allows(script, "bucket.other.example", std::time::Duration::ZERO).await);
+    }
+
+    /// A configured script takes over bounding registration: the per-domain
+    /// throttle and the pre-registration DNS prerequisite both stand down, so an
+    /// operator who makes a name valid sees it act on the next handshake instead
+    /// of up to [`REGISTRATION_RETRY_INTERVAL`] later.
+    #[test]
+    fn a_configured_script_takes_over_gating_registration() {
+        let mut config = crate::runtime_config::RuntimeConfig::default();
+
+        config.acme.dns_check_script = String::new();
+        crate::runtime_live::store(config.clone());
+        assert!(!script_gates_registration(), "no script leaves the throttle and DNS prerequisite in charge");
+
+        config.acme.dns_check_script = "  ".into();
+        crate::runtime_live::store(config.clone());
+        assert!(!script_gates_registration(), "a blank path is not a configured script");
+
+        config.acme.dns_check_script = "./dns_script/dns_check.sh".into();
+        crate::runtime_live::store(config.clone());
+        assert!(script_gates_registration());
     }
 
     #[test]

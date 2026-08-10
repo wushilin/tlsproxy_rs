@@ -111,9 +111,20 @@ never issue for a single label.
 
 Certificates also register themselves: when a terminating route accepts a
 concrete SNI (exact, suffix, or regex match), the domain is registered
-automatically after the public-DNS prerequisite confirms it resolves to the
-configured self IPs. Registration runs in the background, is throttled to
-one attempt per domain per ten minutes, and never delays TLS handshakes.
+automatically. Registration runs in the background and never delays TLS
+handshakes. Because suffix and regex routes accept client-chosen subdomains,
+one gate always bounds which of them may create a record — which gate depends
+on whether a DNS check script is configured (see below). Without a script, the
+domain is registered only after the public-DNS prerequisite confirms it
+resolves to the configured self IPs, and attempts are throttled to one per
+domain per ten minutes. With a script, the script is the gate: both the
+prerequisite and the throttle stand down, so a name the operator has just made
+valid is registered on the very next handshake rather than up to ten minutes
+later. Nothing is lost by that — the renewal backend runs the same public-DNS
+prerequisite before every order, so a domain whose DNS does not point here
+never reaches the CA; it simply becomes a visible pending certificate carrying
+per-resolver diagnostics, a last error, and a backed-off retry schedule
+instead of vanishing with only a log line.
 Suffix matchers accept the bare domain and hosts exactly one label deeper
 (`code.rusts3api.example` for suffix `rusts3api.example`, but not
 `a.b.rusts3api.example`), so clients cannot spam issuance attempts by
