@@ -581,6 +581,7 @@ function bindListenerDialog() {
   const form = document.querySelector('#listener-form');
   if (!dialog || !form) return;
   document.querySelector('#listener-mode').onchange = syncListenerDialogMode;
+  document.querySelector('#listener-target').oninput = refreshTargetValidation;
   form.onsubmit = event => {
     event.preventDefault();
     saveListenerDialog();
@@ -625,6 +626,22 @@ function syncListenerDialogMode() {
       ? 'Optional http://host:port backends (comma or semicolon separated). Leave empty to route dynamically by Host header.'
       : 'Comma or semicolon separated host:port backends.';
   }
+  refreshTargetValidation();
+}
+
+// A value valid for one mode is invalid for another, so this runs on every
+// keystroke and on every mode change.
+function refreshTargetValidation() {
+  const mode = document.querySelector('#listener-mode')?.value || 'passthrough';
+  const field = document.querySelector('#listener-target');
+  const slot = document.querySelector('#listener-target-error');
+  const save = document.querySelector('#listener-save');
+  if (!field || !slot) return;
+  const message = validateTargets(mode, field.value.trim());
+  slot.textContent = message || '';
+  slot.hidden = !message;
+  field.setAttribute('aria-invalid', message ? 'true' : 'false');
+  if (save) save.disabled = Boolean(message);
 }
 
 function saveListenerDialog() {
@@ -877,24 +894,8 @@ function validateListener(name, listener) {
     return `Listener ${name} requires a target port from 1 to 65535.`;
   }
   if (!['passthrough', 'terminate', 'forward', 'http'].includes(listener.mode)) return `Listener ${name} has an invalid mode.`;
-  if (listener.mode === 'forward' && !splitTargets(listener.target).length) return `Listener ${name} requires at least one forward target.`;
-  if (listener.mode === 'forward') {
-    for (const target of splitTargets(listener.target)) {
-      if (!/^[^\s:]+:\d+$/.test(target)) return `Listener ${name} has an invalid forward target: ${target}`;
-      const port = Number(target.slice(target.lastIndexOf(':') + 1));
-      if (!Number.isInteger(port) || port < 1 || port > 65535) return `Listener ${name} has an invalid forward target port: ${target}`;
-    }
-  }
-  if (listener.mode === 'http') {
-    for (const target of splitTargets(listener.target)) {
-      if (!/^http:\/\/[^\s/]+\/?$/.test(target)) return `Listener ${name} has an invalid http backend (expected http://host or http://host:port): ${target}`;
-      const portMatch = target.match(/:(\d+)\/?$/);
-      if (portMatch) {
-        const port = Number(portMatch[1]);
-        if (!Number.isInteger(port) || port < 1 || port > 65535) return `Listener ${name} has an invalid http backend port: ${target}`;
-      }
-    }
-  }
+  const targetError = validateTargets(listener.mode, listener.target);
+  if (targetError) return `Listener ${name}: ${targetError}`;
   if (listener.mode !== 'forward') {
     if (!['ALLOW', 'DENY'].includes(listener.policy)) return `Listener ${name} has an invalid policy.`;
     // Regex patterns are validated server-side: the backend uses Rust's regex
@@ -921,7 +922,9 @@ function cleanListener(listener) {
   const mode = listener.mode || 'passthrough';
   return {
     bind: listener.bind || '',
-    target: listener.target || '',
+    // Only forward and http consume targets; dropping the value elsewhere keeps
+    // a stale entry from a mode switch out of the saved config.
+    target: ['forward', 'http'].includes(mode) ? (listener.target || '') : '',
     target_port: Number(listener.target_port || 443),
     policy: listener.policy || 'DENY',
     rules: {
@@ -944,6 +947,60 @@ function modeLabel(mode) {
 
 function splitTargets(targets = '') {
   return targets.split(/[;,]/).map(item => item.trim()).filter(Boolean);
+}
+
+// Mirrors the server-side rules in src/forward/mod.rs so the inline hint and the
+// save-time toast cannot disagree with what the proxy will actually accept.
+// Returns null when the targets are valid, otherwise a message naming the
+// offending entry and the form it should take.
+function validateTargets(mode, targets = '') {
+  if (!['forward', 'http'].includes(mode)) return null;
+  const entries = splitTargets(targets);
+  if (mode === 'forward' && !entries.length) return 'forward mode requires at least one target.';
+  for (const target of entries) {
+    const error = mode === 'forward' ? forwardTargetError(target) : httpTargetError(target);
+    if (error) return error;
+  }
+  return null;
+}
+
+function forwardTargetError(target) {
+  const scheme = target.match(/^([a-z][a-z0-9+.-]*):\/\//i);
+  if (scheme) {
+    const suggestion = target.slice(scheme[0].length).replace(/\/$/, '');
+    return `"${target}" — forward targets are plaintext host:port. Remove the ${scheme[1].toLowerCase()}:// scheme.`
+      + (suggestion ? ` Example: ${suggestion}` : '');
+  }
+  const parts = target.match(/^(\S+?)\s*[:@|]\s*(\d+)$/);
+  if (!parts) return `"${target}" — forward targets must be host:port. Example: 10.0.0.5:8080`;
+  return portError(target, parts[2]);
+}
+
+function httpTargetError(target) {
+  if (/^https:\/\//i.test(target)) {
+    return `"${target}" — https backends are not supported; HTTP mode proxies to plaintext http:// backends.`;
+  }
+  if (!/^http:\/\//i.test(target)) {
+    const scheme = target.match(/^([a-z][a-z0-9+.-]*):\/\//i);
+    if (scheme) return `"${target}" — HTTP backends must use the http:// scheme, not ${scheme[1].toLowerCase()}://.`;
+    return `"${target}" — HTTP backends need the http:// scheme. Example: http://${target}`;
+  }
+  const rest = target.slice('http://'.length).replace(/\/$/, '');
+  if (!rest || /[/?#]/.test(rest)) {
+    return `"${target}" — HTTP backends must be http://host or http://host:port with no path.`;
+  }
+  if (!rest.includes(':')) return null;
+  const parts = rest.match(/^(\S+?):(\d+)$/);
+  if (!parts) return `"${target}" — HTTP backend has an invalid host:port.`;
+  return portError(target, parts[2]);
+}
+
+function portError(target, port) {
+  const value = Number(port);
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    return `"${target}" — port must be from 1 to 65535.`;
+  }
+  return null;
 }
 
 function formatSince(ms) {

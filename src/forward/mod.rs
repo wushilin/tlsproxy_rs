@@ -702,7 +702,7 @@ async fn publish_configured_statuses() {
     *LISTENER_BACKENDS.write().await = statuses;
 }
 
-fn parse_targets(targets: &str) -> Result<Vec<String>> {
+pub fn parse_targets(targets: &str) -> Result<Vec<String>> {
     let mut parsed = Vec::new();
     for target in targets.split([',', ';']) {
         let target = target.trim();
@@ -712,6 +712,16 @@ fn parse_targets(targets: &str) -> Result<Vec<String>> {
         if target.contains(char::is_whitespace) {
             return Err(anyhow!(
                 "forward target `{target}` must not contain whitespace"
+            ));
+        }
+        // `HostAndPort` accepts any non-whitespace run before the colon, so
+        // `http://host:port` would otherwise parse as host `http://host` and
+        // fail later as an unresolvable DNS name.
+        if let Some((scheme, rest)) = target.split_once("://") {
+            let suggestion = rest.strip_suffix('/').unwrap_or(rest);
+            return Err(anyhow!(
+                "forward target `{target}` must be a plaintext host:port with no scheme \
+                 — drop the `{scheme}://` prefix and use `{suggestion}`"
             ));
         }
         let host_and_port: HostAndPort = target
@@ -1008,6 +1018,27 @@ mod tests {
             upstream_tls: false,
             http_health: false,
         }));
+    }
+
+    #[test]
+    fn parse_targets_rejects_scheme_prefixes() {
+        // `HostAndPort` would otherwise parse `http://10.0.0.5:8080` as host
+        // `http://10.0.0.5` port 8080, leaving the mistake to surface as a
+        // failed DNS lookup at connect time.
+        let error = parse_targets("http://10.0.0.5:8080").unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("no scheme"), "got: {message}");
+        assert!(message.contains("10.0.0.5:8080"), "got: {message}");
+
+        assert!(parse_targets("https://a.example:443").is_err());
+        assert!(parse_targets("HTTP://a.example:80").is_err());
+        assert!(parse_targets("tcp://a.example:80").is_err());
+        assert!(parse_targets("a.example:80, http://b.example:81").is_err());
+
+        assert_eq!(
+            parse_targets("a.example:80; b.example:8080").unwrap(),
+            vec!["a.example:80".to_string(), "b.example:8080".to_string()]
+        );
     }
 
     #[test]

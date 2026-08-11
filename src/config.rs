@@ -241,6 +241,12 @@ impl Config {
                     }
                 }
             }
+            if listener.mode == ListenerMode::Forward {
+                let targets = listener.target.as_deref().unwrap_or_default();
+                if let Err(cause) = crate::forward::parse_targets(targets) {
+                    return Err(format!("listener `{name}`: {cause}").into());
+                }
+            }
         }
         return Ok(());
     }
@@ -483,6 +489,37 @@ dns: {{}}
         assert!(format!("{error}").contains("http://"), "got: {error}");
         let error = Config::load_string(&base("http://backend.example/path")).unwrap_err();
         assert!(format!("{error}").contains("no path"), "got: {error}");
+    }
+
+    #[test]
+    fn forward_listener_rejects_bad_targets_at_load() {
+        let base = |target: &str| {
+            format!(
+                r#"
+listeners:
+  plain:
+    bind: 127.0.0.1:1080
+    target: "{target}"
+    target_port: 443
+    policy: DENY
+    rules:
+      static_hosts: []
+      patterns: []
+    mode: forward
+options: {{}}
+dns: {{}}
+"#
+            )
+        };
+        let error = Config::load_string(&base("http://10.0.0.5:8080")).unwrap_err();
+        assert!(format!("{error}").contains("no scheme"), "got: {error}");
+        let error = Config::load_string(&base("")).unwrap_err();
+        assert!(
+            format!("{error}").contains("at least one target"),
+            "got: {error}"
+        );
+        Config::load_string(&base("a.example:80; b.example:8080"))
+            .expect("valid forward targets load");
     }
 
     fn listener(policy: Policy) -> Listener {
