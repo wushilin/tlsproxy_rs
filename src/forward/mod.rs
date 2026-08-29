@@ -2,25 +2,25 @@
 //! per-request selection with round-robin or client-IP-hash balancing.
 //! Active probing and health status views live in [`health`].
 
-use crate::dataplane::RelayPolicy;
-use crate::runtime_config::HttpLoadBalancing;
 use crate::controller::Controller;
+use crate::dataplane::RelayPolicy;
 use crate::hostutil::HostAndPort;
 use crate::resolver;
+use crate::runtime_config::HttpLoadBalancing;
 use anyhow::{anyhow, Result};
 use lazy_static::lazy_static;
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
-use tokio::net::{lookup_host, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::{mpsc, RwLock};
 use tokio_rustls::TlsConnector;
 
@@ -84,6 +84,17 @@ struct EndpointState {
     online: Option<bool>,
     since_ms: u128,
     last_checked_ms: u128,
+}
+
+/// `Some(true)` when a group has an unprobed or healthy endpoint,
+/// `Some(false)` when every endpoint is confirmed down, and `None` when DNS
+/// produced no endpoints.
+fn group_is_viable(endpoints: &[EndpointState]) -> Option<bool> {
+    (!endpoints.is_empty()).then(|| {
+        endpoints
+            .iter()
+            .any(|endpoint| endpoint.online != Some(false))
+    })
 }
 
 #[derive(Debug)]
@@ -195,8 +206,14 @@ impl MonitorGroup {
             return None;
         };
         let index = match pick {
-            Pick::Sequential => (self.sequence.fetch_add(1, Ordering::Relaxed) as usize) % candidates.len(),
-            Pick::Sticky(client_ip) => rendezvous_index(&candidates, |endpoint| endpoint.endpoint.as_str(), client_ip),
+            Pick::Sequential => {
+                (self.sequence.fetch_add(1, Ordering::Relaxed) as usize) % candidates.len()
+            }
+            Pick::Sticky(client_ip) => rendezvous_index(
+                &candidates,
+                |endpoint| endpoint.endpoint.as_str(),
+                client_ip,
+            ),
         };
         Some(SelectedTarget {
             endpoint: candidates[index].endpoint.clone(),
@@ -266,7 +283,10 @@ impl MonitorGroup {
         // Up if any endpoint is up; unknown while unprobed endpoints could
         // still turn out up; down only when every endpoint is confirmed down
         // (or DNS resolution produced no endpoints at all).
-        let online = if endpoints.iter().any(|endpoint| endpoint.online == Some(true)) {
+        let online = if endpoints
+            .iter()
+            .any(|endpoint| endpoint.online == Some(true))
+        {
             Some(true)
         } else if endpoints.iter().any(|endpoint| endpoint.online.is_none()) {
             None
@@ -285,7 +305,6 @@ impl MonitorGroup {
             since_ms,
         }
     }
-
 }
 
 pub async fn register_forward_listener(
@@ -378,13 +397,16 @@ pub async fn reset() {
     health::HEALTH_BINDINGS.write().await.clear();
 }
 
-pub async fn apply_hot_listener_settings(config: &crate::runtime_config::RuntimeConfig) -> Result<()> {
+pub async fn apply_hot_listener_settings(
+    config: &crate::runtime_config::RuntimeConfig,
+) -> Result<()> {
     for (name, listener) in &config.additional_listeners {
         if config.disabled_listeners.contains(name) {
             continue;
         }
         if let crate::runtime_config::AdditionalListenerConfig::Forward(listener) = listener {
-            register_forward_listener(name.clone(), &listener.targets, listener.upstream_tls).await?;
+            register_forward_listener(name.clone(), &listener.targets, listener.upstream_tls)
+                .await?;
         }
     }
     configure_health_checks(config).await
@@ -401,47 +423,83 @@ pub async fn select_http_backend(
     use crate::runtime_config::HttpLoadBalancing;
     if action.backends.is_empty() {
         let tls = action.upstream == crate::runtime_config::UpstreamTransport::Tls;
-        return Ok((select_routed_target(host, action.target.as_deref(), action.target_port, tls).await?, tls));
+        return Ok((
+            select_routed_target(host, action.target.as_deref(), action.target_port, tls).await?,
+            tls,
+        ));
     }
     let mut available = Vec::new();
     let mut down = Vec::new();
     for backend in &action.backends {
-        let requested: HostAndPort = backend.address.parse()
+        let requested: HostAndPort = backend
+            .address
+            .parse()
             .map_err(|cause| anyhow!("invalid HTTP backend `{}`: {cause}", backend.address))?;
         let tls = backend.transport == crate::runtime_config::UpstreamTransport::Tls;
-        let tls_name = backend.tls_server_name.clone().unwrap_or_else(|| requested.host().to_string());
-        let group = ensure_group(requested.to_string(), requested.host(), requested.port(), tls, true, tls_name, Owner::Runtime).await?;
+        let tls_name = backend
+            .tls_server_name
+            .clone()
+            .unwrap_or_else(|| requested.host().to_string());
+        let group = ensure_group(
+            requested.to_string(),
+            requested.host(),
+            requested.port(),
+            tls,
+            true,
+            tls_name,
+            Owner::Runtime,
+        )
+        .await?;
         group.touch().await;
         let endpoints = group.endpoints.read().await;
-        if endpoints.iter().any(|item| item.online == Some(true)) || endpoints.iter().any(|item| item.online.is_none()) {
-            available.push((Arc::clone(&group), tls));
-        } else if !endpoints.is_empty() {
-            down.push((Arc::clone(&group), tls));
+        match group_is_viable(&endpoints) {
+            Some(true) => available.push((Arc::clone(&group), tls)),
+            Some(false) => down.push((Arc::clone(&group), tls)),
+            None => {}
         }
     }
     // Health state is eventually consistent; when everything is marked down,
     // trying a down backend beats failing fast (it may have just recovered).
-    let available = if available.is_empty() { down } else { available };
-    if available.is_empty() { return Err(anyhow!("no reverse-proxy backends for `{host}`")); }
+    let available = if available.is_empty() {
+        down
+    } else {
+        available
+    };
+    if available.is_empty() {
+        return Err(anyhow!("no reverse-proxy backends for `{host}`"));
+    }
     let (index, pick) = match action.load_balancing {
         HttpLoadBalancing::ClientIpHash => (
-            rendezvous_index(&available, |(group, _)| group.requested_target.as_str(), client_ip),
+            rendezvous_index(
+                &available,
+                |(group, _)| group.requested_target.as_str(),
+                client_ip,
+            ),
             Pick::Sticky(client_ip),
         ),
         HttpLoadBalancing::RoundRobin => {
             let mut cursors = HTTP_ROUTE_CURSORS.write().await;
-            let cursor = cursors.entry(route_key.to_string()).or_insert_with(random_cursor_seed);
+            let cursor = cursors
+                .entry(route_key.to_string())
+                .or_insert_with(random_cursor_seed);
             let index = (*cursor as usize) % available.len();
             *cursor = cursor.wrapping_add(1);
             (index, Pick::Sequential)
         }
     };
     let (group, tls) = &available[index];
-    let selected = group.choose_endpoint(pick).await.ok_or_else(|| anyhow!("no healthy reverse-proxy endpoints for `{host}`"))?;
+    let selected = group
+        .choose_endpoint(pick)
+        .await
+        .ok_or_else(|| anyhow!("no healthy reverse-proxy endpoints for `{host}`"))?;
     Ok((selected, *tls))
 }
 
-pub async fn choose_online(listener_name: &str, client_ip: IpAddr, load_balancing: crate::runtime_config::HttpLoadBalancing) -> Option<SelectedTarget> {
+pub async fn choose_online(
+    listener_name: &str,
+    client_ip: IpAddr,
+    load_balancing: crate::runtime_config::HttpLoadBalancing,
+) -> Option<SelectedTarget> {
     let groups = GROUPS.read().await;
     let keys = FORWARD_LISTENERS.read().await.get(listener_name).cloned();
     let mut members = Vec::new();
@@ -456,6 +514,27 @@ pub async fn choose_online(listener_name: &str, client_ip: IpAddr, load_balancin
     if members.is_empty() {
         return None;
     }
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+    for member in members {
+        let endpoints = member.endpoints.read().await;
+        match group_is_viable(&endpoints) {
+            Some(true) => preferred.push(member.clone()),
+            Some(false) => fallback.push(member.clone()),
+            None => {}
+        }
+    }
+    // Health checks are a filter, not an availability gate. If every target
+    // is confirmed down, retain the configured balancing policy across the
+    // whole pool so a recovered target can still be tried.
+    let members = if preferred.is_empty() {
+        fallback
+    } else {
+        preferred
+    };
+    if members.is_empty() {
+        return None;
+    }
     let (index, pick) = match load_balancing {
         crate::runtime_config::HttpLoadBalancing::ClientIpHash => (
             rendezvous_index(&members, |group| group.requested_target.as_str(), client_ip),
@@ -463,21 +542,15 @@ pub async fn choose_online(listener_name: &str, client_ip: IpAddr, load_balancin
         ),
         crate::runtime_config::HttpLoadBalancing::RoundRobin => {
             let mut cursors = HTTP_ROUTE_CURSORS.write().await;
-            let cursor = cursors.entry(listener_name.to_string()).or_insert_with(random_cursor_seed);
+            let cursor = cursors
+                .entry(listener_name.to_string())
+                .or_insert_with(random_cursor_seed);
             let index = (*cursor as usize) % members.len();
             *cursor = cursor.wrapping_add(1);
             (index, Pick::Sequential)
         }
     };
-    // Fall through the member ring so one down group does not blackhole its
-    // cursor/hash slot.
-    for offset in 0..members.len() {
-        let member = &members[(index + offset) % members.len()];
-        if let Some(endpoint) = member.choose_endpoint(pick).await {
-            return Some(endpoint);
-        }
-    }
-    None
+    members[index].choose_endpoint(pick).await
 }
 
 pub async fn select_runtime_target(
@@ -554,7 +627,13 @@ pub async fn select_routed_pool(
     use crate::runtime_config::HttpLoadBalancing;
 
     let target_texts: Vec<&str> = explicit_targets
-        .map(|targets| targets.split([',', ';']).map(str::trim).filter(|value| !value.is_empty()).collect())
+        .map(|targets| {
+            targets
+                .split([',', ';'])
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
         .unwrap_or_else(|| vec![sni_host]);
     if target_texts.is_empty() {
         return Err(anyhow!("route backend pool requires at least one target"));
@@ -568,35 +647,55 @@ pub async fn select_routed_pool(
             return Err(anyhow!("route target `{target}` has an invalid port"));
         }
         let group = ensure_group(
-            requested.to_string(), requested.host(), requested.port(), upstream_tls,
-            false, sni_host.to_string(), Owner::Runtime,
-        ).await?;
+            requested.to_string(),
+            requested.host(),
+            requested.port(),
+            upstream_tls,
+            false,
+            sni_host.to_string(),
+            Owner::Runtime,
+        )
+        .await?;
         group.touch().await;
         let endpoints = group.endpoints.read().await;
-        if endpoints.iter().any(|item| item.online != Some(false)) {
-            preferred.push(group.clone());
-        } else if !endpoints.is_empty() {
-            fallback.push(group.clone());
+        match group_is_viable(&endpoints) {
+            Some(true) => preferred.push(group.clone()),
+            Some(false) => fallback.push(group.clone()),
+            None => {}
         }
     }
-    let available = if preferred.is_empty() { fallback } else { preferred };
+    let available = if preferred.is_empty() {
+        fallback
+    } else {
+        preferred
+    };
     if available.is_empty() {
-        return Err(anyhow!("no available upstream endpoint for route `{route_key}`"));
+        return Err(anyhow!(
+            "no available upstream endpoint for route `{route_key}`"
+        ));
     }
     let (index, pick) = match load_balancing {
         HttpLoadBalancing::ClientIpHash => (
-            rendezvous_index(&available, |group| group.requested_target.as_str(), client_ip),
+            rendezvous_index(
+                &available,
+                |group| group.requested_target.as_str(),
+                client_ip,
+            ),
             Pick::Sticky(client_ip),
         ),
         HttpLoadBalancing::RoundRobin => {
             let mut cursors = HTTP_ROUTE_CURSORS.write().await;
-            let cursor = cursors.entry(route_key.to_string()).or_insert_with(random_cursor_seed);
+            let cursor = cursors
+                .entry(route_key.to_string())
+                .or_insert_with(random_cursor_seed);
             let index = (*cursor as usize) % available.len();
             *cursor = cursor.wrapping_add(1);
             (index, Pick::Sequential)
         }
     };
-    let mut selected = available[index].choose_endpoint(pick).await
+    let mut selected = available[index]
+        .choose_endpoint(pick)
+        .await
         .ok_or_else(|| anyhow!("no available upstream endpoint for route `{route_key}`"))?;
     selected.tls_server_name = sni_host.to_string();
     Ok(selected)
@@ -823,7 +922,11 @@ impl rustls::client::danger::ServerCertVerifier for TrustAllVerifier {
     // handshake with a TLS error instead of panicking if it ever is not.
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::CryptoProvider::get_default()
-            .map(|provider| provider.signature_verification_algorithms.supported_schemes())
+            .map(|provider| {
+                provider
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            })
             .unwrap_or_default()
     }
 }
@@ -853,7 +956,6 @@ fn state_name(online: Option<bool>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     fn test_group(owner: Owner, target: &str, endpoints: Vec<EndpointState>) -> MonitorGroup {
         MonitorGroup {
@@ -893,13 +995,27 @@ mod tests {
         let group = test_group(
             Owner::Runtime,
             "pool.example:443",
-            vec![endpoint("10.0.0.1:443"), endpoint("10.0.0.2:443"), endpoint("10.0.0.3:443")],
+            vec![
+                endpoint("10.0.0.1:443"),
+                endpoint("10.0.0.2:443"),
+                endpoint("10.0.0.3:443"),
+            ],
         );
         let mut seen = std::collections::HashSet::new();
         for _ in 0..3 {
-            seen.insert(group.choose_endpoint(Pick::Sequential).await.unwrap().endpoint);
+            seen.insert(
+                group
+                    .choose_endpoint(Pick::Sequential)
+                    .await
+                    .unwrap()
+                    .endpoint,
+            );
         }
-        assert_eq!(seen.len(), 3, "three sequential picks cover all three endpoints");
+        assert_eq!(
+            seen.len(),
+            3,
+            "three sequential picks cover all three endpoints"
+        );
     }
 
     #[tokio::test]
@@ -915,11 +1031,26 @@ mod tests {
         let group = test_group(
             Owner::Runtime,
             "pool.example:443",
-            vec![endpoint("10.0.0.1:443", true), endpoint("10.0.0.2:443", true), endpoint("10.0.0.3:443", true)],
+            vec![
+                endpoint("10.0.0.1:443", true),
+                endpoint("10.0.0.2:443", true),
+                endpoint("10.0.0.3:443", true),
+            ],
         );
-        let first = group.choose_endpoint(Pick::Sticky(client)).await.unwrap().endpoint;
+        let first = group
+            .choose_endpoint(Pick::Sticky(client))
+            .await
+            .unwrap()
+            .endpoint;
         for _ in 0..5 {
-            assert_eq!(group.choose_endpoint(Pick::Sticky(client)).await.unwrap().endpoint, first);
+            assert_eq!(
+                group
+                    .choose_endpoint(Pick::Sticky(client))
+                    .await
+                    .unwrap()
+                    .endpoint,
+                first
+            );
         }
         // Rendezvous hashing: removing a member the client was NOT pinned to
         // must not move the client.
@@ -929,10 +1060,21 @@ mod tests {
             .map(|addr| endpoint(addr, true))
             .collect();
         let victim = survivors[0].endpoint.clone();
-        let remaining: Vec<EndpointState> = [endpoint(&first, true), endpoint(&survivors[1].endpoint, true)].into();
+        let remaining: Vec<EndpointState> = [
+            endpoint(&first, true),
+            endpoint(&survivors[1].endpoint, true),
+        ]
+        .into();
         let _ = victim;
         let shrunk = test_group(Owner::Runtime, "pool.example:443", remaining);
-        assert_eq!(shrunk.choose_endpoint(Pick::Sticky(client)).await.unwrap().endpoint, first);
+        assert_eq!(
+            shrunk
+                .choose_endpoint(Pick::Sticky(client))
+                .await
+                .unwrap()
+                .endpoint,
+            first
+        );
     }
 
     #[tokio::test]
@@ -969,6 +1111,21 @@ mod tests {
     async fn choose_endpoint_returns_none_only_when_no_endpoints_exist() {
         let group = test_group(Owner::Runtime, "example.com:443", Vec::new());
         assert!(group.choose_endpoint(Pick::Sequential).await.is_none());
+    }
+
+    #[test]
+    fn health_filter_only_falls_back_after_every_resolved_group_is_down() {
+        let endpoint = |online| EndpointState {
+            endpoint: "127.0.0.1:443".into(),
+            online,
+            since_ms: now_ms(),
+            last_checked_ms: now_ms(),
+        };
+
+        assert_eq!(group_is_viable(&[endpoint(Some(true))]), Some(true));
+        assert_eq!(group_is_viable(&[endpoint(None)]), Some(true));
+        assert_eq!(group_is_viable(&[endpoint(Some(false))]), Some(false));
+        assert_eq!(group_is_viable(&[]), None);
     }
 
     #[tokio::test]
@@ -1044,7 +1201,8 @@ mod tests {
     #[test]
     fn parse_http_targets_normalizes_and_defaults_port() {
         assert_eq!(
-            parse_http_targets("http://a.example; http://b.example:8080, HTTP://c.example/").unwrap(),
+            parse_http_targets("http://a.example; http://b.example:8080, HTTP://c.example/")
+                .unwrap(),
             "a.example:80;b.example:8080;c.example:80"
         );
         assert!(parse_http_targets("https://a.example").is_err());

@@ -36,22 +36,56 @@ pub struct HealthCheckTarget {
 }
 
 fn matcher_label(matcher: &crate::runtime_config::HostMatcher) -> String {
-    matcher.exact.iter().cloned()
-        .chain(matcher.suffix.iter().map(|value| format!("*.{}", value.trim_start_matches('.'))))
+    matcher
+        .exact
+        .iter()
+        .cloned()
+        .chain(
+            matcher
+                .suffix
+                .iter()
+                .map(|value| format!("*.{}", value.trim_start_matches('.'))),
+        )
         .chain(matcher.patterns.iter().map(|value| format!("/{value}/")))
-        .collect::<Vec<_>>().join(", ")
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-async fn bind_http_action(listener: &str, host: &str, path: &str, action: &crate::runtime_config::HttpRouteAction) -> Result<()> {
+async fn bind_http_action(
+    listener: &str,
+    host: &str,
+    path: &str,
+    action: &crate::runtime_config::HttpRouteAction,
+) -> Result<()> {
     for backend in &action.backends {
         let requested = HostAndPort::parse_or_default(&backend.address, action.target_port);
         let tls = backend.transport == crate::runtime_config::UpstreamTransport::Tls;
-        let tls_name = backend.tls_server_name.clone().unwrap_or_else(|| requested.host().to_string());
-        let group = ensure_group(requested.to_string(), requested.host(), requested.port(), tls, true, tls_name, Owner::Configured).await?;
+        let tls_name = backend
+            .tls_server_name
+            .clone()
+            .unwrap_or_else(|| requested.host().to_string());
+        let group = ensure_group(
+            requested.to_string(),
+            requested.host(),
+            requested.port(),
+            tls,
+            true,
+            tls_name,
+            Owner::Configured,
+        )
+        .await?;
         HEALTH_BINDINGS.write().await.push(HealthBinding {
-            group: group.key.clone(), listener: listener.into(), host: host.into(), path: path.into(),
-            backend: backend.address.clone(), transport: if tls { "tls" } else { "plaintext" }.into(),
-            load_balancing: match action.load_balancing { HttpLoadBalancing::RoundRobin => "round_robin", HttpLoadBalancing::ClientIpHash => "client_ip_hash" }.into(),
+            group: group.key.clone(),
+            listener: listener.into(),
+            host: host.into(),
+            path: path.into(),
+            backend: backend.address.clone(),
+            transport: if tls { "tls" } else { "plaintext" }.into(),
+            load_balancing: match action.load_balancing {
+                HttpLoadBalancing::RoundRobin => "round_robin",
+                HttpLoadBalancing::ClientIpHash => "client_ip_hash",
+            }
+            .into(),
         });
     }
     for route in &action.paths {
@@ -62,12 +96,61 @@ async fn bind_http_action(listener: &str, host: &str, path: &str, action: &crate
     Ok(())
 }
 
+async fn bind_forward_listener(
+    listener: &str,
+    configured: &crate::runtime_config::RawForwardListenerConfig,
+) -> Result<()> {
+    let mut keys = Vec::new();
+    for target in parse_targets(&configured.targets)? {
+        let requested = HostAndPort::parse_or_default(&target, 0);
+        let group = ensure_group(
+            requested.to_string(),
+            requested.host(),
+            requested.port(),
+            configured.upstream_tls,
+            false,
+            requested.host().to_string(),
+            Owner::Configured,
+        )
+        .await?;
+        keys.push(group.key.clone());
+        HEALTH_BINDINGS.write().await.push(HealthBinding {
+            group: group.key.clone(),
+            listener: listener.into(),
+            host: String::new(),
+            path: String::new(),
+            backend: target,
+            transport: if configured.upstream_tls {
+                "tls"
+            } else {
+                "plaintext"
+            }
+            .into(),
+            load_balancing: match configured.load_balancing {
+                HttpLoadBalancing::RoundRobin => "round_robin",
+                HttpLoadBalancing::ClientIpHash => "client_ip_hash",
+            }
+            .into(),
+        });
+    }
+    FORWARD_LISTENERS
+        .write()
+        .await
+        .insert(listener.into(), keys);
+    Ok(())
+}
 
 pub async fn configure_health_checks(config: &crate::runtime_config::RuntimeConfig) -> Result<()> {
     HEALTH_BINDINGS.write().await.clear();
     for route in &config.default_listener.ordinary_traffic.routes {
         if let crate::runtime_config::TlsRouteAction::ReverseProxy { action } = &route.action {
-            bind_http_action(crate::runtime_config::DEFAULT_LISTENER_NAME, &matcher_label(&route.matcher), "/", action).await?;
+            bind_http_action(
+                crate::runtime_config::DEFAULT_LISTENER_NAME,
+                &matcher_label(&route.matcher),
+                "/",
+                action,
+            )
+            .await?;
         }
     }
     for (listener, configured) in &config.additional_listeners {
@@ -77,15 +160,24 @@ pub async fn configure_health_checks(config: &crate::runtime_config::RuntimeConf
         match configured {
             crate::runtime_config::AdditionalListenerConfig::Tls(value) => {
                 for route in &value.routing.routes {
-                    if let crate::runtime_config::TlsRouteAction::ReverseProxy { action } = &route.action {
-                        bind_http_action(listener, &matcher_label(&route.matcher), "/", action).await?;
+                    if let crate::runtime_config::TlsRouteAction::ReverseProxy { action } =
+                        &route.action
+                    {
+                        bind_http_action(listener, &matcher_label(&route.matcher), "/", action)
+                            .await?;
                     }
                 }
             }
             crate::runtime_config::AdditionalListenerConfig::Http(value) => {
-                for route in &value.routes { bind_http_action(listener, &matcher_label(&route.matcher), "/", &route.action).await?; }
+                for route in &value.routes {
+                    bind_http_action(listener, &matcher_label(&route.matcher), "/", &route.action)
+                        .await?;
+                }
             }
-            crate::runtime_config::AdditionalListenerConfig::Redirect(_) | crate::runtime_config::AdditionalListenerConfig::Forward(_) => {}
+            crate::runtime_config::AdditionalListenerConfig::Forward(value) => {
+                bind_forward_listener(listener, value).await?;
+            }
+            crate::runtime_config::AdditionalListenerConfig::Redirect(_) => {}
         }
     }
     Ok(())
@@ -96,17 +188,32 @@ pub async fn health_check_targets() -> Vec<HealthCheckTarget> {
     let groups = GROUPS.read().await;
     let mut values = Vec::new();
     for binding in bindings {
-        let Some(group) = groups.get(&binding.group) else { continue };
+        let Some(group) = groups.get(&binding.group) else {
+            continue;
+        };
         for endpoint in group.endpoints.read().await.iter() {
             values.push(HealthCheckTarget {
-                listener: binding.listener.clone(), host: binding.host.clone(), path: binding.path.clone(),
-                backend: binding.backend.clone(), endpoint: endpoint.endpoint.clone(), transport: binding.transport.clone(),
-                load_balancing: binding.load_balancing.clone(), online: endpoint.online, since_ms: endpoint.since_ms,
+                listener: binding.listener.clone(),
+                host: binding.host.clone(),
+                path: binding.path.clone(),
+                backend: binding.backend.clone(),
+                endpoint: endpoint.endpoint.clone(),
+                transport: binding.transport.clone(),
+                load_balancing: binding.load_balancing.clone(),
+                online: endpoint.online,
+                since_ms: endpoint.since_ms,
                 last_checked_ms: endpoint.last_checked_ms,
             });
         }
     }
-    values.sort_by(|a, b| (&a.listener, &a.host, &a.backend, &a.endpoint).cmp(&(&b.listener, &b.host, &b.backend, &b.endpoint)));
+    values.sort_by(|a, b| {
+        (&a.listener, &a.host, &a.backend, &a.endpoint).cmp(&(
+            &b.listener,
+            &b.host,
+            &b.backend,
+            &b.endpoint,
+        ))
+    });
     values
 }
 
@@ -139,11 +246,23 @@ async fn check_all_once(check_controller: &mut Controller, store: &crate::store:
     }
     check_jobs(jobs, check_controller).await;
     let checked_at = OffsetDateTime::now_utc();
-    let samples = health_check_targets().await.into_iter().filter_map(|value| Some(crate::store::HealthCheckSample {
-        listener: value.listener, host: value.host, path: value.path, backend: value.backend,
-        endpoint: value.endpoint, transport: value.transport, load_balancing: value.load_balancing,
-        online: value.online?, checked_at,
-    })).collect::<Vec<_>>();
+    let samples = health_check_targets()
+        .await
+        .into_iter()
+        .filter_map(|value| {
+            Some(crate::store::HealthCheckSample {
+                listener: value.listener,
+                host: value.host,
+                path: value.path,
+                backend: value.backend,
+                endpoint: value.endpoint,
+                transport: value.transport,
+                load_balancing: value.load_balancing,
+                online: value.online?,
+                checked_at,
+            })
+        })
+        .collect::<Vec<_>>();
     if let Err(cause) = store.save_health_check_samples_async(samples).await {
         log::warn!("failed to persist health-check status: {cause:#}");
     }
@@ -166,7 +285,13 @@ async fn check_jobs(jobs: Vec<(Arc<MonitorGroup>, String)>, check_controller: &m
         let group = Arc::clone(group);
         let endpoint = endpoint.clone();
         check_controller.spawn(async move {
-            let online = probe(&endpoint, group.key.upstream_tls, group.key.http_health, &group.tls_server_name).await;
+            let online = probe(
+                &endpoint,
+                group.key.upstream_tls,
+                group.key.http_health,
+                &group.tls_server_name,
+            )
+            .await;
             let _ = tx.send((group, endpoint, online)).await;
         });
     }
@@ -201,7 +326,12 @@ async fn check_jobs(jobs: Vec<(Arc<MonitorGroup>, String)>, check_controller: &m
     publish_configured_statuses().await;
 }
 
-async fn probe(endpoint: &str, upstream_tls: bool, http_health: bool, tls_server_name: &str) -> bool {
+async fn probe(
+    endpoint: &str,
+    upstream_tls: bool,
+    http_health: bool,
+    tls_server_name: &str,
+) -> bool {
     let mut stream = match TcpStream::connect(endpoint).await {
         Ok(stream) => stream,
         Err(_) => return false,
@@ -219,17 +349,32 @@ async fn probe(endpoint: &str, upstream_tls: bool, http_health: bool, tls_server
     else {
         return false;
     };
-    let Ok(mut tls) = connector.connect(server_name, stream).await else { return false };
+    let Ok(mut tls) = connector.connect(server_name, stream).await else {
+        return false;
+    };
     !http_health || probe_http(&mut tls, tls_server_name).await
 }
 
-pub(super) async fn probe_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(stream: &mut S, host: &str) -> bool {
+pub(super) async fn probe_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    host: &str,
+) -> bool {
     let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).await.is_err() { return false; }
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return false;
+    }
     let mut response = [0u8; 64];
-    let Ok(count) = stream.read(&mut response).await else { return false };
+    let Ok(count) = stream.read(&mut response).await else {
+        return false;
+    };
     let first_line = String::from_utf8_lossy(&response[..count]);
-    let Some(status) = first_line.split_ascii_whitespace().nth(1).and_then(|value| value.parse::<u16>().ok()) else { return false };
+    let Some(status) = first_line
+        .split_ascii_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+    else {
+        return false;
+    };
     // Authentication and authorization failures still prove that an HTTP
     // backend is reachable and serving requests. Mark only invalid responses
     // and server-side failures as unhealthy; otherwise protected backends
@@ -250,7 +395,9 @@ mod tests {
             let count = backend_side.read(&mut request).await.unwrap();
             assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET / HTTP/1.1\r\n"));
             backend_side
-                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await
                 .unwrap();
         });
