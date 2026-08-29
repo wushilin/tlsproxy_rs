@@ -1,0 +1,40 @@
+name: Release musl binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake libclang-dev python3-pip
+          sudo pip3 install --break-system-packages ziglang
+          cargo install cargo-zigbuild --locked
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: Build static musl binaries
+        run: |
+          cargo zigbuild --locked --release --target x86_64-unknown-linux-musl
+          cargo zigbuild --locked --release --target aarch64-unknown-linux-musl
+          install -Dm755 target/x86_64-unknown-linux-musl/release/tlsproxy dist/tlsproxy-linux-amd64-musl
+          install -Dm755 target/aarch64-unknown-linux-musl/release/tlsproxy dist/tlsproxy-linux-arm64-musl
+          sha256sum dist/tlsproxy-linux-amd64-musl dist/tlsproxy-linux-arm64-musl > dist/SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            dist/tlsproxy-linux-amd64-musl
+            dist/tlsproxy-linux-arm64-musl
+            dist/SHA256SUMS
