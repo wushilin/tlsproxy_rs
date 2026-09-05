@@ -733,9 +733,10 @@ async fn put_config(
             return (StatusCode::BAD_REQUEST, format!("The new control hostname certificate is unusable: {cause}")).into_response();
         }
     }
-    if let Err(cause) = state.store.ensure_automatic_certificates(&request.config) {
-        return (StatusCode::BAD_REQUEST, cause.to_string()).into_response();
-    }
+    let registered = match state.store.ensure_automatic_certificates(&request.config) {
+        Ok(created) => created,
+        Err(cause) => return (StatusCode::BAD_REQUEST, cause.to_string()).into_response(),
+    };
     let previous_config = current.config.clone();
     match state
         .store
@@ -743,14 +744,19 @@ async fn put_config(
         .await
     {
         Ok(saved) => {
-            apply_runtime_config(&state, &previous_config, &saved).await;
+            apply_runtime_config(&state, &previous_config, &saved, registered > 0).await;
             Json(saved).into_response()
         }
         Err(cause) => (StatusCode::BAD_REQUEST, cause.to_string()).into_response(),
     }
 }
 
-async fn apply_runtime_config(state: &ControlState, previous: &RuntimeConfig, saved: &crate::store::StoredConfig) {
+async fn apply_runtime_config(
+    state: &ControlState,
+    previous: &RuntimeConfig,
+    saved: &crate::store::StoredConfig,
+    registered_certificates: bool,
+) {
     if crate::runtime_live::listener_settings_only(previous, &saved.config) {
         crate::runtime_live::store(saved.config.clone());
         if let Err(cause) = crate::forward::apply_hot_listener_settings(&saved.config).await {
@@ -761,6 +767,16 @@ async fn apply_runtime_config(state: &ControlState, previous: &RuntimeConfig, sa
             // failed full reload rolls back to it rather than to the older
             // revision the runtime loop last applied.
             crate::runtime_live::store_last_good(saved.clone());
+            // Route edits are hot-applied, so adding an exact host registers a
+            // managed certificate without restarting the scheduler. That
+            // certificate has no generation yet, and nothing else would wake
+            // the scheduler, so the route would serve a local-CA fallback leaf
+            // until the next scan interval (12 hours by default). The reload
+            // branches need no nudge: a restarted scheduler always scans at
+            // startup.
+            if registered_certificates {
+                (state.request_renewal_scan)();
+            }
         }
     } else {
         (state.configuration_changed)();
@@ -982,6 +998,62 @@ mod tests {
             )
             .unwrap();
         (directory, store)
+    }
+
+    /// Route edits are topology-equal, so they hot-apply without restarting the
+    /// runtime. A newly registered automatic certificate has no generation yet,
+    /// and only the scheduler can issue one — so the hot path has to wake it.
+    /// Regression: without this the route served a local-CA fallback leaf until
+    /// the next scan interval (12 hours by default), and only a restart, whose
+    /// scheduler always scans at startup, appeared to fix it.
+    #[tokio::test]
+    async fn a_hot_applied_revision_wakes_the_scheduler_for_new_certificates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_directory, store) = initialized_store();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let scans_for_state = Arc::clone(&scans);
+        let reloads_for_state = Arc::clone(&reloads);
+        let state = ControlState::new(store, move || {
+            scans_for_state.fetch_add(1, Ordering::SeqCst);
+        })
+        .with_configuration_changed(move || {
+            reloads_for_state.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let previous = RuntimeConfig::default();
+        let mut hot = previous.clone();
+        hot.default_listener.ordinary_traffic.max_idle_time_ms = Some(1000);
+        assert!(crate::runtime_live::listener_settings_only(&previous, &hot));
+        let saved = crate::store::StoredConfig {
+            revision: 2,
+            updated_at: OffsetDateTime::now_utc(),
+            updated_by: "admin".into(),
+            config: hot,
+        };
+
+        apply_runtime_config(&state, &previous, &saved, true).await;
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "a new certificate must wake the scheduler");
+        assert_eq!(reloads.load(Ordering::SeqCst), 0, "a hot apply must not reload the runtime");
+
+        // Nothing new was registered, so there is nothing to issue.
+        apply_runtime_config(&state, &previous, &saved, false).await;
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+
+        // A topology change reloads instead, and the restarted scheduler's own
+        // startup scan covers the new certificate.
+        let mut topology = previous.clone();
+        topology.default_listener.bind = "127.0.0.1:8443".into();
+        let saved = crate::store::StoredConfig {
+            revision: 3,
+            updated_at: OffsetDateTime::now_utc(),
+            updated_by: "admin".into(),
+            config: topology,
+        };
+        apply_runtime_config(&state, &previous, &saved, true).await;
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "a reload must not also request a scan");
     }
 
     #[tokio::test]
