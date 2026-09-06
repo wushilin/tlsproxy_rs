@@ -93,25 +93,40 @@ where CR: AsyncRead + Unpin + Send + 'static, CW: AsyncWrite + Unpin + Send + 's
     let limiter = Limiter::new(policy.speed_limit());
     let upload = pipe(id.clone(), client_read, upstream_write, stats.clone(), idle.clone(), true, uploaded.clone(), controller.clone(), limiter.clone()).await;
     let download = pipe(id.clone(), upstream_read, client_write, stats, idle.clone(), false, downloaded.clone(), controller.clone(), limiter).await;
-    // After the request side has finished, a response that makes no progress
-    // for this long is torn down even when the listener idle timeout is
-    // disabled. A client FIN is indistinguishable from a full close, so this
-    // bounds how long a vanished client can hold sockets and tasks while
-    // still letting an actively-sending response drain in full (comparable
-    // to HAProxy's `timeout client-fin`).
+    // Either direction reaching EOF leaves the connection half-closed, and the
+    // surviving direction must be allowed to drain in full: a peer that stops
+    // sending has not stopped receiving. A client half-closing after its
+    // request body still needs the response; an upstream that half-closes may
+    // still be reading a client upload; and a raw TCP tunnel may legitimately
+    // run one-directional for the rest of its life.
+    //
+    // A half-closed connection has also lost its own liveness signal. Nothing
+    // is written towards the peer that already finished, so if it disappears
+    // there is no failing write to notice it by — the surviving read would
+    // block forever. That is why the drain is bounded by an inactivity limit
+    // rather than left open: transferring data keeps it alive, silence for
+    // this long ends it. HAProxy bounds the same state with `timeout
+    // client-fin`/`server-fin`. nginx's stream module instead defaults to
+    // `proxy_half_close off`, tearing the whole connection down on the first
+    // FIN; enabling it puts the connection under `proxy_timeout`, 10m by
+    // default.
     const HALF_CLOSED_DRAIN_LIMIT: Duration = Duration::from_secs(30);
     let monitor = controller.write().await.spawn(async move {
         loop {
-            // A client may half-close its request side immediately after the
-            // request body. That completes `upload`, but the upstream response
-            // may still be in flight and must be drained in full. Conversely,
-            // once `download` is complete there is nothing left to send to the
-            // client, so the request side can be stopped.
-            let stalled_after_half_close =
-                upload.is_finished() && idle.lock().await.idled_for() > HALF_CLOSED_DRAIN_LIMIT;
-            if download.is_finished() || idle.lock().await.is_expired() || stalled_after_half_close {
-                if !upload.is_finished() { upload.abort(); }
-                if !download.is_finished() { download.abort(); }
+            let upload_done = upload.is_finished();
+            let download_done = download.is_finished();
+            let (idled_for, listener_timeout_expired) = {
+                let idle = idle.lock().await;
+                (idle.idled_for(), idle.is_expired())
+            };
+            // Only the surviving direction still marks activity, so once one
+            // side is done this measures exactly how long the other has been
+            // silent.
+            let half_closed_stall =
+                (upload_done || download_done) && idled_for > HALF_CLOSED_DRAIN_LIMIT;
+            if (upload_done && download_done) || listener_timeout_expired || half_closed_stall {
+                if !upload_done { upload.abort(); }
+                if !download_done { download.abort(); }
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -204,6 +219,170 @@ mod tests {
         assert!(upstream_lands_on(addr("127.0.0.1:8080"), local_only, &locals, &selfs));
         assert!(!upstream_lands_on(addr("192.168.1.5:8080"), local_only, &locals, &selfs), "same port on an unbound address stays reachable");
         assert!(!upstream_lands_on(addr("203.0.113.9:8080"), local_only, &locals, &selfs), "public IP cannot hairpin to loopback-only");
+    }
+
+    fn test_relay_context(idle_timeout_ms: u64) -> RelayContext {
+        RelayContext {
+            id: Arc::new(RequestId::new()),
+            policy: Arc::new(RelayPolicy {
+                bind: "127.0.0.1:443".into(),
+                target: None,
+                target_port: 80,
+                speed_limit: None,
+                upstream_tls: false,
+            }),
+            stats: Arc::new(ListenerStats::new("test", idle_timeout_ms)),
+            controller: Arc::new(RwLock::new(Controller::new())),
+            initial_uploaded: 0,
+        }
+    }
+
+    /// A relay is two independent directions. One reaching EOF says only that
+    /// that peer has stopped sending — it has not stopped receiving, and the
+    /// opposite direction may still be carrying data.
+    ///
+    /// Regression: the monitor tore the whole connection down the moment the
+    /// download direction finished, so an upstream that half-closed its send
+    /// side silently discarded whatever the client was still uploading. Raw
+    /// TCP tunnels, TLS passthrough and terminate, and WebSocket upgrades all
+    /// share this relay, and half-close in that direction is legitimate for
+    /// every one of them.
+    #[tokio::test]
+    async fn an_upstream_half_close_does_not_discard_the_client_upload() {
+        let (mut client_peer, proxy_client) = tokio::io::duplex(64 * 1024);
+        let (mut upstream_peer, proxy_upstream) = tokio::io::duplex(64 * 1024);
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client);
+        let (proxy_upstream_read, proxy_upstream_write) = tokio::io::split(proxy_upstream);
+
+        let relay_task = tokio::spawn(relay(
+            test_relay_context(60_000),
+            proxy_client_read,
+            proxy_client_write,
+            proxy_upstream_read,
+            proxy_upstream_write,
+        ));
+
+        // The upstream half-closes: nothing more to send, still reading.
+        upstream_peer.shutdown().await.unwrap();
+        // Long enough that the old monitor, which polled every 500ms, would
+        // certainly have aborted the upload direction by now.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        let payload = vec![b'u'; 16 * 1024];
+        client_peer.write_all(&payload).await.unwrap();
+        let mut received = vec![0u8; payload.len()];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            upstream_peer.read_exact(&mut received),
+        )
+        .await
+        .expect("upload was discarded when the upstream half-closed")
+        .unwrap();
+        assert_eq!(received, payload);
+
+        relay_task.abort();
+    }
+
+    /// The mirror of the case above, and the one already covered before: a
+    /// client that half-closes after its request must still receive the whole
+    /// response.
+    #[tokio::test]
+    async fn a_client_half_close_does_not_discard_the_upstream_response() {
+        let (mut client_peer, proxy_client) = tokio::io::duplex(64 * 1024);
+        let (mut upstream_peer, proxy_upstream) = tokio::io::duplex(64 * 1024);
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client);
+        let (proxy_upstream_read, proxy_upstream_write) = tokio::io::split(proxy_upstream);
+
+        let relay_task = tokio::spawn(relay(
+            test_relay_context(60_000),
+            proxy_client_read,
+            proxy_client_write,
+            proxy_upstream_read,
+            proxy_upstream_write,
+        ));
+
+        client_peer.shutdown().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        let payload = vec![b'd'; 16 * 1024];
+        upstream_peer.write_all(&payload).await.unwrap();
+        let mut received = vec![0u8; payload.len()];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client_peer.read_exact(&mut received),
+        )
+        .await
+        .expect("response was discarded when the client half-closed")
+        .unwrap();
+        assert_eq!(received, payload);
+
+        relay_task.abort();
+    }
+
+    /// Both directions finished is a genuine close, and the relay must return
+    /// rather than sit on the sockets until a timeout.
+    #[tokio::test]
+    async fn a_fully_closed_connection_returns_without_waiting_for_a_timeout() {
+        let (mut client_peer, proxy_client) = tokio::io::duplex(1024);
+        let (mut upstream_peer, proxy_upstream) = tokio::io::duplex(1024);
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client);
+        let (proxy_upstream_read, proxy_upstream_write) = tokio::io::split(proxy_upstream);
+
+        // The listener idle timeout is disabled, so only the relay's own
+        // teardown can end this.
+        let relay_task = tokio::spawn(relay(
+            test_relay_context(0),
+            proxy_client_read,
+            proxy_client_write,
+            proxy_upstream_read,
+            proxy_upstream_write,
+        ));
+
+        client_peer.shutdown().await.unwrap();
+        upstream_peer.shutdown().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), relay_task)
+            .await
+            .expect("relay held the connection open after both directions closed")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A half-closed connection cannot notice its remaining peer vanishing:
+    /// nothing is ever written towards the side that finished, so the surviving
+    /// read blocks forever. The drain window is what stops that from holding a
+    /// socket and two tasks indefinitely — including when the listener idle
+    /// timeout is disabled, as it is here.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_half_closed_connection_is_reclaimed() {
+        let (mut client_peer, proxy_client) = tokio::io::duplex(1024);
+        let (_upstream_peer, proxy_upstream) = tokio::io::duplex(1024);
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client);
+        let (proxy_upstream_read, proxy_upstream_write) = tokio::io::split(proxy_upstream);
+
+        let relay_task = tokio::spawn(relay(
+            test_relay_context(0),
+            proxy_client_read,
+            proxy_client_write,
+            proxy_upstream_read,
+            proxy_upstream_write,
+        ));
+
+        // The client half-closes and then goes silent; the upstream never
+        // sends anything and never closes.
+        client_peer.shutdown().await.unwrap();
+
+        // Well inside the drain window nothing has been reclaimed yet.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!relay_task.is_finished(), "the drain window ended early");
+
+        // Past it, the relay lets go on its own.
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        tokio::time::timeout(Duration::from_secs(5), relay_task)
+            .await
+            .expect("a stalled half-closed connection was never reclaimed")
+            .unwrap()
+            .unwrap();
     }
 
     /// Stands in for a TLS writer: `poll_write` accepts plaintext and reports it

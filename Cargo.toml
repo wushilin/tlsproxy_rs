@@ -1,6 +1,6 @@
 [package]
 name = "tlsproxy"
-version = "3.4.1"
+version = "3.4.2"
 edition = "2021"
 rust-version = "1.88"
 
@@ -51,6 +51,10 @@ futures-util = "0.3"
 tempfile = "3"
 
 [dev-dependencies]
+# `test-util` supplies the paused clock the relay teardown tests need. Kept a
+# dev-dependency so the shipped binary keeps the real clock: the resolver does
+# not enable dev-dependency features for a normal build.
+tokio = { version = "1", features = ["test-util"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.30"

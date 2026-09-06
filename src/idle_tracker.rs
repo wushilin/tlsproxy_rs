@@ -1,4 +1,9 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// Tokio's clock rather than the standard one: identical in production, but it
+// lets the relay's teardown windows be exercised under a paused clock instead
+// of by sleeping through them.
+use tokio::time::Instant;
 
 pub struct IdleTracker {
     last_active: Instant,
