@@ -104,7 +104,11 @@ struct MonitorGroup {
     effective_host: String,
     effective_port: u16,
     tls_server_name: String,
-    owner: Owner,
+    /// Interior-mutable so a later configuration pass can promote a group the
+    /// dataplane created on demand. Promotion is one-way: a config-declared
+    /// backend must never decay back into an evictable runtime group while it
+    /// is still referenced.
+    owner: RwLock<Owner>,
     endpoints: RwLock<Vec<EndpointState>>,
     last_activity_ms: RwLock<u128>,
     sequence: AtomicU64,
@@ -156,7 +160,7 @@ impl MonitorGroup {
             effective_host: effective.host().to_string(),
             effective_port: effective.port(),
             tls_server_name,
-            owner,
+            owner: RwLock::new(owner),
             endpoints: RwLock::new(Vec::new()),
             last_activity_ms: RwLock::new(now),
             sequence: AtomicU64::new(now as u64),
@@ -170,7 +174,7 @@ impl MonitorGroup {
     }
 
     async fn expired(&self, now: u128) -> bool {
-        self.owner == Owner::Runtime
+        *self.owner.read().await == Owner::Runtime
             && now.saturating_sub(*self.last_activity_ms.read().await) > RUNTIME_TTL_MS
     }
 
@@ -717,8 +721,13 @@ async fn ensure_group(
         http_health,
     };
     if let Some(group) = GROUPS.read().await.get(&key).cloned() {
-        if owner == Owner::Runtime {
-            group.touch().await;
+        match owner {
+            Owner::Runtime => group.touch().await,
+            // A route that names its backends explicitly owns this group from
+            // now on, even if traffic created it first. Without the promotion
+            // the group would still expire on the runtime TTL and silently
+            // drop out of the health view its binding just added it to.
+            Owner::Configured => *group.owner.write().await = Owner::Configured,
         }
         return Ok(group);
     }
@@ -761,7 +770,7 @@ async fn evict_excess_runtime_groups() {
     let groups: Vec<_> = GROUPS.read().await.values().cloned().collect();
     let mut runtime_groups = Vec::new();
     for group in groups {
-        if group.owner == Owner::Runtime {
+        if *group.owner.read().await == Owner::Runtime {
             runtime_groups.push((group.key.clone(), *group.last_activity_ms.read().await));
         }
     }
@@ -976,7 +985,7 @@ mod tests {
                 .map(|(host, _)| host)
                 .unwrap_or(target)
                 .into(),
-            owner,
+            owner: RwLock::new(owner),
             endpoints: RwLock::new(endpoints),
             last_activity_ms: RwLock::new(now_ms()),
             sequence: AtomicU64::new(0),
@@ -1211,6 +1220,151 @@ mod tests {
         assert!(parse_http_targets("http://a.example:notaport").is_err());
         assert!(parse_http_targets("http://a.example:0").is_err());
         assert!(parse_http_targets(" ; , ").is_err());
+    }
+
+    /// `GROUPS` and `HEALTH_BINDINGS` are process-wide, so tests that drive
+    /// them through `configure_health_checks` must not interleave.
+    fn global_state_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(Default::default)
+    }
+
+    fn l4_route(
+        exact: &str,
+        action: crate::runtime_config::TlsRouteAction,
+    ) -> crate::runtime_config::TlsHostRoute {
+        crate::runtime_config::TlsHostRoute {
+            name: exact.into(),
+            matcher: crate::runtime_config::HostMatcher {
+                exact: vec![exact.into()],
+                ..Default::default()
+            },
+            action,
+        }
+    }
+
+    fn config_with_routes(
+        routes: Vec<crate::runtime_config::TlsHostRoute>,
+    ) -> crate::runtime_config::RuntimeConfig {
+        let mut config = crate::runtime_config::RuntimeConfig::default();
+        config.default_listener.ordinary_traffic.routes = routes;
+        config
+    }
+
+    /// Layer-4 routes that name their backends are registered ahead of traffic,
+    /// so the probe loop can fence out a dead one before a client is handed it.
+    /// Regression: only reverse-proxy routes were bound, so an HTTPS-to-plaintext
+    /// route's backends stayed invisible to the health view and unprobed until
+    /// the first connection created their group.
+    #[tokio::test]
+    async fn explicit_layer4_backends_are_registered_for_health_checks() {
+        use crate::runtime_config::{TlsRouteAction, UpstreamTransport};
+
+        let _guard = global_state_lock().lock().await;
+        reset().await;
+        configure_health_checks(&config_with_routes(vec![
+            l4_route(
+                "plain.example",
+                TlsRouteAction::Terminate {
+                    target: Some("192.0.2.10:8080,192.0.2.11:8080".into()),
+                    target_port: 8080,
+                    upstream: UpstreamTransport::Plaintext,
+                    load_balancing: HttpLoadBalancing::RoundRobin,
+                },
+            ),
+            l4_route(
+                "relay.example",
+                TlsRouteAction::Passthrough {
+                    target: Some("192.0.2.20:443".into()),
+                    target_port: 443,
+                    load_balancing: HttpLoadBalancing::RoundRobin,
+                },
+            ),
+            // Deriving the backend from the connection's SNI leaves nothing to
+            // enumerate, so this route registers no binding.
+            l4_route(
+                "dynamic.example",
+                TlsRouteAction::Terminate {
+                    target: None,
+                    target_port: 8443,
+                    upstream: UpstreamTransport::Plaintext,
+                    load_balancing: HttpLoadBalancing::RoundRobin,
+                },
+            ),
+        ]))
+        .await
+        .unwrap();
+
+        let targets = health_check_targets().await;
+        let rows: Vec<_> = targets
+            .iter()
+            .map(|value| (value.host.as_str(), value.backend.as_str(), value.transport.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("plain.example", "192.0.2.10:8080", "plaintext"),
+                ("plain.example", "192.0.2.11:8080", "plaintext"),
+                // Passthrough relays the client's TLS session, so its upstream
+                // leg is TLS even though the route never terminates.
+                ("relay.example", "192.0.2.20:443", "tls"),
+            ]
+        );
+        assert!(targets.iter().all(|value| value.online.is_none()));
+
+        // The eagerly bound group must be the one the dataplane then uses, or
+        // the pre-warmed health state would be probing a group nobody reads.
+        // `select_routed_pool` mirrors the terminate path's arguments.
+        let selected = select_routed_pool(
+            "plain.example",
+            "plain.example",
+            Some("192.0.2.10:8080"),
+            8080,
+            false,
+            "198.51.100.7".parse().unwrap(),
+            HttpLoadBalancing::RoundRobin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.endpoint, "192.0.2.10:8080");
+        assert_eq!(GROUPS.read().await.len(), 3, "the dataplane reused the bound groups");
+
+        reset().await;
+    }
+
+    /// A configured group outlives eviction by design, so a route edit that
+    /// drops a backend has to hand it back — otherwise it would be probed for
+    /// the rest of the process's life.
+    #[tokio::test]
+    async fn dropping_a_route_releases_its_backends_for_eviction() {
+        use crate::runtime_config::{TlsRouteAction, UpstreamTransport};
+
+        let _guard = global_state_lock().lock().await;
+        reset().await;
+        let route = l4_route(
+            "plain.example",
+            TlsRouteAction::Terminate {
+                target: Some("192.0.2.30:8080".into()),
+                target_port: 8080,
+                upstream: UpstreamTransport::Plaintext,
+                load_balancing: HttpLoadBalancing::RoundRobin,
+            },
+        );
+        configure_health_checks(&config_with_routes(vec![route])).await.unwrap();
+        let key = GROUPS.read().await.keys().next().cloned().unwrap();
+        assert_eq!(*GROUPS.read().await[&key].owner.read().await, Owner::Configured);
+        assert!(!GROUPS.read().await[&key].expired(now_ms() + RUNTIME_TTL_MS + 1).await);
+
+        configure_health_checks(&config_with_routes(Vec::new())).await.unwrap();
+
+        assert!(health_check_targets().await.is_empty());
+        assert_eq!(*GROUPS.read().await[&key].owner.read().await, Owner::Runtime);
+        assert!(
+            GROUPS.read().await[&key].expired(now_ms() + RUNTIME_TTL_MS + 1).await,
+            "a released group must become reclaimable"
+        );
+
+        reset().await;
     }
 
     #[tokio::test]

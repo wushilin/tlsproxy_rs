@@ -96,6 +96,133 @@ async fn bind_http_action(
     Ok(())
 }
 
+/// The backends of a Layer-4 route, when the route names them explicitly.
+///
+/// `upstream_tls` must agree with [`RelayPolicy::for_tls_route`] exactly: it is
+/// part of the group key, so disagreeing here would register a second group the
+/// dataplane never consults, leaving the route unprobed anyway.
+///
+/// A route that leaves `target` unset connects to the connection's own SNI
+/// host. That backend set is unbounded and only knowable per connection, so
+/// those keep using the lazily created, idle-evicted runtime groups.
+fn l4_backends(
+    action: &crate::runtime_config::TlsRouteAction,
+) -> Option<(&str, u16, bool, HttpLoadBalancing)> {
+    use crate::runtime_config::{TlsRouteAction, UpstreamTransport};
+    match action {
+        // Passthrough relays the client's own TLS session, so the upstream leg
+        // is always TLS.
+        TlsRouteAction::Passthrough {
+            target: Some(target),
+            target_port,
+            load_balancing,
+        } => Some((target, *target_port, true, *load_balancing)),
+        TlsRouteAction::Terminate {
+            target: Some(target),
+            target_port,
+            upstream,
+            load_balancing,
+        } => Some((
+            target,
+            *target_port,
+            *upstream == UpstreamTransport::Tls,
+            *load_balancing,
+        )),
+        _ => None,
+    }
+}
+
+/// The name a probe should present to a TLS upstream. Real traffic on this
+/// route arrives with an SNI the backend expects, so an exactly matched host is
+/// a far better probe name than the backend's own address — an origin that
+/// serves one certificate would reject the handshake and look permanently down.
+/// Suffix and regex matchers name no single host; those fall back to the
+/// backend address, as forward listeners already do.
+fn probe_server_name(
+    matcher: &crate::runtime_config::HostMatcher,
+    backend_host: &str,
+) -> String {
+    matcher
+        .exact
+        .first()
+        .cloned()
+        .unwrap_or_else(|| backend_host.to_string())
+}
+
+/// Registers a Layer-4 route's explicit backends so the probe loop can fence
+/// out dead ones before traffic arrives, instead of the route discovering them
+/// on a live connection.
+///
+/// `http_health` is false: these carry arbitrary TCP, or a relayed TLS session
+/// the proxy never parses, so a connect — plus a handshake when the upstream
+/// leg is TLS — is the only meaningful liveness signal. An HTTP `GET /` would
+/// be wrong here.
+async fn bind_l4_route(
+    listener: &str,
+    matcher: &crate::runtime_config::HostMatcher,
+    action: &crate::runtime_config::TlsRouteAction,
+) -> Result<()> {
+    let Some((targets, default_port, upstream_tls, load_balancing)) = l4_backends(action) else {
+        return Ok(());
+    };
+    let host = matcher_label(matcher);
+    for target in parse_targets(targets)? {
+        let requested = HostAndPort::parse_or_default(&target, default_port);
+        if requested.port() == 0 {
+            return Err(anyhow!("route target `{target}` has an invalid port"));
+        }
+        let group = ensure_group(
+            requested.to_string(),
+            requested.host(),
+            requested.port(),
+            upstream_tls,
+            false,
+            probe_server_name(matcher, requested.host()),
+            Owner::Configured,
+        )
+        .await?;
+        HEALTH_BINDINGS.write().await.push(HealthBinding {
+            group: group.key.clone(),
+            listener: listener.into(),
+            host: host.clone(),
+            // Layer 4 has no request path to scope a backend by.
+            path: String::new(),
+            backend: target,
+            transport: if upstream_tls { "tls" } else { "plaintext" }.into(),
+            load_balancing: match load_balancing {
+                HttpLoadBalancing::RoundRobin => "round_robin",
+                HttpLoadBalancing::ClientIpHash => "client_ip_hash",
+            }
+            .into(),
+        });
+    }
+    Ok(())
+}
+
+/// Hands back every configured group this revision no longer references. The
+/// group stays put — traffic may still be using it — but reverts to runtime
+/// ownership so the idle TTL can reclaim it. Without this, editing a route
+/// would leave its old backends probed forever, since eviction only ever
+/// considers runtime groups.
+async fn release_unreferenced_groups() {
+    let referenced: HashSet<GroupKey> = HEALTH_BINDINGS
+        .read()
+        .await
+        .iter()
+        .map(|binding| binding.group.clone())
+        .collect();
+    let groups: Vec<_> = GROUPS.read().await.values().cloned().collect();
+    for group in groups {
+        if referenced.contains(&group.key) {
+            continue;
+        }
+        let mut owner = group.owner.write().await;
+        if *owner == Owner::Configured {
+            *owner = Owner::Runtime;
+        }
+    }
+}
+
 async fn bind_forward_listener(
     listener: &str,
     configured: &crate::runtime_config::RawForwardListenerConfig,
@@ -151,6 +278,13 @@ pub async fn configure_health_checks(config: &crate::runtime_config::RuntimeConf
                 action,
             )
             .await?;
+        } else {
+            bind_l4_route(
+                crate::runtime_config::DEFAULT_LISTENER_NAME,
+                &route.matcher,
+                &route.action,
+            )
+            .await?;
         }
     }
     for (listener, configured) in &config.additional_listeners {
@@ -165,6 +299,8 @@ pub async fn configure_health_checks(config: &crate::runtime_config::RuntimeConf
                     {
                         bind_http_action(listener, &matcher_label(&route.matcher), "/", action)
                             .await?;
+                    } else {
+                        bind_l4_route(listener, &route.matcher, &route.action).await?;
                     }
                 }
             }
@@ -180,6 +316,7 @@ pub async fn configure_health_checks(config: &crate::runtime_config::RuntimeConf
             crate::runtime_config::AdditionalListenerConfig::Redirect(_) => {}
         }
     }
+    release_unreferenced_groups().await;
     Ok(())
 }
 
