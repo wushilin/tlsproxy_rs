@@ -126,19 +126,51 @@ async fn pipe<R, W>(id: Arc<RequestId>, mut reader: R, mut writer: W, stats: Arc
 where R: AsyncRead + Send + Unpin + 'static, W: AsyncWrite + Send + Unpin + 'static {
     controller.write().await.spawn(async move {
         let mut buffer = vec![0; 4096];
+        let mut unflushed = false;
         loop {
-            let Ok(count) = reader.read(&mut buffer).await else { break; };
+            // A buffering writer can accept plaintext without putting it on the
+            // wire: tokio-rustls' `poll_write` reports bytes as written while
+            // the encrypted records stay queued in the session, waiting for the
+            // next write, flush, or shutdown. A keep-alive peer sends no EOF and
+            // may send nothing further, so without an explicit flush the tail of
+            // a response sits in user space until the idle timeout tears the
+            // connection down — the client sees a truncated body.
+            //
+            // Flushing after every chunk would work but would give up record
+            // batching, so flush exactly when the source goes quiet: poll the
+            // read once, and only if it is not already ready is there a pause
+            // worth flushing into.
+            let read_result = {
+                let read = reader.read(&mut buffer);
+                tokio::pin!(read);
+                match futures_util::poll!(read.as_mut()) {
+                    std::task::Poll::Ready(result) => result,
+                    std::task::Poll::Pending => {
+                        // Nothing more is available right now, so push whatever
+                        // the last writes left queued before parking on the
+                        // read. The flag is not cleared: every iteration either
+                        // breaks or writes again, so it can only ever be stale
+                        // in the direction of one redundant flush, never a
+                        // missed one.
+                        if unflushed && writer.flush().await.is_err() { break; }
+                        read.await
+                    }
+                }
+            };
+            let Ok(count) = read_result else { break; };
             if count == 0 { break; }
             counter.fetch_add(count as u64, Ordering::SeqCst);
             if upload { stats.increase_uploaded_bytes(count); active_tracker::add_uploaded(&id, count as u64); }
             else { stats.increase_downloaded_bytes(count); active_tracker::add_downloaded(&id, count as u64); }
             limiter.consume(count).await;
             if writer.write_all(&buffer[..count]).await.is_err() { break; }
+            unflushed = true;
             idle.lock().await.mark();
         }
         // Propagate a directional EOF without tearing down the opposite
         // direction. In particular, an upload EOF becomes a TCP/TLS
-        // half-close while the response continues to drain.
+        // half-close while the response continues to drain. `shutdown` flushes
+        // first, so anything still queued leaves with it.
         let _ = writer.shutdown().await;
     })
 }
@@ -172,6 +204,119 @@ mod tests {
         assert!(upstream_lands_on(addr("127.0.0.1:8080"), local_only, &locals, &selfs));
         assert!(!upstream_lands_on(addr("192.168.1.5:8080"), local_only, &locals, &selfs), "same port on an unbound address stays reachable");
         assert!(!upstream_lands_on(addr("203.0.113.9:8080"), local_only, &locals, &selfs), "public IP cannot hairpin to loopback-only");
+    }
+
+    /// Stands in for a TLS writer: `poll_write` accepts plaintext and reports it
+    /// as written, but nothing reaches the peer until something flushes. This is
+    /// exactly how tokio-rustls behaves — the encrypted records sit in the
+    /// session until the next write, flush, or shutdown.
+    #[derive(Clone)]
+    struct BufferingWriter {
+        queued: Arc<std::sync::Mutex<Vec<u8>>>,
+        delivered: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl BufferingWriter {
+        fn new() -> Self {
+            Self {
+                queued: Arc::new(std::sync::Mutex::new(Vec::new())),
+                delivered: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn delivered_len(&self) -> usize {
+            self.delivered.lock().unwrap().len()
+        }
+    }
+
+    impl tokio::io::AsyncWrite for BufferingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.queued.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let mut queued = self.queued.lock().unwrap();
+            self.delivered.lock().unwrap().extend_from_slice(&queued);
+            queued.clear();
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    /// A response that arrives in full from the upstream must reach the client
+    /// even when neither side ever closes. Regression: the relay wrote each
+    /// chunk and only ever flushed via `shutdown` at EOF, so on a keep-alive
+    /// upstream the tail stayed queued in the TLS session until the idle
+    /// timeout killed the connection — the client saw a body that stopped
+    /// short, with no error anywhere.
+    #[tokio::test]
+    async fn keep_alive_response_is_flushed_without_waiting_for_eof() {
+        // Both peers stay open for the whole test, so no EOF is ever delivered
+        // in either direction.
+        let (_client_peer, proxy_client) = tokio::io::duplex(256 * 1024);
+        let (mut upstream_peer, proxy_upstream) = tokio::io::duplex(256 * 1024);
+        let (proxy_client_read, _proxy_client_write) = tokio::io::split(proxy_client);
+        let (proxy_upstream_read, proxy_upstream_write) = tokio::io::split(proxy_upstream);
+
+        let client_write = BufferingWriter::new();
+        let policy = Arc::new(RelayPolicy {
+            bind: "127.0.0.1:443".into(),
+            target: None,
+            target_port: 80,
+            speed_limit: None,
+            upstream_tls: false,
+        });
+        // A generous idle timeout: the point is that the body arrives promptly,
+        // not that a teardown eventually forces it out.
+        let stats = Arc::new(ListenerStats::new("test", 60_000));
+        let controller = Arc::new(RwLock::new(Controller::new()));
+        let observer = client_write.clone();
+        let relay_task = tokio::spawn(relay(
+            RelayContext {
+                id: Arc::new(RequestId::new()),
+                policy,
+                stats,
+                controller,
+                initial_uploaded: 0,
+            },
+            proxy_client_read,
+            client_write,
+            proxy_upstream_read,
+            proxy_upstream_write,
+        ));
+
+        let body = vec![b'x'; 90 * 1024];
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        upstream_peer.write_all(head.as_bytes()).await.unwrap();
+        upstream_peer.write_all(&body).await.unwrap();
+        // The upstream is keep-alive: it sends nothing further and never closes.
+
+        let expected = head.len() + body.len();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while observer.delivered_len() < expected && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            observer.delivered_len(),
+            expected,
+            "the response tail never left the relay's writer"
+        );
+
+        relay_task.abort();
     }
 
     #[tokio::test]

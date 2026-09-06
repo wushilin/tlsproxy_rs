@@ -317,6 +317,11 @@ where
         (Box::new(read), Box::new(write))
     };
     upstream_write.write_all(&rewritten).await?;
+    // An upgrade request is answered before any body flows, and a TLS upstream
+    // keeps written plaintext queued in the session until something flushes it.
+    // `read_response_head` below would then wait for a reply to a request the
+    // upstream never received.
+    upstream_write.flush().await?;
 
     if upgrade {
         // An Upgrade request (for example WebSocket) is decided by the
@@ -335,6 +340,11 @@ where
         relay_ctx.stats.increase_downloaded_bytes(response_head.len());
         active_tracker::add_downloaded(&relay_ctx.id, response_head.len() as u64);
         client_write.write_all(&response_head).await?;
+        // A 101 hands both directions to the raw relay, and a WebSocket client
+        // says nothing until it has seen the handshake response. Left queued in
+        // the client's TLS session, this head would deadlock against a peer
+        // waiting to read it.
+        client_write.flush().await?;
         if response_status(&response_head) == Some(101) {
             info!("{} upgrade accepted by upstream; relaying as a bidirectional tunnel", relay_ctx.id);
             return crate::relay::relay(relay_ctx, base_read, client_write, upstream_read, upstream_write).await;
