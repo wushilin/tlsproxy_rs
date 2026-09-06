@@ -66,6 +66,21 @@ impl Store {
             .context("user database task failed")?
     }
 
+    /// Every stored account, ordered by username: RocksDB keys are the
+    /// usernames themselves, so iteration is already sorted. Offline account
+    /// recovery lists accounts this way; nothing else needs the full set.
+    pub fn users(&self) -> Result<Vec<UserRecord>> {
+        let cf = self.cf(CF_USERS)?;
+        self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start).map(|item| {
+            let (key, value) = item?;
+            let mut user: UserRecord = serde_json::from_slice(&value)?;
+            if user.username.is_empty() {
+                user.username = String::from_utf8_lossy(&key).into_owned();
+            }
+            Ok(user)
+        }).collect()
+    }
+
     pub fn save_user(&self, user: &UserRecord) -> Result<()> {
         if user.username.trim().is_empty() || user.password_hash.is_empty() {
             bail!("username and password hash are required");

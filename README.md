@@ -252,11 +252,30 @@ identities can never be published.
 tlsproxy backup --runtime-dir /var/lib/tlsproxy --output /backup/tlsproxy-2026-07-22
 tlsproxy restore --checkpoint /backup/tlsproxy-2026-07-22 --runtime-dir /var/lib/tlsproxy-restored
 tlsproxy cleanup --runtime-dir /var/lib/tlsproxy --generations 3 --audit-days 90
-tlsproxy recover-admin --runtime-dir /var/lib/tlsproxy --username admin --password-file /run/secrets/new-password
+tlsproxy recover-admin --runtime-dir /var/lib/tlsproxy --list
+tlsproxy recover-admin --runtime-dir /var/lib/tlsproxy --reset --user admin
+tlsproxy recover-admin --runtime-dir /var/lib/tlsproxy --reset --user admin --password-file /run/secrets/new-password
 ```
 
-Restore refuses a non-empty destination. Administrator recovery is intended
-for offline use, revokes existing sessions, and writes an audit record.
+Restore refuses a non-empty destination. Account recovery reads and writes the
+runtime RocksDB directly, so the service must be stopped: RocksDB admits a
+single writer and a running proxy holds the lock.
+
+`--list` prints the stored accounts with their administrator, disabled, and
+creation state. `--reset` replaces one account's password, prompting for it
+twice on the terminal unless `--password-file` supplies it; `--user` may be
+omitted when exactly one administrator is stored. A reset keeps the account's
+administrator and disabled flags — add `--create` to create a missing account
+as an enabled administrator. Recovery revokes that account's sessions and
+writes an audit record.
+
+```
+$ tlsproxy recover-admin --runtime-dir /var/lib/tlsproxy
+Setting password for admin:
+Enter new password for admin:
+Confirm:
+Password for admin is reset
+```
 Runtime maintenance retains three generations per certificate, 90 days of
 audit, fifty configuration revisions, and removes expired sessions daily.
 

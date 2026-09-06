@@ -76,7 +76,25 @@ struct BackupArgs { #[arg(long, default_value = DEFAULT_RUNTIME_DIR)] runtime_di
 #[derive(Debug, Args)]
 struct RestoreArgs { #[arg(long)] checkpoint: PathBuf, #[arg(long, default_value = DEFAULT_RUNTIME_DIR)] runtime_dir: PathBuf }
 #[derive(Debug, Args)]
-struct RecoverAdminArgs { #[arg(long, default_value = DEFAULT_RUNTIME_DIR)] runtime_dir: PathBuf, #[arg(long, default_value = "admin")] username: String, #[arg(long)] password_file: PathBuf }
+struct RecoverAdminArgs {
+    #[arg(long, default_value = DEFAULT_RUNTIME_DIR)]
+    runtime_dir: PathBuf,
+    /// List the accounts held in the runtime database and exit.
+    #[arg(long, conflicts_with_all = ["reset", "user", "password_file", "create"])]
+    list: bool,
+    /// Reset a password. Optional: this is what the command does by default.
+    #[arg(long)]
+    reset: bool,
+    /// Account to reset. Defaults to the only administrator when there is one.
+    #[arg(long, visible_alias = "username")]
+    user: Option<String>,
+    /// Read the new password from this file instead of prompting for it.
+    #[arg(long)]
+    password_file: Option<PathBuf>,
+    /// Create the account as an enabled administrator when it does not exist.
+    #[arg(long, requires = "user")]
+    create: bool,
+}
 #[derive(Debug, Args)]
 struct CleanupArgs { #[arg(long, default_value = DEFAULT_RUNTIME_DIR)] runtime_dir: PathBuf, #[arg(long, default_value_t = 3)] generations: usize, #[arg(long, default_value_t = 90)] audit_days: i64 }
 
@@ -183,16 +201,133 @@ fn copy_directory(source: &std::path::Path, target: &std::path::Path) -> Result<
     Ok(())
 }
 
+/// Offline account recovery. RocksDB allows a single writer, so the service
+/// must be stopped: the lock error is reported as such rather than as a raw
+/// RocksDB failure.
 fn recover_admin(args: RecoverAdminArgs) -> Result<()> {
-    let password = std::fs::read_to_string(&args.password_file)
-        .with_context(|| format!("failed to read `{}`", args.password_file.display()))?;
-    let store = store::Store::open(&args.runtime_dir)?;
+    let store = open_offline_store(&args.runtime_dir)?;
+    if args.list {
+        return list_accounts(&store);
+    }
     anyhow::ensure!(store.is_initialized()?, "runtime is not initialized");
-    store.save_user(&auth::UserRecord { username: args.username.clone(), password_hash: auth::hash_password(password.trim())?, administrator: true, disabled: false, created_at: Some(time::OffsetDateTime::now_utc()) })?;
-    store.delete_user_sessions(&args.username)?;
-    store.append_audit("administrator_recovered", serde_json::json!({"username": args.username}))?;
-    info!("administrator recovered and existing sessions revoked");
+    // Resetting is the whole point of the command, so `--reset` is optional and
+    // a lone administrator needs no `--user` either.
+    let username = match args.user.clone() {
+        Some(username) => username,
+        None => {
+            let username = sole_administrator(&store)?;
+            println!("Setting password for {username}:");
+            username
+        }
+    };
+
+    let existing = store.user(&username)?;
+    let created = existing.is_none();
+    if created && !args.create {
+        anyhow::bail!(
+            "no account named `{username}`; run `recover-admin --list` to see the stored accounts, or add `--create` to create it as an administrator"
+        );
+    }
+    let password = match &args.password_file {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read `{}`", path.display()))?
+            .trim()
+            .to_owned(),
+        None => prompt_new_password(&username)?,
+    };
+
+    // A reset only replaces the secret: an existing account keeps its
+    // administrator, disabled, and creation state so recovery cannot silently
+    // widen an operator account's rights.
+    let user = match existing {
+        Some(existing) => auth::UserRecord { password_hash: auth::hash_password(&password)?, ..existing },
+        None => auth::UserRecord {
+            username: username.clone(),
+            password_hash: auth::hash_password(&password)?,
+            administrator: true,
+            disabled: false,
+            created_at: Some(time::OffsetDateTime::now_utc()),
+        },
+    };
+    store.save_user(&user)?;
+    let revoked = store.delete_user_sessions(&username)?;
+    store.append_audit(
+        "account_recovered",
+        serde_json::json!({"username": username, "created": created, "sessions_revoked": revoked}),
+    )?;
+    println!("Password for {username} is reset");
+    if revoked > 0 {
+        println!("{revoked} existing session(s) revoked");
+    }
+    if user.disabled {
+        println!("note: `{username}` is disabled and cannot sign in until it is enabled");
+    }
     Ok(())
+}
+
+/// The account to recover when the operator named none: the single
+/// administrator. Anything else is ambiguous and has to be named.
+fn sole_administrator(store: &store::Store) -> Result<String> {
+    let mut administrators = store
+        .users()?
+        .into_iter()
+        .filter(|user| user.administrator)
+        .map(|user| user.username);
+    let Some(first) = administrators.next() else {
+        anyhow::bail!("no administrator account is stored; pass `--user <name> --create` to create one");
+    };
+    let rest = administrators.collect::<Vec<_>>();
+    anyhow::ensure!(
+        rest.is_empty(),
+        "several administrator accounts are stored ({}); pass `--user <name>` to choose one",
+        std::iter::once(first).chain(rest).collect::<Vec<_>>().join(", ")
+    );
+    Ok(first)
+}
+
+fn open_offline_store(runtime_dir: &std::path::Path) -> Result<store::Store> {
+    store::Store::open(runtime_dir).map_err(|cause| {
+        if format!("{cause:#}").contains("lock") {
+            cause.context("the runtime database is locked; stop the tlsproxy service first")
+        } else {
+            cause
+        }
+    })
+}
+
+fn list_accounts(store: &store::Store) -> Result<()> {
+    let users = store.users()?;
+    if users.is_empty() {
+        println!("no accounts stored in the runtime database");
+        return Ok(());
+    }
+    let width = users.iter().map(|user| user.username.chars().count()).max().unwrap_or(0).max(8);
+    println!("{:width$}  {:5}  {:8}  CREATED", "USERNAME", "ADMIN", "DISABLED");
+    for user in &users {
+        let created = user
+            .created_at
+            .and_then(|value| value.format(&time::format_description::well_known::Rfc3339).ok())
+            .unwrap_or_else(|| "-".to_owned());
+        println!(
+            "{:width$}  {:5}  {:8}  {created}",
+            user.username,
+            if user.administrator { "yes" } else { "no" },
+            if user.disabled { "yes" } else { "no" },
+        );
+    }
+    Ok(())
+}
+
+/// Reads the new password twice from the terminal without echoing it. There is
+/// no terminal under a service manager or a pipe, hence the `--password-file`
+/// hint on failure.
+fn prompt_new_password(username: &str) -> Result<String> {
+    let password = rpassword::prompt_password(format!("Enter new password for {username}: "))
+        .context("failed to read the password from the terminal; use `--password-file` when no terminal is attached")?;
+    let confirmation = rpassword::prompt_password("Confirm: ")
+        .context("failed to read the password confirmation from the terminal")?;
+    anyhow::ensure!(password == confirmation, "passwords do not match");
+    Ok(password)
 }
 
 fn cleanup(args: CleanupArgs) -> Result<()> {
@@ -297,6 +432,125 @@ mod cli_tests {
         let Some(Command::Run(args)) = cli.command else { panic!("expected run") };
         assert_eq!(args.setup_port, Some(44448));
         assert_eq!(args.runtime_dir, PathBuf::from("/tmp/tlsproxy-test"));
+    }
+
+    #[test]
+    fn recover_admin_parses_list_and_reset_forms() {
+        let cli = Cli::try_parse_from(["tlsproxy", "recover-admin", "--list"]).unwrap();
+        let Some(Command::RecoverAdmin(args)) = cli.command else { panic!("expected recover-admin") };
+        assert!(args.list && !args.reset && args.user.is_none());
+
+        let cli = Cli::try_parse_from(["tlsproxy", "recover-admin", "--reset", "--user", "abc"]).unwrap();
+        let Some(Command::RecoverAdmin(args)) = cli.command else { panic!("expected recover-admin") };
+        assert!(args.reset && args.user.as_deref() == Some("abc") && args.password_file.is_none());
+
+        // `--username` stays accepted, `--reset` and `--user` each stand alone,
+        // and listing cannot be combined with a reset.
+        assert!(Cli::try_parse_from(["tlsproxy", "recover-admin", "--reset", "--username", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["tlsproxy", "recover-admin", "--reset"]).is_ok());
+        assert!(Cli::try_parse_from(["tlsproxy", "recover-admin", "--user", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["tlsproxy", "recover-admin", "--list", "--reset", "--user", "abc"]).is_err());
+        assert!(Cli::try_parse_from(["tlsproxy", "recover-admin", "--create"]).is_err());
+    }
+
+    #[test]
+    fn recover_admin_resets_stored_accounts_without_widening_rights() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime_dir = directory.path().join("runtime");
+        let password_path = directory.path().join("password");
+        std::fs::write(&password_path, "new correct horse battery staple\n").unwrap();
+        let reset = |user: &str, create: bool| RecoverAdminArgs {
+            runtime_dir: runtime_dir.clone(),
+            list: false,
+            reset: true,
+            user: Some(user.to_owned()),
+            password_file: Some(password_path.clone()),
+            create,
+        };
+
+        let store = store::Store::open(&runtime_dir).unwrap();
+        store
+            .bootstrap(
+                &runtime_config::RuntimeConfig::default(),
+                &auth::UserRecord {
+                    username: "abc".into(),
+                    password_hash: auth::hash_password("original password").unwrap(),
+                    administrator: true,
+                    disabled: false,
+                    created_at: Some(time::OffsetDateTime::now_utc()),
+                },
+            )
+            .unwrap();
+        store
+            .save_user(&auth::UserRecord {
+                username: "operator".into(),
+                password_hash: auth::hash_password("operator password").unwrap(),
+                administrator: false,
+                disabled: true,
+                created_at: None,
+            })
+            .unwrap();
+        store
+            .save_session(&auth::SessionRecord {
+                token_hash: auth::token_hash("session token"),
+                username: "abc".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            store.users().unwrap().iter().map(|user| user.username.clone()).collect::<Vec<_>>(),
+            ["abc", "operator"]
+        );
+        list_accounts(&store).unwrap();
+        drop(store);
+
+        recover_admin(reset("operator", false)).unwrap();
+        let store = store::Store::open(&runtime_dir).unwrap();
+        let operator = store.user("operator").unwrap().unwrap();
+        assert!(auth::verify_password(&operator.password_hash, "new correct horse battery staple"));
+        assert!(!operator.administrator && operator.disabled);
+        assert!(store.session(&auth::token_hash("session token")).unwrap().is_some());
+        drop(store);
+
+        recover_admin(reset("abc", false)).unwrap();
+        let store = store::Store::open(&runtime_dir).unwrap();
+        assert!(auth::verify_password(
+            &store.user("abc").unwrap().unwrap().password_hash,
+            "new correct horse battery staple"
+        ));
+        assert!(store.session(&auth::token_hash("session token")).unwrap().is_none());
+        drop(store);
+
+        // With `abc` as the only administrator, an unnamed reset picks it.
+        recover_admin(RecoverAdminArgs {
+            runtime_dir: runtime_dir.clone(),
+            list: false,
+            reset: false,
+            user: None,
+            password_file: Some(password_path.clone()),
+            create: false,
+        })
+        .unwrap();
+
+        let failure = recover_admin(reset("ghost", false)).unwrap_err().to_string();
+        assert!(failure.contains("no account named `ghost`"), "{failure}");
+        recover_admin(reset("ghost", true)).unwrap();
+        let store = store::Store::open(&runtime_dir).unwrap();
+        let ghost = store.user("ghost").unwrap().unwrap();
+        assert!(ghost.administrator && !ghost.disabled && ghost.created_at.is_some());
+        // `ghost` is a second administrator, so an unnamed reset is ambiguous.
+        drop(store);
+        let failure = recover_admin(RecoverAdminArgs {
+            runtime_dir,
+            list: false,
+            reset: true,
+            user: None,
+            password_file: Some(password_path),
+            create: false,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(failure.contains("abc, ghost"), "{failure}");
     }
 
     #[test]

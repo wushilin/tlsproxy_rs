@@ -1,6 +1,6 @@
 [package]
 name = "tlsproxy"
-version = "3.4.2"
+version = "3.4.3"
 edition = "2021"
 rust-version = "1.88"
 
@@ -49,6 +49,9 @@ instant-acme = { version = "0.8.5", features = ["time", "x509-parser"] }
 hickory-resolver = "0.26.1"
 futures-util = "0.3"
 tempfile = "3"
+# Offline account recovery prompts for a password on the terminal; this reads
+# it from /dev/tty without echoing it back.
+rpassword = "7"
 
 [dev-dependencies]
 # `test-util` supplies the paused clock the relay teardown tests need. Kept a

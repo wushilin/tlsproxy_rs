@@ -104,8 +104,9 @@ is now a resumable completion record rather than an open task list.
   validates an empty destination and initialized result.
 - `[done]` Daily and manual retention bound generations, sessions, audit, and
   configuration history.
-- `[done]` `recover-admin` resets/creates an administrator offline, revokes
-  sessions, and audits recovery.
+- `[done]` `recover-admin` lists accounts, resets a password (prompted or from
+  a file, defaulting to the sole administrator), optionally creates a missing
+  administrator, revokes sessions, and audits recovery.
 - `[done]` Dead manager/admin server modules were deleted. Shared target
   admission and byte relay moved to `relay`; outbound TLS moved to
   `upstream_tls`; normal runtime no longer depends on `Runner`. The isolated
