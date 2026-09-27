@@ -4,7 +4,7 @@
 //! routing and ACME interception remain in `listener::default`.
 
 use std::sync::Arc;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -32,12 +32,14 @@ pub(crate) struct TerminateRoute {
     pub target_port: u16,
     pub upstream_tls: bool,
     pub load_balancing: crate::runtime_config::HttpLoadBalancing,
+    pub proxy_protocol: crate::proxy_protocol::ProxyProtocol,
 }
 
 /// The routed form `run_stream` verifies against the completed handshake.
 struct InspectedRoute {
     expected_sni: String,
-    client_ip: IpAddr,
+    client: SocketAddr,
+    local: SocketAddr,
     route: TerminateRoute,
 }
 
@@ -53,9 +55,9 @@ pub(crate) async fn run_inspected(
     route: TerminateRoute,
     certified_key: Arc<rustls::sign::CertifiedKey>,
 ) -> Result<()> {
-    let crate::dataplane::ConnCtx { name, stats, controller, remote } = ctx;
+    let crate::dataplane::ConnCtx { name, stats, controller, remote, local } = ctx;
     let conn_id = client.request_id();
-    let inspected = InspectedRoute { expected_sni: hello.sni_host.clone(), client_ip: remote.ip(), route };
+    let inspected = InspectedRoute { expected_sni: hello.sni_host.clone(), client: remote, local, route };
     // Restore the peeked ClientHello so the TLS acceptor sees the pristine
     // wire stream.
     client.unread(hello.buffered);
@@ -153,7 +155,8 @@ where
             inspected.route.target.as_deref(),
             inspected.route.target_port,
             upstream_tls,
-            inspected.client_ip,
+            inspected.route.proxy_protocol,
+            inspected.client.ip(),
             inspected.route.load_balancing,
         )
         .await?,
@@ -188,11 +191,16 @@ where
         crate::relay::reject_obvious_self_connect(&policy, &selected.endpoint, &conn_id)
             .await?;
     }
-    let upstream = tokio::time::timeout(
+    let mut upstream = tokio::time::timeout(
         Duration::from_secs(5),
         TcpStream::connect(&selected.endpoint),
     )
     .await??;
+    // Written on the raw socket, so with a TLS upstream it precedes the
+    // handshake — where PROXY-aware TLS servers expect it.
+    if let Some(inspected) = route.as_ref() {
+        inspected.route.proxy_protocol.announce(&mut upstream, inspected.client, inspected.local).await?;
+    }
     info!("{conn_id} connected to upstream {}", selected.endpoint);
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(tls_stream);

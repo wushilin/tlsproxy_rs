@@ -1,6 +1,6 @@
 [package]
 name = "tlsproxy"
-version = "3.4.3"
+version = "3.5.0"
 edition = "2021"
 rust-version = "1.88"
 
@@ -61,3 +61,6 @@ tokio = { version = "1", features = ["test-util"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.30"
+# An independent PROXY protocol parser, so the headers this proxy emits are
+# checked against someone else's reading of the specification, not ours.
+ppp = "2"

@@ -147,7 +147,7 @@ async fn handle_connection(
             }
             route => {
                 let is_acme = matches!(&route, ConnectionRoute::AcmeChallenge { .. });
-                let ctx = crate::dataplane::ConnCtx { name: name.clone(), remote: remote_address, stats: stats.clone(), controller };
+                let ctx = crate::dataplane::ConnCtx { name: name.clone(), remote: remote_address, local: client.local_addr()?, stats: stats.clone(), controller };
                 let tls = crate::dataplane::TlsCtx { ca, cache: certificate_cache, fallback: certificate_fallback };
                 dispatch_non_control(ctx, tls, route, hello, client, &config)
                 .await?;
@@ -226,13 +226,13 @@ pub(crate) async fn dispatch_non_control(
             }
             let policy = crate::dataplane::RelayPolicy::for_tls_route(config, &action);
             match action {
-                TlsRouteAction::Passthrough { target_port, target, load_balancing } => {
+                TlsRouteAction::Passthrough { target_port, target, load_balancing, proxy_protocol } => {
                     crate::dataplane::tls::passthrough::run(
                         ctx,
                         policy,
                         client,
                         Some(hello),
-                        Some(crate::dataplane::tls::passthrough::PassthroughRoute { target, target_port, load_balancing }),
+                        Some(crate::dataplane::tls::passthrough::PassthroughRoute { target, target_port, load_balancing, proxy_protocol }),
                     )
                     .await
                 }
@@ -241,6 +241,7 @@ pub(crate) async fn dispatch_non_control(
                     target,
                     upstream,
                     load_balancing,
+                    proxy_protocol,
                 } => {
                     crate::managed_tls::request_automatic_for_sni(&hello.sni_host);
                     let certified_key = tls.cache
@@ -257,6 +258,7 @@ pub(crate) async fn dispatch_non_control(
                             target_port,
                             upstream_tls: upstream == UpstreamTransport::Tls,
                             load_balancing,
+                            proxy_protocol,
                         },
                         certified_key,
                     )
@@ -400,7 +402,7 @@ mod tests {
             action: TlsRouteAction::Passthrough {
                 target_port: 443,
                 target: Some("downstream.example".into()),
-                load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin,
+                load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
             },
         });
         let hello = ClientHello {
@@ -437,7 +439,7 @@ mod tests {
                         target_port: 8080,
                         target: Some("backend.internal".into()),
                         upstream: UpstreamTransport::Plaintext,
-                        load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin,
+                        load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
                     },
                 }],
                 ..Default::default()
@@ -474,7 +476,7 @@ mod tests {
             action: TlsRouteAction::Passthrough {
                 target_port: 443,
                 target: Some("upstream.example".into()),
-                load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin,
+                load_balancing: crate::runtime_config::HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
             },
         });
         let hello = ClientHello {

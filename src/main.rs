@@ -26,6 +26,7 @@ pub mod idle_tracker;
 pub mod listener_stats;
 pub mod listener;
 pub mod managed_tls;
+pub mod proxy_protocol;
 pub mod request_id;
 pub mod relay;
 pub mod resolver;

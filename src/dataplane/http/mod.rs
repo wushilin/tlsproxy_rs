@@ -125,7 +125,7 @@ pub(crate) async fn run<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let crate::dataplane::ConnCtx { name, remote: remote_address, stats, controller } = ctx;
+    let crate::dataplane::ConnCtx { name, remote: remote_address, local: local_address, stats, controller } = ctx;
     let conn_id = client.request_id();
     info!("{conn_id} {name} http worker started");
     let mut head = match inspected {
@@ -184,13 +184,21 @@ where
         };
     active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint);
     crate::relay::reject_obvious_self_connect(&policy, &selected.endpoint, &conn_id).await?;
-    let upstream = match connect_backend(&conn_id, &selected.endpoint).await {
+    // Path routing has already refined `route` to the per-path action, so
+    // this is the setting of the backend pool actually chosen.
+    let proxy_protocol = route.as_ref().map(|(_, action)| action.proxy_protocol).unwrap_or_default();
+    let mut upstream = match connect_backend(&conn_id, &selected.endpoint).await {
         Some(upstream) => upstream,
         None => {
             bad_gateway(&mut client).await?;
             return Ok(());
         }
     };
+    if let Err(cause) = proxy_protocol.announce(&mut upstream, remote_address, local_address).await {
+        log::warn!("{conn_id} failed to send PROXY header to {}: {cause}", selected.endpoint);
+        bad_gateway(&mut client).await?;
+        return Ok(());
+    }
     info!("{conn_id} connected to http upstream {}", selected.endpoint);
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
 
@@ -505,6 +513,51 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"), "upstream dropped the request; got: {response:?}");
         assert!(response.ends_with("ok"));
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_header_precedes_the_forwarded_request() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            socket.shutdown().await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let (mut browser, server) = tokio::io::duplex(4096);
+        browser.write_all(b"GET / HTTP/1.1\r\nHost: h.example\r\n\r\n").await.unwrap();
+        let action = crate::runtime_config::HttpRouteAction {
+            backends: vec![crate::runtime_config::HttpBackend { address: endpoint.to_string(), transport: Default::default(), tls_server_name: None }],
+            proxy_protocol: crate::proxy_protocol::ProxyProtocol::V1,
+            ..Default::default()
+        };
+        let ctx = crate::dataplane::ConnCtx {
+            name: Arc::new("test".to_string()),
+            remote: "203.0.113.7:51234".parse().unwrap(),
+            local: "192.0.2.1:443".parse().unwrap(),
+            stats: Arc::new(crate::listener_stats::ListenerStats::new("test", 5_000)),
+            controller: Arc::new(tokio::sync::RwLock::new(crate::controller::Controller::new())),
+        };
+        let policy = Arc::new(RelayPolicy { bind: "127.0.0.1:443".into(), target: None, target_port: 80, speed_limit: None, upstream_tls: false });
+        let run_task = tokio::spawn(run(ctx, policy, ConnStream::of(server), None, Some(("test:proxy-protocol".into(), action)), false, None));
+
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut browser, &mut response).await.unwrap();
+        let request = upstream_task.await.unwrap();
+        run_task.await.unwrap().unwrap();
+        assert!(String::from_utf8(response).unwrap().starts_with("HTTP/1.1 200 OK"));
+        let (proxy_line, rest) = request.split_once("\r\n").unwrap();
+        assert_eq!(proxy_line, "PROXY TCP4 203.0.113.7 192.0.2.1 51234 443");
+        assert!(rest.starts_with("GET / HTTP/1.1\r\n"), "request must follow the header; got: {rest:?}");
     }
 
     #[tokio::test]

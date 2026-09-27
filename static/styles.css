@@ -264,6 +264,8 @@ input[type="number"] { font-variant-numeric: tabular-nums; }
 .check-row { flex-direction: row; align-items: center; gap: 9px; }
 .check-row input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
 .check-row label { margin: 0; font-weight: 500; }
+.radio-row { display: flex; flex-wrap: wrap; gap: 6px 20px; }
+.field .radio-row label { margin: 0; display: flex; font-weight: 500; cursor: pointer; }
 
 .form-footer { display: flex; justify-content: flex-end; align-items: end; }
 

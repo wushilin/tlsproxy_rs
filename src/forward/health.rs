@@ -70,6 +70,7 @@ async fn bind_http_action(
             requested.port(),
             tls,
             true,
+            action.proxy_protocol,
             tls_name,
             Owner::Configured,
         )
@@ -107,7 +108,7 @@ async fn bind_http_action(
 /// those keep using the lazily created, idle-evicted runtime groups.
 fn l4_backends(
     action: &crate::runtime_config::TlsRouteAction,
-) -> Option<(&str, u16, bool, HttpLoadBalancing)> {
+) -> Option<(&str, u16, bool, HttpLoadBalancing, ProxyProtocol)> {
     use crate::runtime_config::{TlsRouteAction, UpstreamTransport};
     match action {
         // Passthrough relays the client's own TLS session, so the upstream leg
@@ -116,17 +117,20 @@ fn l4_backends(
             target: Some(target),
             target_port,
             load_balancing,
-        } => Some((target, *target_port, true, *load_balancing)),
+            proxy_protocol,
+        } => Some((target, *target_port, true, *load_balancing, *proxy_protocol)),
         TlsRouteAction::Terminate {
             target: Some(target),
             target_port,
             upstream,
             load_balancing,
+            proxy_protocol,
         } => Some((
             target,
             *target_port,
             *upstream == UpstreamTransport::Tls,
             *load_balancing,
+            *proxy_protocol,
         )),
         _ => None,
     }
@@ -162,7 +166,7 @@ async fn bind_l4_route(
     matcher: &crate::runtime_config::HostMatcher,
     action: &crate::runtime_config::TlsRouteAction,
 ) -> Result<()> {
-    let Some((targets, default_port, upstream_tls, load_balancing)) = l4_backends(action) else {
+    let Some((targets, default_port, upstream_tls, load_balancing, proxy_protocol)) = l4_backends(action) else {
         return Ok(());
     };
     let host = matcher_label(matcher);
@@ -177,6 +181,7 @@ async fn bind_l4_route(
             requested.port(),
             upstream_tls,
             false,
+            proxy_protocol,
             probe_server_name(matcher, requested.host()),
             Owner::Configured,
         )
@@ -236,6 +241,7 @@ async fn bind_forward_listener(
             requested.port(),
             configured.upstream_tls,
             false,
+            configured.proxy_protocol,
             requested.host().to_string(),
             Owner::Configured,
         )
@@ -426,6 +432,7 @@ async fn check_jobs(jobs: Vec<(Arc<MonitorGroup>, String)>, check_controller: &m
                 &endpoint,
                 group.key.upstream_tls,
                 group.key.http_health,
+                group.key.proxy_protocol,
                 &group.tls_server_name,
             )
             .await;
@@ -467,12 +474,19 @@ async fn probe(
     endpoint: &str,
     upstream_tls: bool,
     http_health: bool,
+    proxy_protocol: ProxyProtocol,
     tls_server_name: &str,
 ) -> bool {
     let mut stream = match TcpStream::connect(endpoint).await {
         Ok(stream) => stream,
         Err(_) => return false,
     };
+    // A backend that expects a PROXY header drops a connection arriving
+    // without one, so the probe must open the same way real traffic does.
+    // It announces no client: there is none.
+    if stream.write_all(&proxy_protocol.local_header()).await.is_err() {
+        return false;
+    }
     if !upstream_tls {
         return !http_health || probe_http(&mut stream, tls_server_name).await;
     }
@@ -523,6 +537,27 @@ pub(super) async fn probe_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite +
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn probe_opens_with_a_proxy_header_when_the_backend_expects_one() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let backend = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0);
+                received.extend_from_slice(&buffer[..count]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            received
+        });
+        assert!(probe(&endpoint, false, true, ProxyProtocol::V1, "h.example").await);
+        let received = backend.await.unwrap();
+        assert!(received.starts_with(b"PROXY UNKNOWN\r\nGET / HTTP/1.1\r\n"));
+    }
 
     #[tokio::test]
     async fn http_probe_accepts_authentication_challenge_as_healthy() {

@@ -23,6 +23,7 @@ pub(crate) struct PassthroughRoute {
     pub target: Option<String>,
     pub target_port: u16,
     pub load_balancing: crate::runtime_config::HttpLoadBalancing,
+    pub proxy_protocol: crate::proxy_protocol::ProxyProtocol,
 }
 
 pub(crate) async fn run(
@@ -32,7 +33,7 @@ pub(crate) async fn run(
     inspected: Option<ClientHello>,
     route: Option<PassthroughRoute>,
 ) -> Result<()> {
-    let crate::dataplane::ConnCtx { name, stats, controller, remote } = ctx;
+    let crate::dataplane::ConnCtx { name, stats, controller, remote, local } = ctx;
     let conn_id = client.request_id();
     info!("{conn_id} {name} passthrough worker started");
     let client_hello = match inspected {
@@ -56,6 +57,7 @@ pub(crate) async fn run(
     active_tracker::set_sni(&conn_id, &sni_target);
     stats.increase_uploaded_bytes(header_len);
     active_tracker::add_uploaded(&conn_id, header_len as u64);
+    let proxy_protocol = route.as_ref().map(|route| route.proxy_protocol).unwrap_or_default();
     let selected = match route {
         Some(route) => {
             crate::forward::select_routed_pool(
@@ -64,6 +66,7 @@ pub(crate) async fn run(
                 route.target.as_deref(),
                 route.target_port,
                 true,
+                route.proxy_protocol,
                 remote.ip(),
                 route.load_balancing,
             )
@@ -82,11 +85,14 @@ pub(crate) async fn run(
     };
     active_tracker::set_target(&conn_id, &selected.tls_server_name, &selected.endpoint);
     hello_cache::insert(client_hello.random);
-    let upstream = tokio::time::timeout(
+    let mut upstream = tokio::time::timeout(
         Duration::from_secs(5),
         TcpStream::connect(&selected.endpoint),
     )
     .await??;
+    // The header precedes the relayed ClientHello; the upstream strips it
+    // before starting its own TLS handshake with the client.
+    proxy_protocol.announce(&mut upstream, remote, local).await?;
     info!("{conn_id} connected to TLS upstream {}", selected.endpoint);
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(client);

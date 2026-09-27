@@ -33,6 +33,9 @@ use tokio::sync::RwLock;
 pub struct ConnCtx {
     pub name: Arc<String>,
     pub remote: SocketAddr,
+    /// The listener-side address the client connected to; with `remote` it
+    /// forms the address pair a PROXY protocol header announces.
+    pub local: SocketAddr,
     pub stats: Arc<crate::listener_stats::ListenerStats>,
     pub controller: Arc<RwLock<crate::controller::Controller>>,
 }

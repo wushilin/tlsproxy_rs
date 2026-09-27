@@ -260,6 +260,7 @@ async fn run_revision(runtime_dir: &Path, store: Store, stored: crate::store::St
                 name.clone(),
                 &config.targets,
                 config.upstream_tls,
+                config.proxy_protocol,
             )
             .await?;
         }
@@ -412,7 +413,7 @@ async fn run_tls_listener(
                     TlsRouteAction::Reject => ListenerType::TlsPassthrough,
                 };
                 crate::active_tracker::set_listener_type(&request_id, listener_type);
-                let ctx = crate::dataplane::ConnCtx { name: task_name.clone(), remote, stats: task_stats.clone(), controller: connection_controller };
+                let ctx = crate::dataplane::ConnCtx { name: task_name.clone(), remote, local: client.local_addr()?, stats: task_stats.clone(), controller: connection_controller };
                 let tls = crate::dataplane::TlsCtx { ca: task_ca, cache: task_cache, fallback };
                 crate::listener::default::dispatch_non_control(
                     ctx, tls,
@@ -456,7 +457,7 @@ async fn run_http_listener(name: String, listener: TcpListener, config: HostRout
                     return Ok(());
                 }
                 let route_key = format!("{task_name}:{}", head.host.to_ascii_lowercase());
-                let ctx = crate::dataplane::ConnCtx { name: task_name.clone(), remote, stats: task_stats.clone(), controller: connection_controller };
+                let ctx = crate::dataplane::ConnCtx { name: task_name.clone(), remote, local: client.local_addr()?, stats: task_stats.clone(), controller: connection_controller };
                 crate::dataplane::http::run(ctx, task_policy, client, Some(head), Some((route_key, action)), false, None).await?;
                 Ok(())
             }.await;
@@ -469,6 +470,7 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
     let stats = Arc::new(ListenerStats::new(&name, config.max_idle_time_ms.unwrap_or(u64::MAX)));
     crate::events_hub::register_listener(&stats).await;
     let load_balancing = config.load_balancing;
+    let proxy_protocol = config.proxy_protocol;
     let configured_idle_ms = config.max_idle_time_ms;
     let policy = Arc::new(RelayPolicy { bind: config.bind, target: Some(config.targets), target_port: 0, speed_limit: config.speed_limit, upstream_tls: config.upstream_tls });
     let name = Arc::new(name);
@@ -479,6 +481,7 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
         let live = crate::runtime_live::load();
         let live_forward = live.additional_listeners.get(name.as_str()).and_then(|listener| match listener { AdditionalListenerConfig::Forward(config) => Some(config), _ => None });
         let task_load_balancing = live_forward.map(|config| config.load_balancing).unwrap_or(load_balancing);
+        let task_proxy_protocol = live_forward.map(|config| config.proxy_protocol).unwrap_or(proxy_protocol);
         stats.set_idle_timeout_ms(live_forward.map(|config| config.max_idle_time_ms).unwrap_or(configured_idle_ms).unwrap_or(u64::MAX));
         let task_policy = live_forward.map(|config| Arc::new(RelayPolicy { bind: config.bind.clone(), target: Some(config.targets.clone()), target_port: 0, speed_limit: config.speed_limit, upstream_tls: config.upstream_tls })).unwrap_or_else(|| policy.clone());
         let (task_name, task_stats) = (name.clone(), stats.clone());
@@ -486,7 +489,8 @@ async fn run_forward_listener(name: String, listener: TcpListener, config: RawFo
         drop(controller.spawn(async move {
             let _guard = crate::dataplane::ConnGuard::start(request_id.clone(), task_name.clone(), remote, task_stats.clone(), ListenerType::PortForward);
             crate::active_tracker::set_listener_type(&request_id, ListenerType::PortForward);
-            if let Err(cause) = crate::dataplane::l4::run(crate::dataplane::ConnCtx { name: task_name.clone(), remote, stats: task_stats.clone(), controller: connection_controller }, task_policy, client, task_load_balancing).await {
+            let Ok(local) = client.local_addr() else { return };
+            if let Err(cause) = crate::dataplane::l4::run(crate::dataplane::ConnCtx { name: task_name.clone(), remote, local, stats: task_stats.clone(), controller: connection_controller }, task_policy, client, task_load_balancing, task_proxy_protocol).await {
                 warn!("listener {task_name} connection failed: {cause:#}");
             }
         }));

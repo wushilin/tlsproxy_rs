@@ -80,6 +80,18 @@ global health checker probes every backend endpoint every five seconds over
 TCP — plus an HTTP `GET /` for HTTP backends — and routing prefers online
 endpoints; results are visible in the control plane.
 
+Every mode that opens an upstream connection — passthrough, terminate (to
+plaintext or TLS), reverse-proxy path handlers, and raw forward listeners —
+can announce the client's real address with a PROXY protocol header
+(`proxy_protocol`: `none`, `v1`, or `v2`; off by default). The header is the
+first thing on the upstream connection, ahead of an upstream TLS handshake
+and ahead of a relayed passthrough ClientHello, so the upstream must be
+configured to expect it (nginx `proxy_protocol`, HAProxy `accept-proxy`);
+one that is not will fail every connection. Health probes to such a backend
+open with a client-less header (`PROXY UNKNOWN` / v2 `LOCAL`) so they are
+not rejected. Set it only on routes with an explicit target: a destination
+inferred from the client's hostname will not expect the header.
+
 The mandatory listener intercepts exact `acme-tls/1` connections with an
 active exact-SNI challenge. Without an active local challenge, ACME ALPN
 follows the ordinary SNI route, so a passthrough backend receives the original

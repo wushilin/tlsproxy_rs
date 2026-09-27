@@ -5,6 +5,7 @@
 use crate::controller::Controller;
 use crate::dataplane::RelayPolicy;
 use crate::hostutil::HostAndPort;
+use crate::proxy_protocol::ProxyProtocol;
 use crate::resolver;
 use crate::runtime_config::HttpLoadBalancing;
 use anyhow::{anyhow, Result};
@@ -70,6 +71,9 @@ struct GroupKey {
     target: String,
     upstream_tls: bool,
     http_health: bool,
+    /// Part of the identity because it changes how the backend must be
+    /// probed: one that expects a PROXY header rejects a probe without it.
+    proxy_protocol: ProxyProtocol,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +149,7 @@ impl MonitorGroup {
         effective: HostAndPort,
         upstream_tls: bool,
         http_health: bool,
+        proxy_protocol: ProxyProtocol,
         tls_server_name: String,
         owner: Owner,
     ) -> Arc<Self> {
@@ -153,6 +158,7 @@ impl MonitorGroup {
             target: effective.to_string(),
             upstream_tls,
             http_health,
+            proxy_protocol,
         };
         let group = Arc::new(Self {
             key,
@@ -315,6 +321,7 @@ pub async fn register_forward_listener(
     listener_name: String,
     targets: &str,
     upstream_tls: bool,
+    proxy_protocol: ProxyProtocol,
 ) -> Result<()> {
     let mut keys = Vec::new();
     for target in parse_targets(targets)? {
@@ -325,6 +332,7 @@ pub async fn register_forward_listener(
             requested.port(),
             upstream_tls,
             false,
+            proxy_protocol,
             requested.host().to_string(),
             Owner::Configured,
         )
@@ -409,7 +417,7 @@ pub async fn apply_hot_listener_settings(
             continue;
         }
         if let crate::runtime_config::AdditionalListenerConfig::Forward(listener) = listener {
-            register_forward_listener(name.clone(), &listener.targets, listener.upstream_tls)
+            register_forward_listener(name.clone(), &listener.targets, listener.upstream_tls, listener.proxy_protocol)
                 .await?;
         }
     }
@@ -428,7 +436,7 @@ pub async fn select_http_backend(
     if action.backends.is_empty() {
         let tls = action.upstream == crate::runtime_config::UpstreamTransport::Tls;
         return Ok((
-            select_routed_target(host, action.target.as_deref(), action.target_port, tls).await?,
+            select_routed_target(host, action.target.as_deref(), action.target_port, tls, action.proxy_protocol).await?,
             tls,
         ));
     }
@@ -450,6 +458,7 @@ pub async fn select_http_backend(
             requested.port(),
             tls,
             true,
+            action.proxy_protocol,
             tls_name,
             Owner::Runtime,
         )
@@ -569,6 +578,7 @@ pub async fn select_runtime_target(
         requested_port,
         upstream_tls,
         false,
+        ProxyProtocol::None,
         tls_server_name.to_string(),
         Owner::Runtime,
     )
@@ -590,6 +600,7 @@ pub async fn select_routed_target(
     explicit_target: Option<&str>,
     default_port: u16,
     upstream_tls: bool,
+    proxy_protocol: ProxyProtocol,
 ) -> Result<SelectedTarget> {
     let requested = explicit_target
         .map(|target| HostAndPort::parse_or_default(target, default_port))
@@ -603,6 +614,7 @@ pub async fn select_routed_target(
         requested.port(),
         upstream_tls,
         false,
+        proxy_protocol,
         sni_host.to_string(),
         Owner::Runtime,
     )
@@ -625,6 +637,7 @@ pub async fn select_routed_pool(
     explicit_targets: Option<&str>,
     default_port: u16,
     upstream_tls: bool,
+    proxy_protocol: ProxyProtocol,
     client_ip: IpAddr,
     load_balancing: crate::runtime_config::HttpLoadBalancing,
 ) -> Result<SelectedTarget> {
@@ -656,6 +669,7 @@ pub async fn select_routed_pool(
             requested.port(),
             upstream_tls,
             false,
+            proxy_protocol,
             sni_host.to_string(),
             Owner::Runtime,
         )
@@ -711,6 +725,7 @@ async fn ensure_group(
     requested_port: u16,
     upstream_tls: bool,
     http_health: bool,
+    proxy_protocol: ProxyProtocol,
     tls_server_name: String,
     owner: Owner,
 ) -> Result<Arc<MonitorGroup>> {
@@ -719,6 +734,7 @@ async fn ensure_group(
         target: effective.to_string(),
         upstream_tls,
         http_health,
+        proxy_protocol,
     };
     if let Some(group) = GROUPS.read().await.get(&key).cloned() {
         match owner {
@@ -736,6 +752,7 @@ async fn ensure_group(
         effective,
         upstream_tls,
         http_health,
+        proxy_protocol,
         tls_server_name,
         owner,
     )
@@ -972,6 +989,7 @@ mod tests {
                 target: target.into(),
                 upstream_tls: false,
                 http_health: false,
+                proxy_protocol: ProxyProtocol::None,
             },
             requested_target: target.into(),
             effective_host: target
@@ -1166,6 +1184,7 @@ mod tests {
                     target: format!("runtime-{index}.example:443"),
                     upstream_tls: false,
                     http_health: false,
+                    proxy_protocol: ProxyProtocol::None,
                 };
                 (key, index as u128)
             })
@@ -1178,11 +1197,13 @@ mod tests {
             target: "runtime-0.example:443".into(),
             upstream_tls: false,
             http_health: false,
+            proxy_protocol: ProxyProtocol::None,
         }));
         assert!(!evicted.contains(&GroupKey {
             target: "runtime-204.example:443".into(),
             upstream_tls: false,
             http_health: false,
+            proxy_protocol: ProxyProtocol::None,
         }));
     }
 
@@ -1269,7 +1290,7 @@ mod tests {
                     target: Some("192.0.2.10:8080,192.0.2.11:8080".into()),
                     target_port: 8080,
                     upstream: UpstreamTransport::Plaintext,
-                    load_balancing: HttpLoadBalancing::RoundRobin,
+                    load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
                 },
             ),
             l4_route(
@@ -1277,7 +1298,7 @@ mod tests {
                 TlsRouteAction::Passthrough {
                     target: Some("192.0.2.20:443".into()),
                     target_port: 443,
-                    load_balancing: HttpLoadBalancing::RoundRobin,
+                    load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
                 },
             ),
             // Deriving the backend from the connection's SNI leaves nothing to
@@ -1288,7 +1309,7 @@ mod tests {
                     target: None,
                     target_port: 8443,
                     upstream: UpstreamTransport::Plaintext,
-                    load_balancing: HttpLoadBalancing::RoundRobin,
+                    load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
                 },
             ),
         ]))
@@ -1321,6 +1342,7 @@ mod tests {
             Some("192.0.2.10:8080"),
             8080,
             false,
+            ProxyProtocol::None,
             "198.51.100.7".parse().unwrap(),
             HttpLoadBalancing::RoundRobin,
         )
@@ -1347,7 +1369,7 @@ mod tests {
                 target: Some("192.0.2.30:8080".into()),
                 target_port: 8080,
                 upstream: UpstreamTransport::Plaintext,
-                load_balancing: HttpLoadBalancing::RoundRobin,
+                load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
             },
         );
         configure_health_checks(&config_with_routes(vec![route])).await.unwrap();

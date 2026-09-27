@@ -5,6 +5,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::acme_types::{AcmeSettings, ControlPlaneConfig};
+use crate::proxy_protocol::ProxyProtocol;
 use crate::config::{
     AccountingConfig, Config as LegacyConfig, DnsConfig, Listener, ListenerMode, Policy, Rules,
 };
@@ -157,6 +158,10 @@ pub struct HttpRouteAction {
     pub backends: Vec<HttpBackend>,
     #[serde(default)]
     pub load_balancing: HttpLoadBalancing,
+    /// Announce the client's address to the upstream with a PROXY protocol
+    /// header. The upstream must be configured to expect it.
+    #[serde(default, skip_serializing_if = "ProxyProtocol::is_none")]
+    pub proxy_protocol: ProxyProtocol,
     /// Optional Host header sent upstream. Upstream TLS SNI remains backend-specific.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_header: Option<String>,
@@ -250,6 +255,7 @@ impl Default for HttpRouteAction {
             upstream: UpstreamTransport::Plaintext,
             backends: Vec::new(),
             load_balancing: HttpLoadBalancing::RoundRobin,
+            proxy_protocol: ProxyProtocol::None,
             host_header: None,
             paths: Vec::new(),
             behavior: HttpBehavior::ReverseProxy,
@@ -283,6 +289,10 @@ pub struct RawForwardListenerConfig {
     pub upstream_tls: bool,
     #[serde(default)]
     pub load_balancing: HttpLoadBalancing,
+    /// Announce the client's address to the upstream with a PROXY protocol
+    /// header. The upstream must be configured to expect it.
+    #[serde(default, skip_serializing_if = "ProxyProtocol::is_none")]
+    pub proxy_protocol: ProxyProtocol,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_idle_time_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -453,6 +463,10 @@ pub enum TlsRouteAction {
         target: Option<String>,
         #[serde(default)]
         load_balancing: HttpLoadBalancing,
+        /// Announce the client's address to the upstream with a PROXY
+        /// protocol header. The upstream must be configured to expect it.
+        #[serde(default, skip_serializing_if = "ProxyProtocol::is_none")]
+        proxy_protocol: ProxyProtocol,
     },
     Terminate {
         #[serde(default = "default_target_port")]
@@ -463,6 +477,10 @@ pub enum TlsRouteAction {
         upstream: UpstreamTransport,
         #[serde(default)]
         load_balancing: HttpLoadBalancing,
+        /// Announce the client's address to the upstream with a PROXY
+        /// protocol header. The upstream must be configured to expect it.
+        #[serde(default, skip_serializing_if = "ProxyProtocol::is_none")]
+        proxy_protocol: ProxyProtocol,
     },
     /// Terminate client TLS, parse HTTP/1.1, and proxy using a Layer-7 backend
     /// pool. This allows HTTPS reverse proxying to coexist with encrypted TLS
@@ -480,6 +498,7 @@ impl Default for TlsRouteAction {
             target_port: default_target_port(),
             target: None,
             load_balancing: HttpLoadBalancing::RoundRobin,
+            proxy_protocol: ProxyProtocol::None,
         }
     }
 }
@@ -727,7 +746,7 @@ impl AdditionalListenerConfig {
                     TlsRouteAction::Passthrough {
                         target_port: listener.target_port,
                         target: listener.target,
-                        load_balancing: HttpLoadBalancing::RoundRobin,
+                        load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
                     }
                 } else {
                     TlsRouteAction::Terminate {
@@ -738,7 +757,7 @@ impl AdditionalListenerConfig {
                         } else {
                             UpstreamTransport::Plaintext
                         },
-                        load_balancing: HttpLoadBalancing::RoundRobin,
+                        load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
                     }
                 };
                 Self::Tls(HostRoutedTlsListenerConfig {
@@ -768,7 +787,7 @@ impl AdditionalListenerConfig {
                         UpstreamTransport::Plaintext
                     },
                     backends: Vec::new(),
-                    load_balancing: HttpLoadBalancing::RoundRobin,
+                    load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
                     host_header: None,
                     paths: Vec::new(),
                     behavior: HttpBehavior::ReverseProxy,
@@ -781,7 +800,7 @@ impl AdditionalListenerConfig {
                 bind: listener.bind,
                 targets: listener.target.unwrap_or_default(),
                 upstream_tls: listener.upstream_tls,
-                load_balancing: HttpLoadBalancing::RoundRobin,
+                load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
                 max_idle_time_ms: listener.max_idle_time_ms,
                 speed_limit: listener.speed_limit,
             }),
@@ -798,6 +817,25 @@ fn bind_uses_port_443(bind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_protocol_round_trips_and_is_omitted_when_unset() {
+        let action: TlsRouteAction = serde_json::from_str(r#"{"mode":"terminate","target_port":8080,"proxy_protocol":"v2"}"#).unwrap();
+        assert!(matches!(action, TlsRouteAction::Terminate { proxy_protocol: ProxyProtocol::V2, .. }));
+        assert!(serde_json::to_string(&action).unwrap().contains(r#""proxy_protocol":"v2""#));
+
+        // Configurations saved before the setting existed still load, and an
+        // unset value does not start appearing in them.
+        let legacy: TlsRouteAction = serde_json::from_str(r#"{"mode":"passthrough","target_port":443}"#).unwrap();
+        assert!(matches!(legacy, TlsRouteAction::Passthrough { proxy_protocol: ProxyProtocol::None, .. }));
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("proxy_protocol"));
+
+        let proxied: TlsRouteAction = serde_json::from_str(r#"{"mode":"reverse_proxy","proxy_protocol":"v1","paths":[{"prefix":"/","action":{"type":"reverse_proxy","proxy_protocol":"v2"}}]}"#).unwrap();
+        let TlsRouteAction::ReverseProxy { action } = proxied else { panic!("expected reverse proxy") };
+        assert_eq!(action.proxy_protocol, ProxyProtocol::V1);
+        let HttpPathAction::ReverseProxy { action: path_action } = &action.paths[0].action else { panic!("expected path proxy") };
+        assert_eq!(path_action.proxy_protocol, ProxyProtocol::V2);
+    }
 
     #[test]
     fn defaults_are_mandatory_443_and_deny_ordinary_sni() {
@@ -818,7 +856,7 @@ mod tests {
 
     #[test]
     fn host_routes_use_exact_suffix_regex_then_default_precedence() {
-        let action = |port| TlsRouteAction::Passthrough { target_port: port, target: None, load_balancing: HttpLoadBalancing::RoundRobin };
+        let action = |port| TlsRouteAction::Passthrough { target_port: port, target: None, load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default() };
         let routing = OrdinaryTlsConfig {
             routes: vec![
                 TlsHostRoute { name: String::new(), matcher: HostMatcher { patterns: vec![Regex::new("example").unwrap()], ..Default::default() }, action: action(1001) },
@@ -841,7 +879,7 @@ mod tests {
 
     #[test]
     fn exact_route_hosts_are_recognized_across_active_tls_listeners() {
-        let action = |port| TlsRouteAction::Passthrough { target_port: port, target: None, load_balancing: HttpLoadBalancing::RoundRobin };
+        let action = |port| TlsRouteAction::Passthrough { target_port: port, target: None, load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default() };
         let mut config = RuntimeConfig::default();
         config.default_listener.ordinary_traffic.routes.push(TlsHostRoute {
             name: String::new(),
@@ -874,7 +912,7 @@ mod tests {
 
     #[test]
     fn regex_host_routes_use_configuration_order() {
-        let action = |port| TlsRouteAction::Passthrough { target_port: port, target: None, load_balancing: HttpLoadBalancing::RoundRobin };
+        let action = |port| TlsRouteAction::Passthrough { target_port: port, target: None, load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default() };
         let routing = OrdinaryTlsConfig {
             routes: vec![
                 TlsHostRoute { name: "first".into(), matcher: HostMatcher { patterns: vec![Regex::new("^api.*\\.example$").unwrap()], ..Default::default() }, action: action(1001) },
@@ -955,7 +993,7 @@ mod tests {
                 target_port: 8080,
                 target: None,
                 upstream: UpstreamTransport::Plaintext,
-                load_balancing: HttpLoadBalancing::RoundRobin,
+                load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
             },
         });
         assert!(matches!(
@@ -991,7 +1029,7 @@ mod tests {
                         target_port: 8080,
                         target: None,
                         upstream: UpstreamTransport::Plaintext,
-                        load_balancing: HttpLoadBalancing::RoundRobin,
+                        load_balancing: HttpLoadBalancing::RoundRobin, proxy_protocol: Default::default(),
                     },
                 }],
                 ..Default::default()

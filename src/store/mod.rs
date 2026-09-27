@@ -680,7 +680,7 @@ mod tests {
         config.default_listener.ordinary_traffic.routes.push(TlsHostRoute {
             name: "automatic".into(),
             matcher: HostMatcher { exact: vec!["auto.example".into()], ..Default::default() },
-            action: TlsRouteAction::Terminate { target_port: 443, target: None, upstream: UpstreamTransport::Plaintext, load_balancing: Default::default() },
+            action: TlsRouteAction::Terminate { target_port: 443, target: None, upstream: UpstreamTransport::Plaintext, load_balancing: Default::default(), proxy_protocol: Default::default() },
         });
         assert_eq!(store.ensure_automatic_certificates(&config).unwrap(), 0);
         assert!(store.certificate_for_domain("auto.example").unwrap().is_none());
@@ -696,7 +696,7 @@ mod tests {
         config.default_listener.ordinary_traffic.routes.push(TlsHostRoute {
             name: "automatic".into(),
             matcher: HostMatcher { exact: vec!["Auto.Example".into()], ..Default::default() },
-            action: TlsRouteAction::Terminate { target_port: 443, target: None, upstream: UpstreamTransport::Plaintext, load_balancing: Default::default() },
+            action: TlsRouteAction::Terminate { target_port: 443, target: None, upstream: UpstreamTransport::Plaintext, load_balancing: Default::default(), proxy_protocol: Default::default() },
         });
         store.save_config(&config, "test").unwrap();
         assert_eq!(store.ensure_automatic_certificates(&config).unwrap(), 1);

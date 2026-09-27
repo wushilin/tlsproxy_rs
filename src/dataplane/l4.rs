@@ -18,8 +18,9 @@ pub(crate) async fn run(
     policy: Arc<RelayPolicy>,
     client: ConnStream<TcpStream>,
     load_balancing: crate::runtime_config::HttpLoadBalancing,
+    proxy_protocol: crate::proxy_protocol::ProxyProtocol,
 ) -> Result<()> {
-    let crate::dataplane::ConnCtx { name, stats, controller, remote } = ctx;
+    let crate::dataplane::ConnCtx { name, stats, controller, remote, local } = ctx;
     let client_ip = remote.ip();
     let conn_id = client.request_id();
     info!("{conn_id} {name} forward worker started");
@@ -32,11 +33,12 @@ pub(crate) async fn run(
     // (accept -> connect -> accept -> ...). Loop markers cannot exist in an
     // opaque byte stream, so the address check is the only guard here.
     crate::relay::reject_obvious_self_connect(&policy, &resolved.endpoint, &conn_id).await?;
-    let upstream = tokio::time::timeout(
+    let mut upstream = tokio::time::timeout(
         Duration::from_secs(5),
         TcpStream::connect(&resolved.endpoint),
     )
     .await??;
+    proxy_protocol.announce(&mut upstream, remote, local).await?;
     info!("{conn_id} connected to forward upstream {}", resolved.endpoint);
     active_tracker::set_status(&conn_id, ConnStatus::Ok);
     let (client_read, client_write) = tokio::io::split(client);
