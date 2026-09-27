@@ -1,40 +1,214 @@
-name: Release musl binaries
+name: Release
+
+# Pushing a `v*` tag builds every platform and publishes a GitHub release.
+# Running the workflow by hand (Actions -> Release -> Run workflow) builds
+# everything and keeps the binaries as workflow artifacts, without releasing:
+# use it to try a change to this file before tagging.
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  release:
+  check-version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - name: Tag must match Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_NAME#v}" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
 
-      - name: Install cross-build tools
+  build:
+    needs: check-version
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static musl binaries, cross-linked by Zig; they run on any distro.
+          - { name: linux-amd64-musl, os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: true }
+          - { name: linux-arm64-musl, os: ubuntu-latest, target: aarch64-unknown-linux-musl, zig: true }
+          # macos-latest is Apple Silicon; the Intel binary is cross-compiled.
+          - { name: macos-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { name: macos-amd64, os: macos-latest, target: x86_64-apple-darwin }
+          # The runner's MSVC includes the ARM64 tools, so arm64 is cross-compiled.
+          - { name: windows-amd64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: .exe }
+          - { name: windows-arm64, os: windows-latest, target: aarch64-pc-windows-msvc, exe: .exe }
+    env:
+      # Oldest macOS the binaries support.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux cross-build tools
+        if: matrix.zig
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang cmake libclang-dev python3-pip
           sudo pip3 install --break-system-packages ziglang
           cargo install cargo-zigbuild --locked
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
-      - name: Build static musl binaries
+      # aws-lc-sys assembles its x86-64 code with NASM.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Configure Windows build
+        if: runner.os == 'Windows'
+        shell: bash
         run: |
-          cargo zigbuild --locked --release --target x86_64-unknown-linux-musl
-          cargo zigbuild --locked --release --target aarch64-unknown-linux-musl
-          install -Dm755 target/x86_64-unknown-linux-musl/release/tlsproxy dist/tlsproxy-linux-amd64-musl
-          install -Dm755 target/aarch64-unknown-linux-musl/release/tlsproxy dist/tlsproxy-linux-arm64-musl
-          sha256sum dist/tlsproxy-linux-amd64-musl dist/tlsproxy-linux-arm64-musl > dist/SHA256SUMS
+          # bindgen (librocksdb-sys) needs libclang; the runner ships LLVM.
+          echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+          # Link the C runtime statically so the binary does not need the
+          # Visual C++ redistributable installed.
+          echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
 
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --locked --release --target ${{ matrix.target }}
+          else
+            cargo build --locked --release --target ${{ matrix.target }}
+          fi
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/tlsproxy${{ matrix.exe }}" "dist/tlsproxy-${{ matrix.name }}${{ matrix.exe }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tlsproxy-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # GitHub has no FreeBSD runners, so these build inside a FreeBSD VM.
+  # librocksdb-sys will not build its bundled RocksDB on FreeBSD and always
+  # links the system library, so the VM installs the `rocksdb` package and the
+  # binary links its static archive: users do not need the package installed.
+  freebsd-amd64:
+    needs: check-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build in FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14"
+          arch: x86_64
+          prepare: |
+            mkdir -p /usr/local/etc/pkg/repos
+            # The quarterly branch can lag behind the crate's minimum Rust.
+            echo 'FreeBSD: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
+            pkg update -f
+            pkg install -y rust rocksdb llvm
+          run: |
+            set -e
+            rustc --version
+            export ROCKSDB_LIB_DIR=/usr/local/lib ROCKSDB_STATIC=1
+            # A static librocksdb.a does not carry its C++ runtime dependency.
+            export RUSTFLAGS="-C link-arg=-lc++"
+            # Outside the synced tree, so the VM copies back only the binary.
+            export CARGO_TARGET_DIR="$HOME/target"
+            cargo build --locked --release
+            mkdir -p dist
+            cp "$CARGO_TARGET_DIR/release/tlsproxy" "dist/tlsproxy-freebsd-$(uname -m | sed 's/aarch64/arm64/')"
+            ldd dist/tlsproxy-freebsd-* || true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tlsproxy-freebsd-amd64
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [build, freebsd-amd64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum tlsproxy-* > SHA256SUMS && cat SHA256SUMS
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
-          files: |
-            dist/tlsproxy-linux-amd64-musl
-            dist/tlsproxy-linux-arm64-musl
-            dist/SHA256SUMS
+          files: dist/*
+
+  # FreeBSD on arm64 has no hardware acceleration on GitHub's runners and is
+  # emulated, which takes hours. It is attached to the release once it
+  # finishes rather than holding every other platform back, and a failure
+  # here leaves the rest of the release intact.
+  freebsd-arm64:
+    needs: check-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build in FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14"
+          arch: aarch64
+          prepare: |
+            mkdir -p /usr/local/etc/pkg/repos
+            # The quarterly branch can lag behind the crate's minimum Rust.
+            echo 'FreeBSD: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
+            pkg update -f
+            pkg install -y rust rocksdb llvm
+          run: |
+            set -e
+            rustc --version
+            export ROCKSDB_LIB_DIR=/usr/local/lib ROCKSDB_STATIC=1
+            # A static librocksdb.a does not carry its C++ runtime dependency.
+            export RUSTFLAGS="-C link-arg=-lc++"
+            # Outside the synced tree, so the VM copies back only the binary.
+            export CARGO_TARGET_DIR="$HOME/target"
+            cargo build --locked --release
+            mkdir -p dist
+            cp "$CARGO_TARGET_DIR/release/tlsproxy" "dist/tlsproxy-freebsd-$(uname -m | sed 's/aarch64/arm64/')"
+            ldd dist/tlsproxy-freebsd-* || true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tlsproxy-freebsd-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  attach-freebsd-arm64:
+    needs: [release, freebsd-arm64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: tlsproxy-freebsd-arm64
+          path: dist
+      - name: Upload binary and update checksums
+        run: |
+          cd dist
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS
+          grep -v ' tlsproxy-freebsd-arm64$' SHA256SUMS > SHA256SUMS.new || true
+          sha256sum tlsproxy-freebsd-arm64 >> SHA256SUMS.new
+          mv SHA256SUMS.new SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber tlsproxy-freebsd-arm64 SHA256SUMS

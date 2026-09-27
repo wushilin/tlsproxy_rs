@@ -267,6 +267,9 @@ fn atomic_write(path: &Path, contents: &[u8], private: bool) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    // Windows has no mode bits to restrict; the file inherits its directory's ACL.
+    #[cfg(not(unix))]
+    let _ = private;
     let mut file = options
         .open(&temporary)
         .with_context(|| format!("failed to create `{}`", temporary.display()))?;
