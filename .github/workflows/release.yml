@@ -132,6 +132,9 @@ jobs:
             version=$(pkg query %v snappy | sed 's/[_,].*//')
             fetch -o /tmp/snappy.tar.gz "https://github.com/google/snappy/archive/refs/tags/$version.tar.gz"
             tar -xzf /tmp/snappy.tar.gz -C /tmp
+            # Upstream builds with -fno-rtti, but RocksDB subclasses
+            # snappy::Sink and needs its typeinfo, as the package provides.
+            sed -i '' '/-fno-rtti/d' "/tmp/snappy-$version/CMakeLists.txt"
             cmake -S "/tmp/snappy-$version" -B /tmp/snappy-build -DCMAKE_BUILD_TYPE=Release \
               -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
               -DSNAPPY_BUILD_TESTS=OFF -DSNAPPY_BUILD_BENCHMARKS=OFF \
@@ -201,6 +204,9 @@ jobs:
             version=$(pkg query %v snappy | sed 's/[_,].*//')
             fetch -o /tmp/snappy.tar.gz "https://github.com/google/snappy/archive/refs/tags/$version.tar.gz"
             tar -xzf /tmp/snappy.tar.gz -C /tmp
+            # Upstream builds with -fno-rtti, but RocksDB subclasses
+            # snappy::Sink and needs its typeinfo, as the package provides.
+            sed -i '' '/-fno-rtti/d' "/tmp/snappy-$version/CMakeLists.txt"
             cmake -S "/tmp/snappy-$version" -B /tmp/snappy-build -DCMAKE_BUILD_TYPE=Release \
               -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
               -DSNAPPY_BUILD_TESTS=OFF -DSNAPPY_BUILD_BENCHMARKS=OFF \
