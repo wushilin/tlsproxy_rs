@@ -126,14 +126,25 @@ jobs:
             # The quarterly branch can lag behind the crate's minimum Rust.
             echo 'FreeBSD: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
             pkg update -f
-            pkg install -y rust rocksdb llvm
+            pkg install -y rust rocksdb llvm cmake
+            # librocksdb.a calls snappy's API as of the packaged snappy, which
+            # ships only a shared library. Build the same version statically.
+            version=$(pkg query %v snappy | sed 's/[_,].*//')
+            fetch -o /tmp/snappy.tar.gz "https://github.com/google/snappy/archive/refs/tags/$version.tar.gz"
+            tar -xzf /tmp/snappy.tar.gz -C /tmp
+            cmake -S "/tmp/snappy-$version" -B /tmp/snappy-build -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DSNAPPY_BUILD_TESTS=OFF -DSNAPPY_BUILD_BENCHMARKS=OFF \
+              -DCMAKE_INSTALL_PREFIX=/tmp/snappy
+            cmake --build /tmp/snappy-build --target install -j "$(sysctl -n hw.ncpu)"
           run: |
             set -e
             rustc --version
             export ROCKSDB_LIB_DIR=/usr/local/lib ROCKSDB_STATIC=1
+            export SNAPPY_LIB_DIR=/tmp/snappy/lib SNAPPY_STATIC=1
             # A static librocksdb.a does not carry its dependencies: the C++
             # runtime, and the zlib and bzip2 it was built with (both part of
-            # the FreeBSD base system). Snappy comes from the crate feature.
+            # the FreeBSD base system). Snappy is the static build above.
             export RUSTFLAGS="-C link-arg=-lc++ -C link-arg=-lz -C link-arg=-lbz2"
             # Outside the synced tree, so the VM copies back only the binary.
             export CARGO_TARGET_DIR="$HOME/target"
@@ -184,14 +195,25 @@ jobs:
             # The quarterly branch can lag behind the crate's minimum Rust.
             echo 'FreeBSD: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
             pkg update -f
-            pkg install -y rust rocksdb llvm
+            pkg install -y rust rocksdb llvm cmake
+            # librocksdb.a calls snappy's API as of the packaged snappy, which
+            # ships only a shared library. Build the same version statically.
+            version=$(pkg query %v snappy | sed 's/[_,].*//')
+            fetch -o /tmp/snappy.tar.gz "https://github.com/google/snappy/archive/refs/tags/$version.tar.gz"
+            tar -xzf /tmp/snappy.tar.gz -C /tmp
+            cmake -S "/tmp/snappy-$version" -B /tmp/snappy-build -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DSNAPPY_BUILD_TESTS=OFF -DSNAPPY_BUILD_BENCHMARKS=OFF \
+              -DCMAKE_INSTALL_PREFIX=/tmp/snappy
+            cmake --build /tmp/snappy-build --target install -j "$(sysctl -n hw.ncpu)"
           run: |
             set -e
             rustc --version
             export ROCKSDB_LIB_DIR=/usr/local/lib ROCKSDB_STATIC=1
+            export SNAPPY_LIB_DIR=/tmp/snappy/lib SNAPPY_STATIC=1
             # A static librocksdb.a does not carry its dependencies: the C++
             # runtime, and the zlib and bzip2 it was built with (both part of
-            # the FreeBSD base system). Snappy comes from the crate feature.
+            # the FreeBSD base system). Snappy is the static build above.
             export RUSTFLAGS="-C link-arg=-lc++ -C link-arg=-lz -C link-arg=-lbz2"
             # Outside the synced tree, so the VM copies back only the binary.
             export CARGO_TARGET_DIR="$HOME/target"

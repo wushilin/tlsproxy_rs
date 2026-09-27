@@ -1,6 +1,6 @@
 [package]
 name = "tlsproxy"
-version = "3.6.2"
+version = "3.6.3"
 edition = "2021"
 rust-version = "1.88"
 
@@ -55,8 +55,10 @@ rpassword = "7"
 
 # FreeBSD links the packaged librocksdb.a (librocksdb-sys will not build the
 # bundled RocksDB there). That archive was built with snappy, which the
-# package only ships as a shared library; this compiles the bundled snappy
-# and links it statically instead, so the binary needs no packages at runtime.
+# package only ships as a shared library. The feature makes librocksdb-sys
+# link snappy itself; the release workflow points it (SNAPPY_LIB_DIR) at a
+# static build of the packaged version, since the bundled snappy is too old
+# for the packaged RocksDB. The binary needs no packages at runtime.
 [target.'cfg(target_os = "freebsd")'.dependencies]
 rocksdb = { version = "0.24", default-features = false, features = ["lz4", "snappy"] }
 
