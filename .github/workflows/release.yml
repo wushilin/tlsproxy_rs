@@ -84,6 +84,14 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # librocksdb-sys' build script links libclang dynamically and
+            # finds it only through the loader path. macOS strips DYLD_*
+            # variables on the way into system binaries, so a job-level env
+            # entry may not survive; export it here, right before cargo.
+            libclang=$(dirname "$(find "$(xcode-select -p)" -name libclang.dylib -print -quit)")
+            export LIBCLANG_PATH="$libclang" DYLD_FALLBACK_LIBRARY_PATH="$libclang"
+          fi
           if [ "${{ matrix.zig }}" = "true" ]; then
             cargo zigbuild --locked --release --target ${{ matrix.target }}
           else
