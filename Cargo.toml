@@ -1,6 +1,6 @@
 [package]
 name = "tlsproxy"
-version = "3.6.1"
+version = "3.6.2"
 edition = "2021"
 rust-version = "1.88"
 
@@ -52,6 +52,13 @@ tempfile = "3"
 # Offline account recovery prompts for a password on the terminal; this reads
 # it from /dev/tty without echoing it back.
 rpassword = "7"
+
+# FreeBSD links the packaged librocksdb.a (librocksdb-sys will not build the
+# bundled RocksDB there). That archive was built with snappy, which the
+# package only ships as a shared library; this compiles the bundled snappy
+# and links it statically instead, so the binary needs no packages at runtime.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+rocksdb = { version = "0.24", default-features = false, features = ["lz4", "snappy"] }
 
 [dev-dependencies]
 # `test-util` supplies the paused clock the relay teardown tests need. Kept a

@@ -131,8 +131,10 @@ jobs:
             set -e
             rustc --version
             export ROCKSDB_LIB_DIR=/usr/local/lib ROCKSDB_STATIC=1
-            # A static librocksdb.a does not carry its C++ runtime dependency.
-            export RUSTFLAGS="-C link-arg=-lc++"
+            # A static librocksdb.a does not carry its dependencies: the C++
+            # runtime, and the zlib and bzip2 it was built with (both part of
+            # the FreeBSD base system). Snappy comes from the crate feature.
+            export RUSTFLAGS="-C link-arg=-lc++ -C link-arg=-lz -C link-arg=-lbz2"
             # Outside the synced tree, so the VM copies back only the binary.
             export CARGO_TARGET_DIR="$HOME/target"
             cargo build --locked --release
@@ -187,8 +189,10 @@ jobs:
             set -e
             rustc --version
             export ROCKSDB_LIB_DIR=/usr/local/lib ROCKSDB_STATIC=1
-            # A static librocksdb.a does not carry its C++ runtime dependency.
-            export RUSTFLAGS="-C link-arg=-lc++"
+            # A static librocksdb.a does not carry its dependencies: the C++
+            # runtime, and the zlib and bzip2 it was built with (both part of
+            # the FreeBSD base system). Snappy comes from the crate feature.
+            export RUSTFLAGS="-C link-arg=-lc++ -C link-arg=-lz -C link-arg=-lbz2"
             # Outside the synced tree, so the VM copies back only the binary.
             export CARGO_TARGET_DIR="$HOME/target"
             cargo build --locked --release
